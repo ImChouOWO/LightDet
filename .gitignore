@@ -1,0 +1,92 @@
+# =========================
+# Python virtual environment
+# =========================
+venv/
+.venv/
+env/
+ENV/
+
+# =========================
+# Python cache
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# =========================
+# OS / Editor
+# =========================
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+desktop.ini
+
+.vscode/
+.idea/
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+
+# =========================
+# Output / generated files
+# =========================
+output/
+outputs/
+runs/
+results/
+tmp/
+temp/
+
+# =========================
+datasets/images/
+datasets/labels/
+
+# =========================
+# Model weights / checkpoints
+# =========================
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.onnx
+*.engine
+*.safetensors
+
+checkpoints/
+weights/
+
+units/model/checkpoints/
+units/model/resnet/checkpoints/
+
+# =========================
+# BERT / HuggingFace cache
+# =========================
+units/model/bert_cache/
+**/bert_cache/
+**/.cache/huggingface/
+**/models--*/
+
+# =========================
+# Large pretrained model folders
+# =========================
+units/model/bert/
+units/model/resnet/
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Environment files
+# =========================
+.env
+.env.*

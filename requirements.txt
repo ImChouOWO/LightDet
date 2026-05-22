@@ -1,0 +1,4 @@
+pillow
+tqdm
+transformers
+huggingface-hub

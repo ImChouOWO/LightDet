@@ -1,0 +1,12 @@
+model:
+  num_layer: 4
+  dyhead_layer: 2
+  hidden_dim: 512
+  num_heads: 8
+  mlp_ratio: 4.0
+  image_grid_size: 10
+
+proposal:
+  max_drop: 0.8
+  start_ratio: 0.3
+  end_ratio: 0.7
