@@ -1,57 +1,22 @@
-# =========================
-# Python virtual environment
-# =========================
-venv/
-.venv/
-env/
-ENV/
-
-# =========================
 # Python cache
-# =========================
 __pycache__/
 *.py[cod]
-*$py.class
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.cache/
 
-# =========================
-# OS / Editor
-# =========================
-.DS_Store
-.AppleDouble
-.LSOverride
-Thumbs.db
-desktop.ini
+# Virtual environment
+venv/
+.venv/
 
-.vscode/
-.idea/
-
-# =========================
-# Logs
-# =========================
-*.log
-logs/
-
-# =========================
-# Output / generated files
-# =========================
+# Output / logs
 output/
 outputs/
-runs/
-results/
-tmp/
-temp/
+logs/
+*.log
 
-# =========================
+# Dataset
 datasets/images/
 datasets/labels/
 
-# =========================
 # Model weights / checkpoints
-# =========================
 *.pt
 *.pth
 *.ckpt
@@ -60,33 +25,16 @@ datasets/labels/
 *.engine
 *.safetensors
 
-checkpoints/
-weights/
-
+# Model generated artifacts
 units/model/checkpoints/
+units/model/bert_cache/
 units/model/resnet/checkpoints/
 
-# =========================
-# BERT / HuggingFace cache
-# =========================
-units/model/bert_cache/
-**/bert_cache/
-**/.cache/huggingface/
-**/models--*/
-
-# =========================
 # Large pretrained model folders
-# =========================
 units/model/bert/
 units/model/resnet/
 
-# =========================
-# Jupyter
-# =========================
-.ipynb_checkpoints/
-
-# =========================
-# Environment files
-# =========================
-.env
-.env.*
+# macOS / editor
+.DS_Store
+.vscode/
+.idea/
