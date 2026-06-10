@@ -29,19 +29,82 @@ disable_progress_bars()
 
 CARD_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
 print("Card Root :",CARD_ROOT)
+class FusionBlock(nn.Module):
+    def __init__(
+        self,
+        hidden_dim=512,
+        fusion_token_num=16
+    ):
+        super().__init__()
+
+        self.fusion_tokens = nn.Parameter(
+            torch.randn(
+                1,
+                fusion_token_num,
+                hidden_dim
+            )
+        )
+
+        self.img_adapter = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+
+    def forward(
+        self,
+        img_tokens,
+        text_tokens
+    ):
+        """
+        img_tokens:
+            [B,400,512]
+
+        text_tokens:
+            [B,32,512]
+        """
+        img_global = img_tokens.mean(dim=1)
+
+        fusion_tokens = self.fusion_tokens.expand(img_tokens.shape[0],-1,-1)
+        fusion_tokens = (fusion_tokens+self.img_adapter(img_global).unsqueeze(1))
+
+        x = torch.cat(
+            [fusion_tokens,img_tokens,text_tokens],dim=1)
+
+        return x
+
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        num_layer=1,
+        in_channel=512,
+        out_channel=512
+    
+    ):
+        super().__init__()
+        self.fuse = FusionBlock(in_channel,out_channel)
+    def forward(self,img_token, text_token):
+        x = self.fuse(img_token, text_token)
+        return x
+
+
+
 class Bert(nn.Module):
     def __init__(
         self,
         local_model_dir=f"{CARD_ROOT}/LightDet/units/model/bert",
-        max_cache_size=20000
+        out_dim=512,
+        max_length=32,
+        max_cache_size=20000,
+        freeze_bert=True
     ):
         super().__init__()
+
         local_model_dir = Path(local_model_dir)
 
         if not local_model_dir.exists():
             raise FileNotFoundError(
-                f"找不到本機 BERT 模型資料夾: {local_model_dir}\n"
-                f"請先將 tokenizer 與 model 用 save_pretrained() 存到這個路徑。"
+                f"找不到本機 BERT 模型資料夾: {local_model_dir}"
             )
 
         self.tokenizer = BertTokenizerFast.from_pretrained(
@@ -54,85 +117,140 @@ class Bert(nn.Module):
             local_files_only=True
         )
 
-        self.model.eval()
-
-        for p in self.model.parameters():
-            p.requires_grad_(False)
-
-        self.cache = {}
+        self.max_length = max_length
         self.max_cache_size = max_cache_size
+        self.cache = {}
+
+        bert_dim = self.model.config.hidden_size
+
+        self.proj = nn.Sequential(
+            nn.Linear(bert_dim, out_dim),
+            nn.LayerNorm(out_dim),
+            nn.GELU()
+        )
+
+        if freeze_bert:
+            self.model.eval()
+            for p in self.model.parameters():
+                p.requires_grad_(False)
+        else:
+            self.model.train()
 
     def clear_cache(self):
         self.cache.clear()
 
-    def _encode_uncached(self, texts, device):
+    def _encode_texts(self, texts, device):
         inputs = self.tokenizer(
             texts,
             padding="max_length",
             truncation=True,
-            max_length=32,
+            max_length=self.max_length,
             return_tensors="pt"
         )
 
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-
-        return {
-            "last_hidden_state": outputs.last_hidden_state.detach(),
-            "pooler_output": outputs.pooler_output.detach(),
-            "attention_mask": inputs["attention_mask"].detach()
+        inputs = {
+            k: v.to(device)
+            for k, v in inputs.items()
         }
 
-    def forward(self, x):
-        if isinstance(x, str):
-            x = [x]
+        bert_trainable = any(
+            p.requires_grad for p in self.model.parameters()
+        )
 
-        x = [str(t).strip() for t in x]
+        if bert_trainable:
+            outputs = self.model(**inputs)
+        else:
+            with torch.no_grad():
+                outputs = self.model(**inputs)
 
-        device = next(self.model.parameters()).device
+        return {
+            "last_hidden_state": outputs.last_hidden_state,
+            "attention_mask": inputs["attention_mask"]
+        }
 
-        missing_texts = []
-        missing_indices = []
+    def forward(self, texts):
+        """
+        texts:
+            str 或 List[str]
 
-        for i, text in enumerate(x):
+        return:
+            text_tokens: [B, L, out_dim]
+            text_mask:   [B, L]
+        """
+
+        if isinstance(texts, str):
+            texts = [texts]
+
+        texts = [
+            str(t).strip()
+            for t in texts
+        ]
+
+        device = next(self.proj.parameters()).device
+
+        # 如果 BERT 是 freeze，才使用 cache
+        bert_trainable = any(
+            p.requires_grad for p in self.model.parameters()
+        )
+
+        if bert_trainable:
+            encoded = self._encode_texts(texts, device)
+
+            text_tokens = self.proj(
+                encoded["last_hidden_state"]
+            )
+
+            return {
+                "text_tokens": text_tokens,
+                "text_mask": encoded["attention_mask"]
+            }
+
+        missing = []
+        for text in texts:
             if text not in self.cache:
-                missing_texts.append(text)
-                missing_indices.append(i)
+                missing.append(text)
 
-        if len(missing_texts) > 0:
-            encoded = self._encode_uncached(missing_texts, device)
+        if len(missing) > 0:
+            encoded = self._encode_texts(missing, device)
 
-            for j, text in enumerate(missing_texts):
+            for i, text in enumerate(missing):
                 if len(self.cache) >= self.max_cache_size:
                     self.cache.clear()
 
                 self.cache[text] = {
-                    "last_hidden_state": encoded["last_hidden_state"][j].cpu(),
-                    "pooler_output": encoded["pooler_output"][j].cpu(),
-                    "attention_mask": encoded["attention_mask"][j].cpu()
+                    "last_hidden_state": encoded["last_hidden_state"][i].detach().cpu(),
+                    "attention_mask": encoded["attention_mask"][i].detach().cpu()
                 }
 
-        last_hidden_state = []
-        pooler_output = []
-        attention_mask = []
+        hidden_states = []
+        masks = []
 
-        for text in x:
+        for text in texts:
             item = self.cache[text]
 
-            last_hidden_state.append(item["last_hidden_state"])
-            pooler_output.append(item["pooler_output"])
-            attention_mask.append(item["attention_mask"])
+            hidden_states.append(
+                item["last_hidden_state"]
+            )
 
-        last_hidden_state = torch.stack(last_hidden_state, dim=0).to(device, non_blocking=True)
-        pooler_output = torch.stack(pooler_output, dim=0).to(device, non_blocking=True)
-        attention_mask = torch.stack(attention_mask, dim=0).to(device, non_blocking=True)
+            masks.append(
+                item["attention_mask"]
+            )
+
+        hidden_states = torch.stack(
+            hidden_states,
+            dim=0
+        ).to(device)
+
+        masks = torch.stack(
+            masks,
+            dim=0
+        ).to(device)
+
+        text_tokens = self.proj(hidden_states)
 
         return {
-            "last_hidden_state": last_hidden_state,
-            "pooler_output": pooler_output,
-            "attention_mask": attention_mask
+            "text_tokens": text_tokens,
+            "text_mask": masks
         }
 
 
@@ -163,55 +281,287 @@ class ResNet50Extractor(nn.Module):
         fc = outputs["logits"]
         return feat_layer2, feat_layer4, fc
 
-
-class BackBone(nn.Module):
-    def __init__(self, out_channels=1024, target_size=(40, 40)):
+class ConvBNAct(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=1,
+        stride=1,
+        groups=1,
+        act=True
+    ):
         super().__init__()
-        self.target_size = target_size
-        self.backbone = ResNet50Extractor()
 
-        self.resNet_l2_proj = nn.Sequential(
-            nn.Conv2d(512, out_channels, kernel_size=1, stride=1, padding=0, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+        padding = kernel_size // 2
+
+        layers = [
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                groups=groups,
+                bias=False
+            ),
+            nn.BatchNorm2d(out_channels)
+        ]
+
+        if act:
+            layers.append(nn.SiLU(inplace=True))
+
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class MobileNetV4ConvBlock(nn.Module):
+    """
+    MobileNetV4-style UIB Block.
+
+    設計邏輯：
+    1. optional start depthwise conv
+    2. pointwise expand
+    3. optional middle depthwise conv
+    4. pointwise project
+    5. residual connection
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        stride=1,
+        expand_ratio=2.0,
+        start_dw=True,
+        middle_dw=True,
+        kernel_size=3,
+        use_residual=True
+    ):
+        super().__init__()
+
+        hidden_channels = int(in_channels * expand_ratio)
+
+        self.use_residual = (
+            use_residual
+            and stride == 1
+            and in_channels == out_channels
         )
 
-        self.resNet_l4_proj = nn.Sequential(
-            nn.Conv2d(2048, out_channels, kernel_size=1, stride=1, padding=0, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+        self.start_dw = (
+            ConvBNAct(
+                in_channels=in_channels,
+                out_channels=in_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                groups=in_channels,
+                act=True
+            )
+            if start_dw
+            else nn.Identity()
         )
 
-        self.MBv3 = nn.Sequential(
-            nn.Conv2d(2 * out_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.Hardswish(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.Hardswish(inplace=True),
+        self.expand = ConvBNAct(
+            in_channels=in_channels,
+            out_channels=hidden_channels,
+            kernel_size=1,
+            stride=1,
+            groups=1,
+            act=True
+        )
+
+        self.middle_dw = (
+            ConvBNAct(
+                in_channels=hidden_channels,
+                out_channels=hidden_channels,
+                kernel_size=kernel_size,
+                stride=1 if start_dw else stride,
+                groups=hidden_channels,
+                act=True
+            )
+            if middle_dw
+            else nn.Identity()
+        )
+
+        self.project = ConvBNAct(
+            in_channels=hidden_channels,
+            out_channels=out_channels,
+            kernel_size=1,
+            stride=1,
+            groups=1,
+            act=False
         )
 
     def forward(self, x):
-        layer_2, layer_4, fc = self.backbone(x)
+        identity = x
 
-        layer_2 = self.resNet_l2_proj(layer_2)
-        layer_4 = self.resNet_l4_proj(layer_4)
+        x = self.start_dw(x)
+        x = self.expand(x)
+        x = self.middle_dw(x)
+        x = self.project(x)
 
-        layer_2 = F.interpolate(layer_2, size=self.target_size, mode="bilinear", align_corners=False)
-        layer_4 = F.interpolate(layer_4, size=self.target_size, mode="bilinear", align_corners=False)
+        if self.use_residual:
+            x = x + identity
 
-        x = torch.cat([layer_4, layer_2], dim=1)
-        x = self.MBv3(x)
+        return x
 
-        return x, fc
+class ImgProjector(nn.Module):
+    def __init__(
+        self,
+        in_channels=1024,
+        out_channels=512,
+        layer_num=3,
+        expand_ratio=2.0,
+        target_size = (40,40)
+    ):
+        super().__init__()
+        self.target_size  = target_size
+        self.larger_view = self._make_layers(
+            in_channels,
+            out_channels,
+            layer_num,
+            expand_ratio
+        )
+
+        self.middle_view = self._make_layers(
+            in_channels,
+            out_channels,
+            layer_num,
+            expand_ratio
+        )
+
+        self.smaller_view = self._make_layers(
+            in_channels,
+            out_channels,
+            layer_num,
+            expand_ratio
+        )
+        self.resize_view = nn.Sequential(
+            nn.LazyConv2d(
+                512,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=False
+            ),
+            nn.BatchNorm2d(512),
+            nn.SiLU(inplace=True)
+        )
+
+    def _make_layers(
+        self,
+        in_channels,
+        out_channels,
+        layer_num,
+        expand_ratio
+    ):
+        layers = []
+
+        for i in range(layer_num):
+            layers.append(
+                MobileNetV4ConvBlock(
+                    in_channels=in_channels if i == 0 else out_channels,
+                    out_channels=out_channels,
+                    stride=1,
+                    expand_ratio=expand_ratio,
+                    start_dw=True,
+                    middle_dw=True,
+                    kernel_size=3
+                )
+            )
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        large_x = x
+
+        middle_x = F.interpolate(
+            x,
+            scale_factor=0.5,
+            mode="bilinear",
+            align_corners=False
+        )
+
+        small_x = F.interpolate(
+            x,
+            scale_factor=0.25,
+            mode="bilinear",
+            align_corners=False
+        )
+
+        large_feat = self.larger_view(large_x)
+        middle_feat = self.middle_view(middle_x)
+        small_feat = self.smaller_view(small_x)
+
+        target_size =self.target_size
+
+        large_feat = F.interpolate(
+            large_feat,
+            size=target_size,
+            mode="bilinear",
+            align_corners=False
+        )
+        middle_feat = F.interpolate(
+            large_feat,
+            size=target_size,
+            mode="bilinear",
+            align_corners=False
+        )
+
+        small_feat = F.interpolate(
+            small_feat,
+            size=target_size,
+            mode="bilinear",
+            align_corners=False
+        )
+
+        large_feat = self.resize_view(large_feat)
+        middle_feat = self.resize_view(middle_feat)
+        small_feat = self.resize_view(small_feat)
+        x = sum([large_feat, middle_feat, small_feat])
+        
+        return x
+
+class BackBone(nn.Module):
+    def __init__(self, in_channels,out_channels=1024, target_size=(40, 40)):
+        super().__init__()
+        self.backbone = ImgProjector(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            layer_num=3,
+            expand_ratio=2.0,
+            target_size = target_size
+        )
+
+    def forward(self, x):
+        x = self.backbone(x)
+        x = x.flatten(2).transpose(1, 2)
+        return x
 
 
 if __name__ == "__main__":
-    model = Bert(
-        # local_model_dir=f"{CARD_ROOT}/LightDet/units/model/bert"
+    img_model = BackBone(
+        in_channels=1024,
+        out_channels=512,
+        target_size=(20, 20)
     )
-    text = "黃色箱子"
 
-    out = model(text)
-    print("output shape:", out.pooler_output) #Bert最終層輸出
+    text_model = Bert(
+        out_dim=512,
+        max_length=32,
+        freeze_bert=True
+    )
+    transformer = TransformerBlock()
+    img = torch.randn(1, 1024, 40, 40)
+    texts = ["ship"]
+    img_token = img_model(img)
+    text_out = text_model(texts)
+    text_token = text_out["text_tokens"]
+    text_mask = text_out["text_mask"]
+    fuse = transformer(img_token,text_token)
+    print(fuse.shape)
+
+    
    
