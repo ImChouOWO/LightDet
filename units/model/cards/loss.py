@@ -1,273 +1,259 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
 
 
-def cxcywh_to_xyxy(box):
-    cx, cy, w, h = box.unbind(-1)
 
-    x1 = cx - w / 2
-    y1 = cy - h / 2
-    x2 = cx + w / 2
-    y2 = cy + h / 2
-
-    return torch.stack([x1, y1, x2, y2], dim=-1)
+# Utils
 
 
-def compute_iou(pred_bbox, gt_bbox, eps=1e-7):
-    B, N, _ = pred_bbox.shape
-
-    gt_bbox = gt_bbox.unsqueeze(1).expand(-1, N, -1)
-
-    pred_xyxy = cxcywh_to_xyxy(pred_bbox)
-    gt_xyxy = cxcywh_to_xyxy(gt_bbox)
-
-    px1, py1, px2, py2 = pred_xyxy.unbind(-1)
-    gx1, gy1, gx2, gy2 = gt_xyxy.unbind(-1)
-
-    inter_x1 = torch.max(px1, gx1)
-    inter_y1 = torch.max(py1, gy1)
-    inter_x2 = torch.min(px2, gx2)
-    inter_y2 = torch.min(py2, gy2)
-
-    inter_w = (inter_x2 - inter_x1).clamp(min=0)
-    inter_h = (inter_y2 - inter_y1).clamp(min=0)
-    inter_area = inter_w * inter_h
-
-    pred_area = (px2 - px1).clamp(min=0) * (py2 - py1).clamp(min=0)
-    gt_area = (gx2 - gx1).clamp(min=0) * (gy2 - gy1).clamp(min=0)
-
-    union = pred_area + gt_area - inter_area + eps
-
-    return inter_area / union
+def box_area(box):
+    return (
+        (box[..., 2] - box[..., 0]).clamp(min=0)
+        *
+        (box[..., 3] - box[..., 1]).clamp(min=0)
+    )
 
 
-def compute_iou_multi_single(pred_bbox, gt_boxes, eps=1e-7):
-    if gt_boxes.numel() == 0:
-        return torch.zeros(
-            pred_bbox.shape[0],
-            0,
-            device=pred_bbox.device,
-            dtype=pred_bbox.dtype
-        )
+def generalized_box_iou(boxes1, boxes2):
+    area1 = box_area(boxes1)
+    area2 = box_area(boxes2)
 
-    pred_xyxy = cxcywh_to_xyxy(pred_bbox)
-    gt_xyxy = cxcywh_to_xyxy(gt_boxes)
+    lt = torch.max(boxes1[:, None, :2], boxes2[None, :, :2])
+    rb = torch.min(boxes1[:, None, 2:], boxes2[None, :, 2:])
 
-    pred_xyxy = pred_xyxy.unsqueeze(1)
-    gt_xyxy = gt_xyxy.unsqueeze(0)
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[..., 0] * wh[..., 1]
 
-    px1, py1, px2, py2 = pred_xyxy.unbind(-1)
-    gx1, gy1, gx2, gy2 = gt_xyxy.unbind(-1)
+    union = area1[:, None] + area2[None, :] - inter
+    iou = inter / union.clamp(min=1e-6)
 
-    inter_x1 = torch.max(px1, gx1)
-    inter_y1 = torch.max(py1, gy1)
-    inter_x2 = torch.min(px2, gx2)
-    inter_y2 = torch.min(py2, gy2)
+    lt_c = torch.min(boxes1[:, None, :2], boxes2[None, :, :2])
+    rb_c = torch.max(boxes1[:, None, 2:], boxes2[None, :, 2:])
 
-    inter_w = (inter_x2 - inter_x1).clamp(min=0)
-    inter_h = (inter_y2 - inter_y1).clamp(min=0)
-    inter_area = inter_w * inter_h
+    wh_c = (rb_c - lt_c).clamp(min=0)
+    area_c = wh_c[..., 0] * wh_c[..., 1]
 
-    pred_area = (px2 - px1).clamp(min=0) * (py2 - py1).clamp(min=0)
-    gt_area = (gx2 - gx1).clamp(min=0) * (gy2 - gy1).clamp(min=0)
+    giou = iou - (area_c - union) / area_c.clamp(min=1e-6)
 
-    union = pred_area + gt_area - inter_area + eps
-
-    return inter_area / union
+    return giou
 
 
-def siou_loss(pred_bbox, gt_bbox, eps=1e-7):
-    px, py, pw, ph = pred_bbox.unbind(-1)
-    gx, gy, gw, gh = gt_bbox.unbind(-1)
 
-    pred_xyxy = cxcywh_to_xyxy(pred_bbox)
-    gt_xyxy = cxcywh_to_xyxy(gt_bbox)
+# Hungarian Matcher
+class HungarianMatcher:
+    def __init__(
+        self,
+        cost_bbox=5.0,
+        cost_giou=2.0,
+        cost_score=1.0,
+    ):
+        self.cost_bbox = float(cost_bbox)
+        self.cost_giou = float(cost_giou)
+        self.cost_score = float(cost_score)
 
-    px1, py1, px2, py2 = pred_xyxy.unbind(-1)
-    gx1, gy1, gx2, gy2 = gt_xyxy.unbind(-1)
+    @torch.no_grad()
+    def __call__(
+        self,
+        pred_bbox,
+        pred_score_logit,
+        targets,
+    ):
+        B, N, _ = pred_bbox.shape
+        indices = []
 
-    inter_x1 = torch.max(px1, gx1)
-    inter_y1 = torch.max(py1, gy1)
-    inter_x2 = torch.min(px2, gx2)
-    inter_y2 = torch.min(py2, gy2)
+        pred_score = pred_score_logit.sigmoid().squeeze(-1)
 
-    inter_w = (inter_x2 - inter_x1).clamp(min=0)
-    inter_h = (inter_y2 - inter_y1).clamp(min=0)
-    inter_area = inter_w * inter_h
+        for b in range(B):
+            tgt_bbox = targets[b]["boxes"].to(
+                device=pred_bbox.device,
+                dtype=pred_bbox.dtype,
+            )
 
-    pred_area = (px2 - px1).clamp(min=0) * (py2 - py1).clamp(min=0)
-    gt_area = (gx2 - gx1).clamp(min=0) * (gy2 - gy1).clamp(min=0)
+            if tgt_bbox.numel() == 0:
+                indices.append((
+                    torch.empty(
+                        0,
+                        dtype=torch.long,
+                        device=pred_bbox.device,
+                    ),
+                    torch.empty(
+                        0,
+                        dtype=torch.long,
+                        device=pred_bbox.device,
+                    ),
+                ))
+                continue
 
-    union = pred_area + gt_area - inter_area + eps
-    iou = inter_area / union
+            out_bbox = pred_bbox[b]
+            out_score = pred_score[b]
 
-    center_distance = (px - gx) ** 2 + (py - gy) ** 2
-    shape_cost = (pw - gw) ** 2 + (ph - gh) ** 2
+            cost_bbox = torch.cdist(
+                out_bbox,
+                tgt_bbox,
+                p=1,
+            )
 
-    loss = 1.0 - iou + center_distance + shape_cost
+            cost_giou = -generalized_box_iou(
+                out_bbox,
+                tgt_bbox,
+            )
 
-    return loss.mean()
+            cost_score = -out_score[:, None]
+
+            cost = (
+                self.cost_bbox * cost_bbox
+                +
+                self.cost_giou * cost_giou
+                +
+                self.cost_score * cost_score
+            )
+
+            pred_idx, gt_idx = linear_sum_assignment(
+                cost.detach().cpu().numpy()
+            )
+
+            indices.append((
+                torch.as_tensor(
+                    pred_idx,
+                    dtype=torch.long,
+                    device=pred_bbox.device,
+                ),
+                torch.as_tensor(
+                    gt_idx,
+                    dtype=torch.long,
+                    device=pred_bbox.device,
+                ),
+            ))
+
+        return indices
 
 
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.75, gamma=2.0):
+
+# Loss
+class GroundingLoss(nn.Module):
+    def __init__(
+        self,
+        cost_bbox=5.0,
+        cost_giou=2.0,
+        cost_score=1.0,
+    ):
         super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
 
-    def forward(self, logits, targets):
-        prob = torch.sigmoid(logits)
-
-        ce_loss = F.binary_cross_entropy_with_logits(
-            logits,
-            targets,
-            reduction="none"
+        self.matcher = HungarianMatcher(
+            cost_bbox=cost_bbox,
+            cost_giou=cost_giou,
+            cost_score=cost_score,
         )
 
-        p_t = prob * targets + (1.0 - prob) * (1.0 - targets)
-        alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
+    def forward(
+        self,
+        pred_bbox,
+        pred_score_logit,
+        targets,
+        lambda_bbox=5.0,
+        lambda_giou=2.0,
+        lambda_score=1.0,
+        pos_weight=1.0,
+    ):
+        """
+        pred_bbox:
+            [B, N, 4], normalized xyxy, range 0~1
 
-        loss = alpha_t * ((1.0 - p_t) ** self.gamma) * ce_loss
+        pred_score_logit:
+            [B, N, 1], raw logits, 不要先 sigmoid
 
-        return loss.mean()
+        targets:
+            list[dict], 每個 dict 至少包含：
+            {
+                "boxes": Tensor[M, 4] normalized xyxy
+            }
 
+        lambda_bbox / lambda_giou / lambda_score:
+            final loss 權重，可由 YAML 動態控制
 
-def contrastive_loss_multi(text_feat, bbox_feat, matched_indices, temperature=0.07):
-    text_feat = F.normalize(text_feat, dim=-1)
-    bbox_feat = F.normalize(bbox_feat, dim=-1)
+        pos_weight:
+            BCE 正樣本權重，可由 YAML 動態控制
+        """
 
-    losses = []
-
-    for b in range(bbox_feat.shape[0]):
-        pos_idx = matched_indices[b]
-
-        if pos_idx.numel() == 0:
-            continue
-
-        sim = torch.matmul(
-            bbox_feat[b],
-            text_feat[b].unsqueeze(-1)
-        ).squeeze(-1)
-
-        sim = sim / temperature
-
-        target = torch.zeros_like(sim)
-        target[pos_idx] = 1.0
-        target = target / target.sum().clamp(min=1e-6)
-
-        log_prob = F.log_softmax(sim, dim=0)
-        loss = -(target * log_prob).sum()
-
-        losses.append(loss)
-
-    if len(losses) == 0:
-        return bbox_feat.sum() * 0.0
-
-    return torch.stack(losses).mean()
-
-
-def compute_total_loss(
-    outputs,
-    gt_boxes_per_image,
-    text_feat,
-    lambda_bbox=1.0,
-    lambda_score=1.0,
-    lambda_text=0.5,
-    positive_ratio=0.05
-):
-    pred_bbox = outputs["bbox"]
-    score_logits = outputs["score"]
-    bbox_feat = outputs["att_out"]
-
-    device = pred_bbox.device
-
-    text_feat = text_feat.to(device).float()
-
-    B, N, _ = pred_bbox.shape
-
-    target_score = torch.zeros_like(score_logits)
-
-    bbox_losses = []
-    matched_indices_for_text = []
-    max_iou_list = []
-    best_gt_index_list = []
-
-    for b in range(B):
-        gt_boxes = gt_boxes_per_image[b].to(device).float()
-
-        if gt_boxes.numel() == 0:
-            matched_indices_for_text.append(
-                torch.empty(0, device=device, dtype=torch.long)
-            )
-            max_iou_list.append(torch.zeros(N, device=device, dtype=pred_bbox.dtype))
-            best_gt_index_list.append(torch.zeros(N, device=device, dtype=torch.long))
-            continue
-
-        iou_matrix = compute_iou_multi_single(
-            pred_bbox[b],
-            gt_boxes
+        indices = self.matcher(
+            pred_bbox=pred_bbox,
+            pred_score_logit=pred_score_logit,
+            targets=targets,
         )
 
-        max_iou, best_gt_idx = iou_matrix.max(dim=1)
+        B, N, _ = pred_bbox.shape
 
-        max_iou_list.append(max_iou)
-        best_gt_index_list.append(best_gt_idx)
+        score_target = torch.zeros_like(pred_score_logit)
 
-        top_k = max(1, int(N * positive_ratio))
-        topk_iou, topk_idx = max_iou.detach().topk(k=top_k, dim=0)
+        loss_bbox = pred_bbox.new_tensor(0.0)
+        loss_giou = pred_bbox.new_tensor(0.0)
+        total_matched = 0
 
-        soft_values = topk_iou.pow(2)
-        soft_values = soft_values / soft_values.max().clamp(min=1e-6)
-        soft_values = soft_values.to(dtype=target_score.dtype)
+        for b, (pred_idx, gt_idx) in enumerate(indices):
+            if pred_idx.numel() == 0:
+                continue
 
-        target_score[b, topk_idx, 0] = soft_values
-
-        matched_for_text = []
-
-        for gt_idx in range(gt_boxes.shape[0]):
-            proposal_for_gt = iou_matrix[:, gt_idx].argmax()
-            matched_for_text.append(proposal_for_gt)
-
-            pred_box = pred_bbox[b, proposal_for_gt].unsqueeze(0)
-            gt_box = gt_boxes[gt_idx].unsqueeze(0)
-
-            bbox_loss = (
-                siou_loss(pred_box, gt_box)
-                + F.l1_loss(pred_box, gt_box)
+            tgt_bbox = targets[b]["boxes"].to(
+                device=pred_bbox.device,
+                dtype=pred_bbox.dtype,
             )
 
-            bbox_losses.append(bbox_loss)
+            matched_pred = pred_bbox[b, pred_idx]
+            matched_tgt = tgt_bbox[gt_idx]
 
-        matched_for_text = torch.stack(matched_for_text).unique()
-        matched_indices_for_text.append(matched_for_text)
+            score_target[b, pred_idx, 0] = 1.0
 
-    if len(bbox_losses) > 0:
-        loss_bbox = torch.stack(bbox_losses).mean()
-    else:
-        loss_bbox = pred_bbox.sum() * 0.0
+            loss_bbox = loss_bbox + F.l1_loss(
+                matched_pred,
+                matched_tgt,
+                reduction="sum",
+            )
 
-    loss_score = FocalLoss()(score_logits, target_score)
+            giou = generalized_box_iou(
+                matched_pred,
+                matched_tgt,
+            )
 
-    loss_text = contrastive_loss_multi(
-        text_feat=text_feat,
-        bbox_feat=bbox_feat,
-        matched_indices=matched_indices_for_text
-    )
+            loss_giou = loss_giou + (1.0 - torch.diag(giou)).sum()
 
-    total_loss = (
-        lambda_bbox * loss_bbox
-        + lambda_score * loss_score
-        + lambda_text * loss_text
-    )
+            total_matched += int(pred_idx.numel())
 
-    max_iou_tensor = torch.stack(max_iou_list, dim=0)
+        total = max(total_matched, 1)
 
-    return total_loss, {
-        "loss_bbox": loss_bbox.detach(),
-        "loss_score": loss_score.detach(),
-        "loss_text": loss_text.detach(),
-        "iou": max_iou_tensor.detach(),
-        "target_score_mean": target_score.detach().mean(),
-        "positive_ratio": torch.tensor(positive_ratio, device=device),
-    }
+        loss_bbox = loss_bbox / total
+        loss_giou = loss_giou / total
+
+        pos_weight_tensor = pred_score_logit.new_tensor([float(pos_weight)])
+
+        loss_score = F.binary_cross_entropy_with_logits(
+            pred_score_logit,
+            score_target,
+            pos_weight=pos_weight_tensor,
+            reduction="mean",
+        )
+
+        loss = (
+            float(lambda_bbox) * loss_bbox
+            +
+            float(lambda_giou) * loss_giou
+            +
+            float(lambda_score) * loss_score
+        )
+
+        loss_dict = {
+            "loss": loss.detach(),
+            "loss_bbox": loss_bbox.detach(),
+            "loss_giou": loss_giou.detach(),
+            "loss_score": loss_score.detach(),
+            "matched": float(total_matched),
+            "lambda_bbox": float(lambda_bbox),
+            "lambda_giou": float(lambda_giou),
+            "lambda_score": float(lambda_score),
+            "pos_weight": float(pos_weight),
+        }
+
+        return loss, loss_dict
+
+

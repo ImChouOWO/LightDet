@@ -1,0 +1,66 @@
+data:
+  dataset_dir: /home/soic/Desktop/LightDet/datasets
+  image_size: 640
+  max_text_aug_per_image: 1
+
+train:
+  epochs: 300
+  batch_size: 32
+  warmup_epochs: 5
+  num_workers: 18
+  device: cuda:1
+  seed: 42
+  deterministic: true
+  use_amp: true
+  use_ema: true
+  ema_decay: 0.999
+  grad_clip_norm: 1.0
+
+optim:
+  lr_vision: 0.0001
+  lr_text: 0.00001
+  lr_transformer: 0.0001
+  lr_head: 0.0001
+  weight_decay: 0.0001
+  min_lr_ratio: 0.05
+  max_warmup_steps: 3000
+
+loss:
+  matcher:
+    cost_bbox: 5.0
+    cost_giou: 2.0
+    cost_score: 1.0
+
+  weight:
+    dynamic: true
+
+    bbox_start: 5.0
+    bbox_end: 3.0
+    bbox_decay_until: 0.5
+
+    giou: 2.0
+
+    score_start: 1.0
+    score_end: 2.0
+    score_warm_until: 0.4
+
+  pos_weight:
+    min: 1.0
+    max: 5.0
+    warm_until: 0.5
+
+eval:
+  val_loss_interval: 1
+  eval_interval: 1
+  max_val_batches: 320
+  score_thr: 0.25
+  top_k: 20
+  nms_iou_thr: 0.5
+  best_metric: map50
+
+log:
+  save_dir: null
+  resume_path: null
+  save_epoch_interval: 50
+  emit_step_metrics: true
+  log_interval: 10

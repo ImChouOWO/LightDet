@@ -1,12 +1,11 @@
 model:
-  num_layer: 4
-  dyhead_layer: 2
+  img_in_channels: 1024
   hidden_dim: 512
   num_heads: 8
-  mlp_ratio: 4.0
+  num_layers: 3
+  mlp_ratio: 3.5
   image_grid_size: 10
-
-proposal:
-  max_drop: 0.8
-  start_ratio: 0.3
-  end_ratio: 0.7
+  text_max_length: 32
+  fusion_token_num: 16
+  dropout: 0.1
+  freeze_bert: true

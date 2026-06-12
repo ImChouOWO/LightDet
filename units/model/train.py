@@ -1,27 +1,124 @@
+from types import SimpleNamespace
 import os
 import sys
-
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-UNITS_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
-sys.path.insert(0, UNITS_DIR)
-
-from model.cards.main import Model
-from model.cards.loss import compute_total_loss
-from model.pipeline.data import build_dataloaders
-import shutil
-import random
-import numpy as np
+import csv
+import json
+import time
 import math
 import copy
+import random
+import shutil
+from pathlib import Path
+
+import yaml
+import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torch.multiprocessing as mp
 from torch.optim import AdamW
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
-import time
+from scipy.optimize import linear_sum_assignment
 from torchvision.ops import nms
 
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+UNITS_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "../.."))
+
+for path in [PROJECT_ROOT, UNITS_DIR, CURRENT_DIR]:
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+from units.tool.card import VisionTextModel
+from units.model.pipeline.data import build_dataloaders
+
+
 mp.set_sharing_strategy("file_system")
+
+
+
+# Basic utils
+def set_seed(seed):
+    if seed is None:
+        return
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def count_parameters(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    def fmt(x):
+        if x >= 1e9:
+            return f"{x / 1e9:.3f}B"
+        if x >= 1e6:
+            return f"{x / 1e6:.3f}M"
+        if x >= 1e3:
+            return f"{x / 1e3:.3f}K"
+        return str(x)
+
+    return fmt(total), fmt(trainable)
+
+
+def get_rng_state_dict():
+    rng_state = {
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "python": random.getstate(),
+        "numpy": None,
+    }
+
+    try:
+        rng_state["numpy"] = np.random.get_state()
+    except Exception:
+        rng_state["numpy"] = None
+
+    return rng_state
+
+
+def restore_rng_state(rng_state):
+    if not isinstance(rng_state, dict):
+        return
+
+    if rng_state.get("torch", None) is not None:
+        torch.set_rng_state(rng_state["torch"])
+
+    if torch.cuda.is_available() and rng_state.get("cuda", None) is not None:
+        torch.cuda.set_rng_state_all(rng_state["cuda"])
+
+    if rng_state.get("python", None) is not None:
+        random.setstate(rng_state["python"])
+
+    if rng_state.get("numpy", None) is not None:
+        try:
+            np.random.set_state(rng_state["numpy"])
+        except Exception:
+            pass
+
+
+def build_scaler(device):
+    enabled = device.type == "cuda"
+
+    try:
+        return GradScaler(device.type, enabled=enabled)
+    except TypeError:
+        return GradScaler(enabled=enabled)
+
+
+def get_amp_enabled(device, use_amp=True):
+    return bool(use_amp and device.type == "cuda")
+
+
+
+# EMA
 
 
 class ModelEMA:
@@ -46,24 +143,40 @@ class ModelEMA:
                 ema_v.copy_(model_v)
 
 
+
+# Optimizer / Scheduler
+
+
 def build_optimizer(
     model,
-    lr_backbone=1e-5,
-    lr_text_encoder=1e-5,
+    lr_vision=1e-4,
+    lr_text=1e-5,
+    lr_transformer=1e-4,
     lr_head=1e-4,
-    weight_decay=1e-4
+    weight_decay=1e-4,
 ):
-    no_decay = ["bias", "LayerNorm.weight", "norm.weight"]
+    no_decay = [
+        "bias",
+        "LayerNorm.weight",
+        "norm.weight",
+        "bn.weight",
+        "BatchNorm",
+    ]
+
     param_groups = []
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
 
-        if "vis_text_model.backbone" in name:
-            lr = lr_backbone
-        elif "vis_text_model.text_encoder" in name:
-            lr = lr_text_encoder
+        if "text_model.model" in name:
+            lr = lr_text
+        elif "bottle_net" in name or "img_model" in name:
+            lr = lr_vision
+        elif "transformer" in name:
+            lr = lr_transformer
+        elif "head" in name:
+            lr = lr_head
         else:
             lr = lr_head
 
@@ -72,7 +185,8 @@ def build_optimizer(
         param_groups.append({
             "params": [param],
             "lr": lr,
-            "weight_decay": decay
+            "weight_decay": decay,
+            "name": name,
         })
 
     return AdamW(param_groups)
@@ -81,9 +195,9 @@ def build_optimizer(
 class WarmupCosineScheduler:
     def __init__(self, optimizer, warmup_steps, total_steps, min_lr_ratio=0.05):
         self.optimizer = optimizer
-        self.warmup_steps = warmup_steps
-        self.total_steps = total_steps
-        self.min_lr_ratio = min_lr_ratio
+        self.warmup_steps = int(warmup_steps)
+        self.total_steps = int(total_steps)
+        self.min_lr_ratio = float(min_lr_ratio)
         self.step_num = 0
         self.base_lrs = [group["lr"] for group in optimizer.param_groups]
 
@@ -94,9 +208,11 @@ class WarmupCosineScheduler:
             factor = self.step_num / max(1, self.warmup_steps)
         else:
             progress = (self.step_num - self.warmup_steps) / max(
-                1, self.total_steps - self.warmup_steps
+                1,
+                self.total_steps - self.warmup_steps
             )
             progress = min(max(progress, 0.0), 1.0)
+
             cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
             factor = self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cosine
 
@@ -107,46 +223,364 @@ class WarmupCosineScheduler:
         return [group["lr"] for group in self.optimizer.param_groups]
 
 
-def get_drop_proposal_prob(
-    epoch,
-    total_epochs,
-    max_drop=0.8,
-    start_ratio=0.3,
-    end_ratio=0.7
-):
-    progress = epoch / total_epochs
 
-    if progress < start_ratio:
-        return 0.0
+# Dynamic training schedule
 
-    if progress >= end_ratio:
-        return max_drop
 
-    ratio = (progress - start_ratio) / max(1e-8, end_ratio - start_ratio)
-    return max_drop * ratio
+def get_loss_weights(epoch, total_epochs, args):
+    progress = epoch / max(1, total_epochs)
+
+    if not args.loss_dynamic:
+        return (
+            float(args.lambda_bbox),
+            float(args.lambda_giou),
+            float(args.lambda_score),
+        )
+
+    bbox_decay_until = max(1e-8, float(args.lambda_bbox_decay_until))
+    bbox_ratio = min(progress / bbox_decay_until, 1.0)
+
+    lambda_bbox = (
+        float(args.lambda_bbox_start)
+        +
+        (
+            float(args.lambda_bbox_end)
+            -
+            float(args.lambda_bbox_start)
+        )
+        * bbox_ratio
+    )
+
+    lambda_giou = float(args.lambda_giou)
+
+    score_warm_until = max(1e-8, float(args.lambda_score_warm_until))
+    score_ratio = min(progress / score_warm_until, 1.0)
+
+    lambda_score = (
+        float(args.lambda_score_start)
+        +
+        (
+            float(args.lambda_score_end)
+            -
+            float(args.lambda_score_start)
+        )
+        * score_ratio
+    )
+
+    return lambda_bbox, lambda_giou, lambda_score
+
+
+def get_pos_weight(epoch, total_epochs, args):
+    progress = epoch / max(1, total_epochs)
+
+    warm_until = max(1e-8, float(args.pos_weight_warm_until))
+    ratio = min(progress / warm_until, 1.0)
+
+    pos_weight = (
+        float(args.min_pos_weight)
+        +
+        (
+            float(args.max_pos_weight)
+            -
+            float(args.min_pos_weight)
+        )
+        * ratio
+    )
+
+    return pos_weight
+
+
+
+# Loss: normalized xyxy + Hungarian matcher
+
+
+def box_area(box):
+    return (
+        (box[..., 2] - box[..., 0]).clamp(min=0)
+        *
+        (box[..., 3] - box[..., 1]).clamp(min=0)
+    )
+
+
+def box_iou_xyxy(boxes1, boxes2, eps=1e-7):
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return boxes1.new_zeros((boxes1.shape[0], boxes2.shape[0]))
+
+    area1 = box_area(boxes1)
+    area2 = box_area(boxes2)
+
+    lt = torch.max(boxes1[:, None, :2], boxes2[None, :, :2])
+    rb = torch.min(boxes1[:, None, 2:], boxes2[None, :, 2:])
+
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[..., 0] * wh[..., 1]
+
+    union = area1[:, None] + area2[None, :] - inter
+
+    return inter / union.clamp(min=eps)
+
+
+def generalized_box_iou(boxes1, boxes2):
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return boxes1.new_zeros((boxes1.shape[0], boxes2.shape[0]))
+
+    area1 = box_area(boxes1)
+    area2 = box_area(boxes2)
+
+    lt = torch.max(boxes1[:, None, :2], boxes2[None, :, :2])
+    rb = torch.min(boxes1[:, None, 2:], boxes2[None, :, 2:])
+
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[..., 0] * wh[..., 1]
+
+    union = area1[:, None] + area2[None, :] - inter
+    iou = inter / union.clamp(min=1e-6)
+
+    lt_c = torch.min(boxes1[:, None, :2], boxes2[None, :, :2])
+    rb_c = torch.max(boxes1[:, None, 2:], boxes2[None, :, 2:])
+
+    wh_c = (rb_c - lt_c).clamp(min=0)
+    area_c = wh_c[..., 0] * wh_c[..., 1]
+
+    giou = iou - (area_c - union) / area_c.clamp(min=1e-6)
+
+    return giou
+
+
+class HungarianMatcher:
+    def __init__(self, cost_bbox=5.0, cost_giou=2.0, cost_score=1.0):
+        self.cost_bbox = cost_bbox
+        self.cost_giou = cost_giou
+        self.cost_score = cost_score
+
+    @torch.no_grad()
+    def __call__(self, pred_bbox, pred_score_logit, targets):
+        B, N, _ = pred_bbox.shape
+        indices = []
+
+        pred_score = pred_score_logit.sigmoid().squeeze(-1)
+
+        for b in range(B):
+            tgt_bbox = targets[b]["boxes"].to(
+                device=pred_bbox.device,
+                dtype=pred_bbox.dtype
+            )
+
+            if tgt_bbox.numel() == 0:
+                indices.append((
+                    torch.empty(0, dtype=torch.long, device=pred_bbox.device),
+                    torch.empty(0, dtype=torch.long, device=pred_bbox.device),
+                ))
+                continue
+
+            out_bbox = pred_bbox[b]
+            out_score = pred_score[b]
+
+            cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+            cost_giou = -generalized_box_iou(out_bbox, tgt_bbox)
+            cost_score = -out_score[:, None]
+
+            cost = (
+                self.cost_bbox * cost_bbox
+                +
+                self.cost_giou * cost_giou
+                +
+                self.cost_score * cost_score
+            )
+
+            pred_idx, gt_idx = linear_sum_assignment(cost.detach().cpu().numpy())
+
+            indices.append((
+                torch.as_tensor(pred_idx, dtype=torch.long, device=pred_bbox.device),
+                torch.as_tensor(gt_idx, dtype=torch.long, device=pred_bbox.device),
+            ))
+
+        return indices
+
+
+class GroundingLoss(nn.Module):
+    def __init__(
+        self,
+        cost_bbox=5.0,
+        cost_giou=2.0,
+        cost_score=1.0,
+    ):
+        super().__init__()
+
+        self.matcher = HungarianMatcher(
+            cost_bbox=cost_bbox,
+            cost_giou=cost_giou,
+            cost_score=cost_score,
+        )
+
+    def forward(
+        self,
+        pred_bbox,
+        pred_score_logit,
+        targets,
+        lambda_bbox=5.0,
+        lambda_giou=2.0,
+        lambda_score=1.0,
+        pos_weight=1.0,
+    ):
+        indices = self.matcher(pred_bbox, pred_score_logit, targets)
+
+        B, N, _ = pred_bbox.shape
+
+        score_target = torch.zeros_like(pred_score_logit)
+
+        loss_bbox = pred_bbox.new_tensor(0.0)
+        loss_giou = pred_bbox.new_tensor(0.0)
+        total_matched = 0
+
+        for b, (pred_idx, gt_idx) in enumerate(indices):
+            if pred_idx.numel() == 0:
+                continue
+
+            tgt_bbox = targets[b]["boxes"].to(
+                device=pred_bbox.device,
+                dtype=pred_bbox.dtype
+            )
+
+            matched_pred = pred_bbox[b, pred_idx]
+            matched_tgt = tgt_bbox[gt_idx]
+
+            score_target[b, pred_idx, 0] = 1.0
+
+            loss_bbox = loss_bbox + F.l1_loss(
+                matched_pred,
+                matched_tgt,
+                reduction="sum"
+            )
+
+            giou = generalized_box_iou(matched_pred, matched_tgt)
+            loss_giou = loss_giou + (1.0 - torch.diag(giou)).sum()
+
+            total_matched += int(pred_idx.numel())
+
+        total = max(total_matched, 1)
+
+        loss_bbox = loss_bbox / total
+        loss_giou = loss_giou / total
+
+        pos_weight_tensor = pred_score_logit.new_tensor([pos_weight])
+
+        loss_score = F.binary_cross_entropy_with_logits(
+            pred_score_logit,
+            score_target,
+            pos_weight=pos_weight_tensor,
+            reduction="mean"
+        )
+
+        loss = (
+            lambda_bbox * loss_bbox
+            +
+            lambda_giou * loss_giou
+            +
+            lambda_score * loss_score
+        )
+
+        loss_dict = {
+            "loss": loss.detach(),
+            "loss_bbox": loss_bbox.detach(),
+            "loss_giou": loss_giou.detach(),
+            "loss_score": loss_score.detach(),
+            "matched": float(total_matched),
+        }
+
+        return loss, loss_dict
+
+
+
+# Batch helper
+
+
+def move_targets_to_device(batch, device):
+    """
+    支援新版 dataloader:
+        batch["targets"] = [{"boxes": ..., ...}, ...]
+
+    也支援你舊 collate 的 fallback:
+        batch["target_boxes_per_image"]
+    """
+
+    if "targets" in batch:
+        raw_targets = batch["targets"]
+    else:
+        raw_targets = []
+
+        boxes_list = batch["target_boxes_per_image"]
+        labels_list = batch.get("target_labels_per_image", None)
+
+        for i, boxes in enumerate(boxes_list):
+            target = {"boxes": boxes}
+
+            if labels_list is not None:
+                target["labels"] = labels_list[i]
+
+            raw_targets.append(target)
+
+    targets = []
+
+    for t in raw_targets:
+        nt = {}
+
+        for k, v in t.items():
+            if torch.is_tensor(v):
+                nt[k] = v.to(device, non_blocking=True)
+            else:
+                nt[k] = v
+
+        if "boxes" not in nt:
+            raise KeyError("target must contain key: boxes")
+
+        targets.append(nt)
+
+    return targets
+
+
+def get_score_logit(outputs):
+    if "score_logit" in outputs:
+        return outputs["score_logit"]
+
+    if "score" in outputs:
+        return outputs["score"]
+
+    raise KeyError("Model output must contain score_logit")
+
+
+
+# Train / Val loss
+
 
 def train_one_epoch(
     model,
     ema,
+    criterion,
     train_loader,
     optimizer,
     scheduler,
+    scaler,
     device,
     epoch,
     num_epochs,
-    image_size,
-    scaler=None,
     use_amp=True,
     grad_clip_norm=1.0,
-    lambda_bbox=1.0,
+    lambda_bbox=5.0,
+    lambda_giou=2.0,
     lambda_score=1.0,
-    lambda_text=0.5,
-    positive_ratio=0.05,
-    drop_proposal_prob=0.0
+    pos_weight=1.0,
+    log_interval=10,
+    step_metrics_path=None,
 ):
     model.train()
+
     total_loss_sum = 0.0
-    dropped_batch_count = 0
+    total_bbox_sum = 0.0
+    total_giou_sum = 0.0
+    total_score_sum = 0.0
+
+    amp_enabled = get_amp_enabled(device, use_amp)
 
     pbar = tqdm(
         enumerate(train_loader),
@@ -157,57 +591,28 @@ def train_one_epoch(
     )
 
     for step, batch in pbar:
+        global_step = (epoch - 1) * len(train_loader) + step + 1
+
         images = batch["images"].to(device, non_blocking=True)
-
-        boxes_per_image = [
-            b.to(device, non_blocking=True)
-            for b in batch["boxes_per_image"]
-        ]
-
-        target_boxes_per_image = [
-            b.to(device, non_blocking=True)
-            for b in batch["target_boxes_per_image"]
-        ]
-
         query_texts = batch["query_texts"]
-
-        proposal_dropped = False
-
-        if drop_proposal_prob > 0.0:
-            if torch.rand(1, device=device).item() < drop_proposal_prob:
-                boxes_per_image = [
-                    torch.empty(
-                        0,
-                        4,
-                        device=device,
-                        dtype=b.dtype
-                    )
-                    for b in boxes_per_image
-                ]
-
-                proposal_dropped = True
-                dropped_batch_count += 1
+        targets = move_targets_to_device(batch, device)
 
         optimizer.zero_grad(set_to_none=True)
 
-        amp_enabled = use_amp and device.type == "cuda"
-
         with autocast(device_type=device.type, enabled=amp_enabled):
-            outputs = model(
-                images=images,
-                boxes_per_image=boxes_per_image,
-                texts=query_texts,
-                image_size=image_size
-            )
+            outputs = model(images, query_texts)
 
-            loss, loss_dict = compute_total_loss(
-                outputs=outputs,
-                gt_boxes_per_image=target_boxes_per_image,
-                text_feat=outputs["text_feat"],
+            pred_bbox = outputs["bbox"]
+            pred_score_logit = get_score_logit(outputs)
+
+            loss, loss_dict = criterion(
+                pred_bbox=pred_bbox,
+                pred_score_logit=pred_score_logit,
+                targets=targets,
                 lambda_bbox=lambda_bbox,
+                lambda_giou=lambda_giou,
                 lambda_score=lambda_score,
-                lambda_text=lambda_text,
-                positive_ratio=positive_ratio
+                pos_weight=pos_weight,
             )
 
         if amp_enabled:
@@ -232,169 +637,348 @@ def train_one_epoch(
         if ema is not None:
             ema.update(model)
 
-        total_loss_sum += loss.item()
+        loss_item = float(loss.item())
+        bbox_item = float(loss_dict["loss_bbox"].item())
+        giou_item = float(loss_dict["loss_giou"].item())
+        score_item = float(loss_dict["loss_score"].item())
+
+        total_loss_sum += loss_item
+        total_bbox_sum += bbox_item
+        total_giou_sum += giou_item
+        total_score_sum += score_item
+
         avg_loss = total_loss_sum / (step + 1)
         current_lr = scheduler.get_lr()[0]
-        drop_rate_now = dropped_batch_count / max(1, step + 1)
 
         pbar.set_postfix({
             "lr": f"{current_lr:.2e}",
-            "loss": f"{loss.item():.4f}",
+            "loss": f"{loss_item:.4f}",
             "avg": f"{avg_loss:.4f}",
-            "bbox": f"{loss_dict['loss_bbox'].item():.4f}",
-            "score": f"{loss_dict['loss_score'].item():.4f}",
-            "text": f"{loss_dict['loss_text'].item():.4f}",
+            "bbox": f"{bbox_item:.4f}",
+            "giou": f"{giou_item:.4f}",
+            "score": f"{score_item:.4f}",
             "lb": f"{lambda_bbox:.2f}",
+            "lg": f"{lambda_giou:.2f}",
             "ls": f"{lambda_score:.2f}",
-            "lt": f"{lambda_text:.2f}",
-            "pos": f"{positive_ratio:.3f}",
-            "drop": f"{drop_proposal_prob:.2f}",
-            "dr": f"{drop_rate_now:.2f}",
+            "pw": f"{pos_weight:.2f}",
         })
 
-    return total_loss_sum / max(1, len(train_loader))
+        if step_metrics_path is not None and (step + 1) % log_interval == 0:
+            append_jsonl(step_metrics_path, {
+                "type": "step",
+                "time": time.time(),
+                "epoch": epoch,
+                "step": step + 1,
+                "global_step": global_step,
+                "lr": current_lr,
+                "train_loss": loss_item,
+                "train_loss_avg": avg_loss,
+                "loss_bbox": bbox_item,
+                "loss_giou": giou_item,
+                "loss_score": score_item,
+                "lambda_bbox": lambda_bbox,
+                "lambda_giou": lambda_giou,
+                "lambda_score": lambda_score,
+                "pos_weight": pos_weight,
+            })
+
+    n = max(1, len(train_loader))
+
+    return {
+        "train_loss": total_loss_sum / n,
+        "train_loss_bbox": total_bbox_sum / n,
+        "train_loss_giou": total_giou_sum / n,
+        "train_loss_score": total_score_sum / n,
+    }
 
 
 @torch.no_grad()
-def validate_one_epoch(
+def validate_loss_one_epoch(
     model,
+    criterion,
     val_loader,
     device,
     epoch,
-    image_size,
     use_amp=True,
-    lambda_bbox=1.0,
+    lambda_bbox=5.0,
+    lambda_giou=2.0,
     lambda_score=1.0,
-    lambda_text=0.5,
-    positive_ratio=0.05
+    pos_weight=1.0,
 ):
     model.eval()
+
     total_loss_sum = 0.0
+    total_bbox_sum = 0.0
+    total_giou_sum = 0.0
+    total_score_sum = 0.0
+
+    amp_enabled = get_amp_enabled(device, use_amp)
 
     pbar = tqdm(
         enumerate(val_loader),
         total=len(val_loader),
-        desc=f"Epoch {epoch} [Val]",
+        desc=f"Epoch {epoch} [Val Loss]",
         dynamic_ncols=True,
         leave=True
     )
 
     for step, batch in pbar:
         images = batch["images"].to(device, non_blocking=True)
-        boxes_per_image = [b.to(device, non_blocking=True) for b in batch["boxes_per_image"]]
-        target_boxes_per_image = [
-            b.to(device, non_blocking=True)
-            for b in batch["target_boxes_per_image"]
-        ]
         query_texts = batch["query_texts"]
-
-        amp_enabled = use_amp and device.type == "cuda"
+        targets = move_targets_to_device(batch, device)
 
         with autocast(device_type=device.type, enabled=amp_enabled):
-            outputs = model(
-                images=images,
-                boxes_per_image=boxes_per_image,
-                texts=query_texts,
-                image_size=image_size
-            )
+            outputs = model(images, query_texts)
 
-            loss, loss_dict = compute_total_loss(
-                outputs=outputs,
-                gt_boxes_per_image=target_boxes_per_image,
-                text_feat=outputs["text_feat"],
+            pred_bbox = outputs["bbox"]
+            pred_score_logit = get_score_logit(outputs)
+
+            loss, loss_dict = criterion(
+                pred_bbox=pred_bbox,
+                pred_score_logit=pred_score_logit,
+                targets=targets,
                 lambda_bbox=lambda_bbox,
+                lambda_giou=lambda_giou,
                 lambda_score=lambda_score,
-                lambda_text=lambda_text,
-                positive_ratio=positive_ratio
+                pos_weight=pos_weight,
             )
 
-        total_loss_sum += loss.item()
+        loss_item = float(loss.item())
+        bbox_item = float(loss_dict["loss_bbox"].item())
+        giou_item = float(loss_dict["loss_giou"].item())
+        score_item = float(loss_dict["loss_score"].item())
+
+        total_loss_sum += loss_item
+        total_bbox_sum += bbox_item
+        total_giou_sum += giou_item
+        total_score_sum += score_item
+
         avg_loss = total_loss_sum / (step + 1)
 
         pbar.set_postfix({
-            "val_loss": f"{loss.item():.4f}",
+            "val_loss": f"{loss_item:.4f}",
             "avg": f"{avg_loss:.4f}",
-            "bbox": f"{loss_dict['loss_bbox'].item():.4f}",
-            "score": f"{loss_dict['loss_score'].item():.4f}",
-            "text": f"{loss_dict['loss_text'].item():.4f}",
-            "pos": f"{positive_ratio:.3f}",
+            "bbox": f"{bbox_item:.4f}",
+            "giou": f"{giou_item:.4f}",
+            "score": f"{score_item:.4f}",
         })
 
-    return total_loss_sum / max(1, len(val_loader))
+    n = max(1, len(val_loader))
+
+    return {
+        "val_loss": total_loss_sum / n,
+        "val_loss_bbox": total_bbox_sum / n,
+        "val_loss_giou": total_giou_sum / n,
+        "val_loss_score": total_score_sum / n,
+    }
 
 
-def cxcywh_to_xyxy(box):
-    cx, cy, w, h = box.unbind(-1)
 
-    x1 = cx - w / 2
-    y1 = cy - h / 2
-    x2 = cx + w / 2
-    y2 = cy + h / 2
-
-    return torch.stack([x1, y1, x2, y2], dim=-1)
-
-
-def compute_iou_multi_single(pred_bbox, gt_boxes, eps=1e-7):
-    if gt_boxes.numel() == 0:
-        return torch.zeros(
-            pred_bbox.shape[0],
-            0,
-            device=pred_bbox.device,
-            dtype=pred_bbox.dtype
-        )
-
-    pred_xyxy = cxcywh_to_xyxy(pred_bbox)
-    gt_xyxy = cxcywh_to_xyxy(gt_boxes)
-
-    pred_xyxy = pred_xyxy.unsqueeze(1)
-    gt_xyxy = gt_xyxy.unsqueeze(0)
-
-    px1, py1, px2, py2 = pred_xyxy.unbind(-1)
-    gx1, gy1, gx2, gy2 = gt_xyxy.unbind(-1)
-
-    inter_x1 = torch.max(px1, gx1)
-    inter_y1 = torch.max(py1, gy1)
-    inter_x2 = torch.min(px2, gx2)
-    inter_y2 = torch.min(py2, gy2)
-
-    inter_w = (inter_x2 - inter_x1).clamp(min=0)
-    inter_h = (inter_y2 - inter_y1).clamp(min=0)
-    inter_area = inter_w * inter_h
-
-    pred_area = (px2 - px1).clamp(min=0) * (py2 - py1).clamp(min=0)
-    gt_area = (gx2 - gx1).clamp(min=0) * (gy2 - gy1).clamp(min=0)
-
-    union = pred_area + gt_area - inter_area + eps
-
-    return inter_area / union
+# Detection metrics: query-conditioned binary detection
 
 
 @torch.no_grad()
-def inference_validate_one_epoch(
+def select_predictions(
+    boxes,
+    scores,
+    score_thr=0.25,
+    top_k=20,
+    nms_iou_thr=0.5,
+    use_topk_fallback=True,
+):
+    """
+    boxes:
+        [N, 4], normalized xyxy
+
+    scores:
+        [N], sigmoid score
+    """
+
+    N = boxes.shape[0]
+
+    if N == 0:
+        return boxes.new_zeros((0, 4)), scores.new_zeros((0,))
+
+    keep = scores >= score_thr
+
+    if keep.sum() > 0:
+        selected_boxes = boxes[keep]
+        selected_scores = scores[keep]
+    else:
+        if not use_topk_fallback:
+            return boxes.new_zeros((0, 4)), scores.new_zeros((0,))
+
+        k = min(top_k, N)
+        selected_scores, top_idx = scores.topk(k=k)
+        selected_boxes = boxes[top_idx]
+
+    if selected_scores.numel() > top_k:
+        selected_scores, top_idx = selected_scores.topk(k=top_k)
+        selected_boxes = selected_boxes[top_idx]
+
+    if selected_boxes.numel() == 0:
+        return selected_boxes, selected_scores
+
+    keep_idx = nms(
+        selected_boxes.float(),
+        selected_scores.float(),
+        iou_threshold=nms_iou_thr,
+    )
+
+    selected_boxes = selected_boxes[keep_idx]
+    selected_scores = selected_scores[keep_idx]
+
+    return selected_boxes, selected_scores
+
+
+def compute_ap_from_pr(precision, recall):
+    if precision.numel() == 0 or recall.numel() == 0:
+        return 0.0
+
+    mrec = torch.cat([
+        torch.tensor([0.0], dtype=recall.dtype),
+        recall,
+        torch.tensor([1.0], dtype=recall.dtype),
+    ])
+
+    mpre = torch.cat([
+        torch.tensor([0.0], dtype=precision.dtype),
+        precision,
+        torch.tensor([0.0], dtype=precision.dtype),
+    ])
+
+    for i in range(mpre.numel() - 1, 0, -1):
+        mpre[i - 1] = torch.maximum(mpre[i - 1], mpre[i])
+
+    idx = torch.where(mrec[1:] != mrec[:-1])[0]
+    ap = torch.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])
+
+    return float(ap.item())
+
+
+def evaluate_ap_at_iou(pred_records, gt_by_sample, iou_thr=0.5):
+    """
+    pred_records:
+        list of {
+            "sample_id": int,
+            "score": float,
+            "box": Tensor[4] CPU
+        }
+
+    gt_by_sample:
+        list of Tensor[M, 4] CPU
+    """
+
+    num_gt = sum(int(gt.shape[0]) for gt in gt_by_sample)
+
+    if num_gt == 0:
+        return {
+            "ap": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "tp": 0,
+            "fp": 0,
+            "num_gt": 0,
+            "num_pred": len(pred_records),
+        }
+
+    pred_records = sorted(
+        pred_records,
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    matched = [
+        torch.zeros((gt.shape[0],), dtype=torch.bool)
+        for gt in gt_by_sample
+    ]
+
+    tp = []
+    fp = []
+
+    for rec in pred_records:
+        sample_id = rec["sample_id"]
+        pred_box = rec["box"].view(1, 4)
+        gt_boxes = gt_by_sample[sample_id]
+
+        if gt_boxes.numel() == 0:
+            tp.append(0.0)
+            fp.append(1.0)
+            continue
+
+        ious = box_iou_xyxy(pred_box, gt_boxes)[0]
+        best_iou, best_idx = ious.max(dim=0)
+
+        if best_iou.item() >= iou_thr and not matched[sample_id][best_idx]:
+            matched[sample_id][best_idx] = True
+            tp.append(1.0)
+            fp.append(0.0)
+        else:
+            tp.append(0.0)
+            fp.append(1.0)
+
+    if len(tp) == 0:
+        return {
+            "ap": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "tp": 0,
+            "fp": 0,
+            "num_gt": num_gt,
+            "num_pred": 0,
+        }
+
+    tp = torch.tensor(tp, dtype=torch.float32)
+    fp = torch.tensor(fp, dtype=torch.float32)
+
+    cum_tp = torch.cumsum(tp, dim=0)
+    cum_fp = torch.cumsum(fp, dim=0)
+
+    recall = cum_tp / max(1, num_gt)
+    precision = cum_tp / torch.clamp(cum_tp + cum_fp, min=1e-6)
+
+    ap = compute_ap_from_pr(precision, recall)
+
+    final_tp = int(cum_tp[-1].item())
+    final_fp = int(cum_fp[-1].item())
+
+    final_precision = final_tp / max(1, final_tp + final_fp)
+    final_recall = final_tp / max(1, num_gt)
+
+    return {
+        "ap": ap,
+        "precision": final_precision,
+        "recall": final_recall,
+        "tp": final_tp,
+        "fp": final_fp,
+        "num_gt": num_gt,
+        "num_pred": len(pred_records),
+    }
+
+
+@torch.no_grad()
+def evaluate_detection_one_epoch(
     model,
     val_loader,
     device,
     epoch,
-    image_size,
     use_amp=True,
     score_thr=0.25,
     top_k=20,
     nms_iou_thr=0.5,
-    max_val_batches=320
+    max_val_batches=None,
+    use_topk_fallback=True,
 ):
     model.eval()
 
-    total_oracle_iou = 0.0
-    total_multi_best_iou = 0.0
-    total_samples = 0
+    amp_enabled = get_amp_enabled(device, use_amp)
 
-    oracle_recall_hits_05 = 0
-    multi_recall_hits_05 = 0
+    pred_records = []
+    gt_by_sample = []
 
-    oracle_recall_hits_075 = 0
-    multi_recall_hits_075 = 0
-
+    sample_id = 0
     skipped_empty_gt = 0
+    total_selected = 0
 
     pbar_total = (
         len(val_loader)
@@ -405,7 +989,7 @@ def inference_validate_one_epoch(
     pbar = tqdm(
         enumerate(val_loader),
         total=pbar_total,
-        desc=f"Epoch {epoch} [Infer Val]",
+        desc=f"Epoch {epoch} [Eval]",
         dynamic_ncols=True,
         leave=True
     )
@@ -415,675 +999,993 @@ def inference_validate_one_epoch(
             break
 
         images = batch["images"].to(device, non_blocking=True)
-
-        boxes_per_image = [
-            b.to(device, non_blocking=True)
-            for b in batch["boxes_per_image"]
-        ]
-
-        target_boxes_per_image = [
-            b.to(device, non_blocking=True)
-            for b in batch["target_boxes_per_image"]
-        ]
-
         query_texts = batch["query_texts"]
-
-        amp_enabled = use_amp and device.type == "cuda"
+        targets = move_targets_to_device(batch, device)
 
         with autocast(device_type=device.type, enabled=amp_enabled):
-            outputs = model(
-                images=images,
-                boxes_per_image=boxes_per_image,
-                texts=query_texts,
-                image_size=image_size
-            )
+            outputs = model(images, query_texts)
 
-        pred_bbox_set = outputs["bbox"]        # [B, N, 4]
-        score_logits = outputs["score"]        # [B, N, 1]
+        pred_bbox = outputs["bbox"]
+        pred_score_logit = get_score_logit(outputs)
+        pred_scores = pred_score_logit.sigmoid().squeeze(-1)
 
-        scores = torch.sigmoid(score_logits).squeeze(-1)
-
-        B, N, _ = pred_bbox_set.shape
-
-        oracle_iou_list = []
-        multi_best_ious = []
-        valid_B = 0
+        B = pred_bbox.shape[0]
 
         for b in range(B):
-            gt_boxes = target_boxes_per_image[b]
+            gt_boxes = targets[b]["boxes"].detach().float().cpu()
+            gt_by_sample.append(gt_boxes)
 
-            # 空 GT 直接略過，不納入 IoU / Recall 統計
             if gt_boxes.numel() == 0:
                 skipped_empty_gt += 1
-                continue
 
-            valid_B += 1
+            boxes_b = pred_bbox[b].detach()
+            scores_b = pred_scores[b].detach()
 
-            
-            # Oracle IoU
-            # 代表 proposal set 裡面理論上能達到的最佳 IoU
-            
-            proposal_iou_matrix = compute_iou_multi_single(
-                pred_bbox_set[b],
-                gt_boxes
-            )  # [N, M]
+            selected_boxes, selected_scores = select_predictions(
+                boxes=boxes_b,
+                scores=scores_b,
+                score_thr=score_thr,
+                top_k=top_k,
+                nms_iou_thr=nms_iou_thr,
+                use_topk_fallback=use_topk_fallback,
+            )
 
-            if proposal_iou_matrix.numel() == 0:
-                oracle_iou_b = torch.tensor(0.0, device=device)
-            else:
-                oracle_iou_b = proposal_iou_matrix.max()
+            total_selected += int(selected_boxes.shape[0])
 
-            oracle_iou_list.append(oracle_iou_b)
+            for box, score in zip(selected_boxes, selected_scores):
+                pred_records.append({
+                    "sample_id": sample_id,
+                    "score": float(score.item()),
+                    "box": box.detach().float().cpu(),
+                })
 
-            
-            # Multi Proposal selection
-            
-            b_boxes = pred_bbox_set[b]
-            b_scores = scores[b]
-
-            keep = b_scores >= score_thr
-
-            if keep.sum() > 0:
-                selected_boxes = b_boxes[keep]
-                selected_scores = b_scores[keep]
-            else:
-                k = min(top_k, N)
-
-                if k == 0:
-                    selected_boxes = b_boxes.new_zeros((0, 4))
-                    selected_scores = b_scores.new_zeros((0,))
-                else:
-                    selected_scores, top_idx = b_scores.topk(k=k)
-                    selected_boxes = b_boxes[top_idx]
-
-            # 限制 proposal 數量
-            if selected_scores.numel() > top_k:
-                selected_scores, top_idx = selected_scores.topk(k=top_k)
-                selected_boxes = selected_boxes[top_idx]
-
-            
-            # NMS
-            
-            if selected_boxes.numel() == 0:
-                multi_best_iou = torch.tensor(0.0, device=device)
-            else:
-                selected_boxes_xyxy = cxcywh_to_xyxy(selected_boxes)
-
-                keep_idx = nms(
-                    selected_boxes_xyxy.float(),
-                    selected_scores.float(),
-                    iou_threshold=nms_iou_thr
-                )
-
-                selected_boxes = selected_boxes[keep_idx]
-
-                if selected_boxes.numel() == 0:
-                    multi_best_iou = torch.tensor(0.0, device=device)
-                else:
-                    selected_ious_matrix = compute_iou_multi_single(
-                        selected_boxes,
-                        gt_boxes
-                    )
-
-                    if selected_ious_matrix.numel() == 0:
-                        multi_best_iou = torch.tensor(0.0, device=device)
-                    else:
-                        multi_best_iou = selected_ious_matrix.max()
-
-            multi_best_ious.append(multi_best_iou)
-
-        # 這個 batch 如果全部都是 empty GT，就跳過統計
-        if valid_B == 0:
-            pbar.set_postfix({
-                "multi_iou": f"{total_multi_best_iou / max(1, total_samples):.4f}",
-                "oracle_iou": f"{total_oracle_iou / max(1, total_samples):.4f}",
-                "MR@0.5": f"{multi_recall_hits_05 / max(1, total_samples):.4f}",
-                "OR@0.5": f"{oracle_recall_hits_05 / max(1, total_samples):.4f}",
-                "skip_empty": skipped_empty_gt,
-            })
-            continue
-
-        
-        # Batch statistics
-        
-        oracle_iou = torch.stack(oracle_iou_list, dim=0)
-        multi_best_ious = torch.stack(multi_best_ious, dim=0)
-
-        total_oracle_iou += oracle_iou.sum().item()
-        total_multi_best_iou += multi_best_ious.sum().item()
-
-        total_samples += valid_B
-
-        oracle_recall_hits_05 += (oracle_iou >= 0.5).sum().item()
-        multi_recall_hits_05 += (multi_best_ious >= 0.5).sum().item()
-
-        oracle_recall_hits_075 += (oracle_iou >= 0.75).sum().item()
-        multi_recall_hits_075 += (multi_best_ious >= 0.75).sum().item()
-
-        mean_oracle_iou = total_oracle_iou / max(1, total_samples)
-        mean_multi_iou = total_multi_best_iou / max(1, total_samples)
-
-        oracle_recall_05 = oracle_recall_hits_05 / max(1, total_samples)
-        multi_recall_05 = multi_recall_hits_05 / max(1, total_samples)
-
-        oracle_recall_075 = oracle_recall_hits_075 / max(1, total_samples)
-        multi_recall_075 = multi_recall_hits_075 / max(1, total_samples)
+            sample_id += 1
 
         pbar.set_postfix({
-            "multi_iou": f"{mean_multi_iou:.4f}",
-            "oracle_iou": f"{mean_oracle_iou:.4f}",
-            "MR@0.5": f"{multi_recall_05:.4f}",
-            "OR@0.5": f"{oracle_recall_05:.4f}",
-            "MR@0.75": f"{multi_recall_075:.4f}",
-            "OR@0.75": f"{oracle_recall_075:.4f}",
+            "samples": sample_id,
+            "pred": len(pred_records),
+            "sel/img": f"{total_selected / max(1, sample_id):.2f}",
             "skip_empty": skipped_empty_gt,
         })
 
-    
-    # Final Metrics
-    
+    ap50 = evaluate_ap_at_iou(pred_records, gt_by_sample, iou_thr=0.50)
+
+    ap_list = []
+    for thr in np.arange(0.50, 0.96, 0.05):
+        ap_t = evaluate_ap_at_iou(pred_records, gt_by_sample, iou_thr=float(thr))
+        ap_list.append(ap_t["ap"])
+
+    map50_95 = float(np.mean(ap_list)) if len(ap_list) > 0 else 0.0
+
     metrics = {
-        "multi_mean_iou": total_multi_best_iou / max(1, total_samples),
-        "oracle_iou": total_oracle_iou / max(1, total_samples),
-
-        "multi_recall@0.5": multi_recall_hits_05 / max(1, total_samples),
-        "oracle_recall@0.5": oracle_recall_hits_05 / max(1, total_samples),
-
-        "multi_recall@0.75": multi_recall_hits_075 / max(1, total_samples),
-        "oracle_recall@0.75": oracle_recall_hits_075 / max(1, total_samples),
-
-        "valid_samples": total_samples,
+        "map50": ap50["ap"],
+        "map50_95": map50_95,
+        "precision": ap50["precision"],
+        "recall": ap50["recall"],
+        "tp": ap50["tp"],
+        "fp": ap50["fp"],
+        "num_gt": ap50["num_gt"],
+        "num_pred": ap50["num_pred"],
+        "valid_samples": sample_id,
         "skipped_empty_gt": skipped_empty_gt,
+        "avg_selected_per_sample": total_selected / max(1, sample_id),
     }
 
     tqdm.write(
-        f"Inference Val Epoch [{epoch}] "
-        f"multi_iou={metrics['multi_mean_iou']:.4f} "
-        f"oracle_iou={metrics['oracle_iou']:.4f} "
-        f"MR@0.5={metrics['multi_recall@0.5']:.4f} "
-        f"OR@0.5={metrics['oracle_recall@0.5']:.4f} "
-        f"MR@0.75={metrics['multi_recall@0.75']:.4f} "
-        f"OR@0.75={metrics['oracle_recall@0.75']:.4f} "
-        f"valid={metrics['valid_samples']} "
+        f"Eval Epoch [{epoch}] "
+        f"mAP50={metrics['map50']:.4f} "
+        f"mAP50-95={metrics['map50_95']:.4f} "
+        f"P={metrics['precision']:.4f} "
+        f"R={metrics['recall']:.4f} "
+        f"TP={metrics['tp']} "
+        f"FP={metrics['fp']} "
+        f"GT={metrics['num_gt']} "
+        f"Pred={metrics['num_pred']} "
         f"skip_empty={metrics['skipped_empty_gt']}"
     )
 
     return metrics
 
-def state_dict_to_cpu(state_dict):
-    """
-    將 state_dict 轉到 CPU，避免 deepcopy checkpoint 時額外佔用 GPU VRAM。
-    """
-    cpu_state = {}
-
-    for k, v in state_dict.items():
-        if torch.is_tensor(v):
-            cpu_state[k] = v.detach().cpu()
-        else:
-            cpu_state[k] = v
-
-    return cpu_state
-
-def count_parameters(model):
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    if total >= 1e9:
-        total = f"{total / 1e9:.3f}B"
-    elif total >= 1e6:
-        total = f"{total / 1e6:.3f}M"
-
-    if trainable >= 1e9:
-        trainable = f"{trainable / 1e9:.3f}B"
-    elif trainable >= 1e6:
-        trainable = f"{trainable / 1e6:.3f}M"
-
-    return [total, trainable]
-
-def get_positive_ratio(epoch, total_epochs):
-    progress = epoch / total_epochs
-
-    min_ratio = 0.02
-    max_ratio = 0.10
-
-    ratio = min_ratio + (max_ratio - min_ratio) * min(progress / 0.6, 1.0)
-
-    return ratio
-
-def get_lambda_score(progress):
-    if progress < 0.2:
-        return 1.0 + (3.0 - 1.0) * (progress / 0.2)
-    elif progress < 0.6:
-        return 3.0 - (3.0 - 1.5) * ((progress - 0.2) / 0.4)
-    else:
-        return 1.5 - (1.5 - 1.0) * ((progress - 0.6) / 0.4)
-
-def get_loss_weights(epoch, total_epochs):
-    progress = epoch / total_epochs
-
-    lambda_bbox = 3.0 - 1.0 * min(progress / 0.5, 1.0)
-    lambda_score = get_lambda_score(progress)
-    lambda_text = 0.05 + 0.45 * min(progress / 0.4, 1.0)
-
-    return lambda_bbox, lambda_score, lambda_text
 
 
-def train(
-    dir,
-    epochs=100,
-    warmup_epochs=5,
-    batch_size=4,
-    image_size=(640, 640),
-    ema_decay=0.999,
-    lr_backbone=1e-5,
-    lr_text_encoder=1e-5,
-    lr_head=1e-4,
-    weight_decay=1e-4,
-    device=None,
-    num_workers=16,
-    infer_val_interval=1,
-    max_val_batches=320,
-    score_thr=0.25,
-    top_k=20,
-    nms_iou_thr=0.5,
-    save_best_interval=50,
-    resume_path=None
+# Metrics logging for external watcher
+
+
+def append_jsonl(path, row):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def write_latest_json(path, row):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    tmp_path = path + ".tmp"
+
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(row, f, ensure_ascii=False, indent=2)
+
+    os.replace(tmp_path, path)
+
+
+def append_csv(path, row):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    write_header = not os.path.exists(path)
+
+    fieldnames = list(row.keys())
+
+    with open(path, "a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+
+        if write_header:
+            writer.writeheader()
+
+        writer.writerow(row)
+
+
+
+# Checkpoint
+
+
+def build_checkpoint(
+    model,
+    ema,
+    optimizer,
+    scaler,
+    scheduler,
+    epoch,
+    best_metric,
+    best_metric_name,
+    train_metrics,
+    val_loss_metrics,
+    eval_metrics,
+    train_config,
+    dynamic_config,
 ):
-    if device is None:
+    return {
+        "epoch": epoch,
+
+        "model": model.state_dict(),
+        "ema": ema.ema.state_dict() if ema is not None else None,
+        "optimizer": optimizer.state_dict(),
+        "scaler": scaler.state_dict(),
+        "scheduler_step": scheduler.step_num,
+
+        "best_metric": best_metric,
+        "best_metric_name": best_metric_name,
+
+        "train_metrics": train_metrics,
+        "val_loss_metrics": val_loss_metrics,
+        "eval_metrics": eval_metrics,
+
+        "train_config": train_config,
+        "dynamic_config": dynamic_config,
+        "scheduler_config": {
+            "name": "WarmupCosineScheduler",
+            "warmup_steps": scheduler.warmup_steps,
+            "total_steps": scheduler.total_steps,
+            "min_lr_ratio": scheduler.min_lr_ratio,
+            "step_num": scheduler.step_num,
+            "base_lrs": scheduler.base_lrs,
+        },
+
+        "rng_state": get_rng_state_dict(),
+    }
+
+
+def load_checkpoint(
+    resume_path,
+    model,
+    ema,
+    optimizer,
+    scaler,
+    scheduler,
+    device,
+):
+    ckpt = torch.load(resume_path, map_location=device)
+
+    if "model" in ckpt:
+        model.load_state_dict(ckpt["model"], strict=True)
+    else:
+        model.load_state_dict(ckpt, strict=True)
+
+    if ema is not None and ckpt.get("ema", None) is not None:
+        ema.ema.load_state_dict(ckpt["ema"], strict=True)
+
+    if "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
+
+    if "scaler" in ckpt:
+        scaler.load_state_dict(ckpt["scaler"])
+
+    if "scheduler_step" in ckpt:
+        scheduler.step_num = int(ckpt["scheduler_step"])
+
+    if "rng_state" in ckpt:
+        restore_rng_state(ckpt["rng_state"])
+
+    start_epoch = int(ckpt.get("epoch", 0)) + 1
+    best_metric = float(ckpt.get("best_metric", -1.0))
+
+    return start_epoch, best_metric
+
+
+
+# Main train
+
+
+def train(args):
+    set_seed(args.seed)
+
+    if args.device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
 
-    num_epochs = epochs
+    dataset_dir = args.dir
 
-    train_image_dir = f"{dir}/images/train"
-    train_anno_dir = f"{dir}/labels/train"
+    train_image_dir = os.path.join(dataset_dir, "images", "train")
+    train_anno_dir = os.path.join(dataset_dir, "labels", "train")
 
-    val_image_dir = f"{dir}/images/val"
-    val_anno_dir = f"{dir}/labels/val"
+    val_image_dir = os.path.join(dataset_dir, "images", "val")
+    val_anno_dir = os.path.join(dataset_dir, "labels", "val")
 
     train_loader, val_loader = build_dataloaders(
         train_image_dir=train_image_dir,
         train_anno_dir=train_anno_dir,
         val_image_dir=val_image_dir,
         val_anno_dir=val_anno_dir,
-        batch_size=batch_size,
-        image_size=image_size,
-        num_workers=num_workers
+        batch_size=args.batch_size,
+        image_size=(args.image_size, args.image_size),
+        num_workers=args.num_workers,
+        max_text_aug_per_image=args.max_text_aug_per_image,
+        random_seed=args.seed,
     )
 
-    model_cfg = None
-    config_path = os.path.join(CURRENT_DIR, "cards", "config", "model.yaml")
+    model = VisionTextModel(
+        img_in_channels=args.img_in_channels,
+        hidden_dim=args.hidden_dim,
+        target_size=(args.target_size, args.target_size),
+        text_max_length=args.text_max_length,
+        fusion_token_num=args.fusion_token_num,
+        num_heads=args.num_heads,
+        num_layers=args.num_layers,
+        mlp_ratio=args.mlp_ratio,
+        dropout=args.dropout,
+        freeze_bert=args.freeze_bert,
+    ).to(device)
 
-    if os.path.exists(config_path):
-        try:
-            import yaml
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = yaml.safe_load(f)
-            model_cfg = config.get("model", {})
-        except Exception:
-            model_cfg = None
+    ema = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
 
-    model = Model(num_classes=1).to(device)
-    ema = ModelEMA(model, decay=ema_decay)
+    criterion = GroundingLoss(
+        cost_bbox=args.cost_bbox,
+        cost_giou=args.cost_giou,
+        cost_score=args.cost_score,
+    )
 
-    parameters = count_parameters(model)
-    print(f"[Info]: Model parameters: total={parameters[0]}, trainable={parameters[1]}")
+    total_params, trainable_params = count_parameters(model)
+
+    print(f"[Info] Device: {device}")
+    print(f"[Info] Model parameters: total={total_params}, trainable={trainable_params}")
+    print(f"[Info] Train batches: {len(train_loader)}")
+    print(f"[Info] Val batches: {len(val_loader)}")
 
     optimizer = build_optimizer(
         model=model,
-        lr_backbone=lr_backbone,
-        lr_text_encoder=lr_text_encoder,
-        lr_head=lr_head,
-        weight_decay=weight_decay
+        lr_vision=args.lr_vision,
+        lr_text=args.lr_text,
+        lr_transformer=args.lr_transformer,
+        lr_head=args.lr_head,
+        weight_decay=args.weight_decay,
     )
 
-    total_steps = num_epochs * len(train_loader)
-    warmup_steps = min(3000, warmup_epochs * len(train_loader))
+    total_steps = args.epochs * len(train_loader)
+    warmup_steps = min(args.max_warmup_steps, args.warmup_epochs * len(train_loader))
 
     scheduler = WarmupCosineScheduler(
         optimizer=optimizer,
         warmup_steps=warmup_steps,
         total_steps=total_steps,
-        min_lr_ratio=0.05
+        min_lr_ratio=args.min_lr_ratio,
     )
 
-    scaler = GradScaler(enabled=(device.type == "cuda"))
+    scaler = build_scaler(device)
 
-    best_mean_iou = -1.0
-    best_window_iou = -1.0
-    best_window_epoch = -1
+    if args.resume_path is not None:
+        save_path = os.path.dirname(os.path.abspath(args.resume_path))
+    else:
+        if args.save_dir is None:
+            save_path = os.path.join(
+                "checkpoints",
+                f"results_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
+            )
+        else:
+            save_path = args.save_dir
+
+    os.makedirs(save_path, exist_ok=True)
+
+    epoch_metrics_path = os.path.join(save_path, "metrics_epoch.jsonl")
+    step_metrics_path = os.path.join(save_path, "metrics_step.jsonl")
+    latest_metrics_path = os.path.join(save_path, "latest_metrics.json")
+    csv_metrics_path = os.path.join(save_path, "metrics_epoch.csv")
+
+    print(f"[Info] Save path: {save_path}")
+    print(f"[Info] Watch epoch metrics: {epoch_metrics_path}")
+    print(f"[Info] Watch step metrics: {step_metrics_path}")
+    print(f"[Info] Watch latest metrics: {latest_metrics_path}")
 
     start_epoch = 1
+    best_metric = -1.0
+    best_metric_name = args.best_metric
 
-    os.makedirs("checkpoints", exist_ok=True)
-
-    if resume_path is not None:
-        resume_path = os.path.abspath(resume_path)
-        ckpt_resume = torch.load(resume_path, map_location=device)
-
-        if "model" in ckpt_resume:
-            model.load_state_dict(ckpt_resume["model"], strict=True)
-        else:
-            model.load_state_dict(ckpt_resume, strict=True)
-
-        if "ema" in ckpt_resume:
-            ema.ema.load_state_dict(ckpt_resume["ema"], strict=True)
-
-        if "optimizer" in ckpt_resume:
-            optimizer.load_state_dict(ckpt_resume["optimizer"])
-
-        if "scaler" in ckpt_resume:
-            scaler.load_state_dict(ckpt_resume["scaler"])
-
-        if "scheduler_step" in ckpt_resume:
-            scheduler.step_num = ckpt_resume["scheduler_step"]
-
-        if "rng_state" in ckpt_resume:
-            rng_state = ckpt_resume["rng_state"]
-
-            if rng_state.get("torch", None) is not None:
-                torch.set_rng_state(rng_state["torch"])
-
-            if (
-                torch.cuda.is_available()
-                and rng_state.get("cuda", None) is not None
-            ):
-                torch.cuda.set_rng_state_all(rng_state["cuda"])
-
-            if rng_state.get("python", None) is not None:
-                random.setstate(rng_state["python"])
-
-            if rng_state.get("numpy", None) is not None:
-                try:
-                    np.random.set_state(rng_state["numpy"])
-                except Exception:
-                    pass
-
-        start_epoch = int(ckpt_resume.get("epoch", 0)) + 1
-        best_mean_iou = float(ckpt_resume.get("best_mean_iou", -1.0))
-
-        old_save_path = os.path.dirname(resume_path)
-        save_path = old_save_path
-
-        print(f"[Info]: Resume from: {resume_path}")
-        print(f"[Info]: Start epoch: {start_epoch}")
-        print(f"[Info]: Checkpoints will be saved to: {save_path}")
-
-    else:
-        save_path = f"checkpoints/results_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
-        os.makedirs(save_path, exist_ok=True)
-        print(f"[Info]: Checkpoints will be saved to: LightDet/units/model/{save_path}")
-
-    window_tmp_path = f"{save_path}/_window_best_tmp.pt"
-
-    last_infer_metrics = {
-        "multi_mean_iou": -1.0,
-        "oracle_iou": -1.0,
-        "multi_recall@0.5": -1.0,
-        "oracle_recall@0.5": -1.0,
-        "multi_recall@0.75": -1.0,
-        "oracle_recall@0.75": -1.0,
-        "valid_samples": 0,
-        "skipped_empty_gt": 0,
-    }
-
-    def get_rng_state_dict():
-        rng_state = {
-            "torch": torch.get_rng_state(),
-            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-            "python": random.getstate(),
-            "numpy": None,
-        }
-
-        try:
-            rng_state["numpy"] = np.random.get_state()
-        except Exception:
-            rng_state["numpy"] = None
-
-        return rng_state
-
-    def build_checkpoint(
-        epoch,
-        train_loss,
-        infer_metrics,
-        lambda_bbox,
-        lambda_score,
-        lambda_text,
-        positive_ratio,
-        best_mean_iou,
-        best_window_iou,
-        best_window_epoch
-    ):
-        ckpt = {
-            "epoch": epoch,
-
-            "model": model.state_dict(),
-            "ema": ema.ema.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scaler": scaler.state_dict(),
-            "scheduler_step": scheduler.step_num,
-
-            "best_mean_iou": best_mean_iou,
-            "best_window_iou": best_window_iou,
-            "best_window_epoch": best_window_epoch,
-            "best_metric_name": "multi_mean_iou",
-
-            "train_loss": train_loss,
-            "infer_metrics": infer_metrics,
-
-            "lambda_bbox": lambda_bbox,
-            "lambda_score": lambda_score,
-            "lambda_text": lambda_text,
-            "positive_ratio": positive_ratio,
-
-            "train_config": {
-                "dataset_dir": dir,
-                "train_image_dir": train_image_dir,
-                "train_anno_dir": train_anno_dir,
-                "val_image_dir": val_image_dir,
-                "val_anno_dir": val_anno_dir,
-
-                "epochs": num_epochs,
-                "start_epoch": start_epoch,
-                "warmup_epochs": warmup_epochs,
-                "warmup_steps": warmup_steps,
-                "total_steps": total_steps,
-
-                "batch_size": batch_size,
-                "image_size": image_size,
-                "ema_decay": ema_decay,
-
-                "lr_backbone": lr_backbone,
-                "lr_text_encoder": lr_text_encoder,
-                "lr_head": lr_head,
-                "weight_decay": weight_decay,
-
-                "num_workers": num_workers,
-                "infer_val_interval": infer_val_interval,
-
-                "max_val_batches": max_val_batches,
-                "score_thr": score_thr,
-                "top_k": top_k,
-                "nms_iou_thr": nms_iou_thr,
-
-                "save_best_interval": save_best_interval,
-                "device": str(device),
-                "train_loader_len": len(train_loader),
-                "val_loader_len": len(val_loader),
-            },
-
-            "scheduler_config": {
-                "name": "WarmupCosineScheduler",
-                "warmup_steps": warmup_steps,
-                "total_steps": total_steps,
-                "min_lr_ratio": scheduler.min_lr_ratio,
-                "step_num": scheduler.step_num,
-                "base_lrs": scheduler.base_lrs,
-            },
-
-            "loss_schedule_state": {
-                "lambda_bbox": lambda_bbox,
-                "lambda_score": lambda_score,
-                "lambda_text": lambda_text,
-                "positive_ratio": positive_ratio,
-            },
-
-            "model_cfg": model_cfg,
-
-            "rng_state": get_rng_state_dict(),
-        }
-
-        return ckpt
-
-    for epoch in range(start_epoch, num_epochs + 1):
-        lambda_bbox, lambda_score, lambda_text = get_loss_weights(
-            epoch=epoch,
-            total_epochs=num_epochs
-        )
-
-        positive_ratio = get_positive_ratio(epoch, num_epochs)
-        drop_proposal_prob = get_drop_proposal_prob(
-            epoch=epoch,
-            total_epochs=num_epochs,
-            max_drop=config.get("proposal", {}).get("max_drop", 0.8),
-            start_ratio=config.get("proposal", {}).get("start_ratio", 0.3),
-            end_ratio=config.get("proposal", {}).get("end_ratio", 0.7)
-        )
-
-        train_loss = train_one_epoch(
+    if args.resume_path is not None:
+        start_epoch, best_metric = load_checkpoint(
+            resume_path=args.resume_path,
             model=model,
             ema=ema,
+            optimizer=optimizer,
+            scaler=scaler,
+            scheduler=scheduler,
+            device=device,
+        )
+
+        print(f"[Info] Resume from: {args.resume_path}")
+        print(f"[Info] Start epoch: {start_epoch}")
+        print(f"[Info] Best {best_metric_name}: {best_metric:.4f}")
+
+    train_config = vars(args).copy()
+    train_config.update({
+        "train_image_dir": train_image_dir,
+        "train_anno_dir": train_anno_dir,
+        "val_image_dir": val_image_dir,
+        "val_anno_dir": val_anno_dir,
+        "save_path": save_path,
+        "train_loader_len": len(train_loader),
+        "val_loader_len": len(val_loader),
+        "total_steps": total_steps,
+        "warmup_steps": warmup_steps,
+    })
+
+    for epoch in range(start_epoch, args.epochs + 1):
+        lambda_bbox, lambda_giou, lambda_score = get_loss_weights(
+            epoch=epoch,
+            total_epochs=args.epochs,
+            args=args,
+        )
+
+        pos_weight = get_pos_weight(
+            epoch=epoch,
+            total_epochs=args.epochs,
+            args=args,
+        )
+
+        train_metrics = train_one_epoch(
+            model=model,
+            ema=ema,
+            criterion=criterion,
             train_loader=train_loader,
             optimizer=optimizer,
             scheduler=scheduler,
+            scaler=scaler,
             device=device,
             epoch=epoch,
-            scaler=scaler,
-            use_amp=True,
-            grad_clip_norm=1.0,
-            num_epochs=num_epochs,
-            image_size=image_size,
+            num_epochs=args.epochs,
+            use_amp=args.use_amp,
+            grad_clip_norm=args.grad_clip_norm,
             lambda_bbox=lambda_bbox,
+            lambda_giou=lambda_giou,
             lambda_score=lambda_score,
-            lambda_text=lambda_text,
-            positive_ratio=positive_ratio,
-            drop_proposal_prob=drop_proposal_prob
+            pos_weight=pos_weight,
+            log_interval=args.log_interval,
+            step_metrics_path=step_metrics_path if args.emit_step_metrics else None,
         )
 
-        if epoch % infer_val_interval == 0:
-            infer_metrics = inference_validate_one_epoch(
-                model=ema.ema,
+        if epoch % args.val_loss_interval == 0:
+            val_loss_metrics = validate_loss_one_epoch(
+                model=ema.ema if ema is not None else model,
+                criterion=criterion,
                 val_loader=val_loader,
                 device=device,
                 epoch=epoch,
-                image_size=image_size,
-                use_amp=True,
-                score_thr=score_thr,
-                top_k=top_k,
-                nms_iou_thr=nms_iou_thr,
-                max_val_batches=max_val_batches
+                use_amp=args.use_amp,
+                lambda_bbox=lambda_bbox,
+                lambda_giou=lambda_giou,
+                lambda_score=lambda_score,
+                pos_weight=pos_weight,
             )
-            last_infer_metrics = infer_metrics
         else:
-            infer_metrics = last_infer_metrics
+            val_loss_metrics = {}
 
-        multi_iou = infer_metrics.get("multi_mean_iou", -1.0)
-        oracle_iou = infer_metrics.get("oracle_iou", -1.0)
+        if epoch % args.eval_interval == 0:
+            eval_metrics = evaluate_detection_one_epoch(
+                model=ema.ema if ema is not None else model,
+                val_loader=val_loader,
+                device=device,
+                epoch=epoch,
+                use_amp=args.use_amp,
+                score_thr=args.score_thr,
+                top_k=args.top_k,
+                nms_iou_thr=args.nms_iou_thr,
+                max_val_batches=args.max_val_batches,
+                use_topk_fallback=args.use_topk_fallback,
+            )
+        else:
+            eval_metrics = {}
 
-        multi_recall_05 = infer_metrics.get("multi_recall@0.5", -1.0)
-        oracle_recall_05 = infer_metrics.get("oracle_recall@0.5", -1.0)
+        dynamic_config = {
+            "lambda_bbox": lambda_bbox,
+            "lambda_giou": lambda_giou,
+            "lambda_score": lambda_score,
+            "pos_weight": pos_weight,
+        }
 
-        multi_recall_075 = infer_metrics.get("multi_recall@0.75", -1.0)
-        oracle_recall_075 = infer_metrics.get("oracle_recall@0.75", -1.0)
+        metric_row = {
+            "type": "epoch",
+            "time": time.time(),
+            "epoch": epoch,
+            "lr": scheduler.get_lr()[0],
+            **train_metrics,
+            **val_loss_metrics,
+            **eval_metrics,
+            **dynamic_config,
+        }
 
-        valid_samples = infer_metrics.get("valid_samples", 0)
-        skipped_empty_gt = infer_metrics.get("skipped_empty_gt", 0)
+        append_jsonl(epoch_metrics_path, metric_row)
+        append_csv(csv_metrics_path, metric_row)
+        write_latest_json(latest_metrics_path, metric_row)
 
-        tqdm.write(
-            f"Epoch [{epoch}/{num_epochs}] "
-            f"skip_empty={skipped_empty_gt} "
-            f"train_loss={train_loss:.4f} "
-            f"multi_iou={multi_iou:.4f} "
-            f"oracle_iou={oracle_iou:.4f} "
-            f"MR@0.5={multi_recall_05:.4f} "
-            f"OR@0.5={oracle_recall_05:.4f} "
-            f"lb={lambda_bbox:.2f} "
-            f"ls={lambda_score:.2f} "
-            f"lt={lambda_text:.2f}"
-        )
+        save_metric = float(eval_metrics.get(best_metric_name, -1.0))
 
-        save_metric = infer_metrics.get("multi_mean_iou", -1.0)
+        is_best = False
 
-        is_global_best = False
-        is_window_best = False
-
-        if save_metric > best_mean_iou:
-            best_mean_iou = save_metric
-            is_global_best = True
-
-        if save_metric > best_window_iou:
-            best_window_iou = save_metric
-            best_window_epoch = epoch
-            is_window_best = True
+        if save_metric > best_metric:
+            best_metric = save_metric
+            is_best = True
 
         ckpt = build_checkpoint(
+            model=model,
+            ema=ema,
+            optimizer=optimizer,
+            scaler=scaler,
+            scheduler=scheduler,
             epoch=epoch,
-            train_loss=train_loss,
-            infer_metrics=infer_metrics,
-            lambda_bbox=lambda_bbox,
-            lambda_score=lambda_score,
-            lambda_text=lambda_text,
-            positive_ratio=positive_ratio,
-            best_mean_iou=best_mean_iou,
-            best_window_iou=best_window_iou,
-            best_window_epoch=best_window_epoch
+            best_metric=best_metric,
+            best_metric_name=best_metric_name,
+            train_metrics=train_metrics,
+            val_loss_metrics=val_loss_metrics,
+            eval_metrics=eval_metrics,
+            train_config=train_config,
+            dynamic_config=dynamic_config,
         )
 
-        torch.save(ckpt, f"{save_path}/latest.pt")
+        latest_path = os.path.join(save_path, "latest.pt")
+        torch.save(ckpt, latest_path)
 
-        if is_global_best:
-            torch.save(ckpt, f"{save_path}/best_iou.pt")
+        if is_best:
+            best_path = os.path.join(save_path, f"best_{best_metric_name}.pt")
+            torch.save(ckpt, best_path)
+
             tqdm.write(
-                f"Saved global best checkpoint: "
-                f"epoch={epoch}, multi_mean_iou={best_mean_iou:.4f}"
+                f"Saved best checkpoint: "
+                f"epoch={epoch}, {best_metric_name}={best_metric:.4f}"
             )
 
-        if is_window_best:
-            torch.save(ckpt, window_tmp_path)
+        if args.save_epoch_interval > 0 and epoch % args.save_epoch_interval == 0:
+            epoch_path = os.path.join(save_path, f"epoch_{epoch:03d}.pt")
+            torch.save(ckpt, epoch_path)
 
-        if epoch % save_best_interval == 0:
-            start_window_epoch = epoch - save_best_interval + 1
-            end_window_epoch = epoch
+        tqdm.write(
+            f"Epoch [{epoch}/{args.epochs}] "
+            f"train_loss={train_metrics.get('train_loss', -1):.4f} "
+            f"val_loss={val_loss_metrics.get('val_loss', -1):.4f} "
+            f"mAP50={eval_metrics.get('map50', -1):.4f} "
+            f"mAP50-95={eval_metrics.get('map50_95', -1):.4f} "
+            f"P={eval_metrics.get('precision', -1):.4f} "
+            f"R={eval_metrics.get('recall', -1):.4f} "
+            f"lb={lambda_bbox:.2f} "
+            f"lg={lambda_giou:.2f} "
+            f"ls={lambda_score:.2f} "
+            f"pw={pos_weight:.2f}"
+        )
 
-            if os.path.exists(window_tmp_path):
-                window_path = (
-                    f"{save_path}/best_iou_epoch_"
-                    f"{start_window_epoch:03d}_{end_window_epoch:03d}.pt"
-                )
+# ============================================================
+# Config
+# ============================================================
 
-                shutil.copyfile(window_tmp_path, window_path)
+DEFAULT_MODEL_CFG = {
+    "model": {
+        "img_in_channels": 1024,
+        "hidden_dim": 512,
+        "num_heads": 8,
+        "num_layers": 3,
+        "mlp_ratio": 3.5,
+        "image_grid_size": 10,
+        "text_max_length": 32,
+        "fusion_token_num": 16,
+        "dropout": 0.1,
+        "freeze_bert": True,
+    }
+}
 
-                tqdm.write(
-                    f"Saved window best IoU checkpoint: "
-                    f"epoch {start_window_epoch}-{end_window_epoch}, "
-                    f"best_epoch={best_window_epoch}, "
-                    f"multi_mean_iou={best_window_iou:.4f}"
-                )
 
-                os.remove(window_tmp_path)
+DEFAULT_TRAIN_CFG = {
+    "data": {
+        "dataset_dir": "/home/soic/Desktop/LightDet/datasets",
+        "image_size": 640,
+        "max_text_aug_per_image": 1,
+    },
 
-            best_window_iou = -1.0
-            best_window_epoch = -1
+    "train": {
+        "epochs": 300,
+        "batch_size": 12,
+        "warmup_epochs": 5,
+        "num_workers": 8,
+        "device": "cuda:1",
+        "seed": 42,
+        "deterministic": True,
+        "use_amp": True,
+        "use_ema": True,
+        "ema_decay": 0.999,
+        "grad_clip_norm": 1.0,
+    },
+
+    "optim": {
+        "lr_vision": 1e-4,
+        "lr_text": 1e-5,
+        "lr_transformer": 1e-4,
+        "lr_head": 1e-4,
+        "weight_decay": 1e-4,
+        "min_lr_ratio": 0.05,
+        "max_warmup_steps": 3000,
+    },
+
+    "loss": {
+        "matcher": {
+            "cost_bbox": 5.0,
+            "cost_giou": 2.0,
+            "cost_score": 1.0,
+        },
+
+        "weight": {
+            "dynamic": True,
+
+            "bbox": 5.0,
+            "giou": 2.0,
+            "score": 1.0,
+
+            "bbox_start": 5.0,
+            "bbox_end": 3.0,
+            "bbox_decay_until": 0.5,
+
+            "score_start": 1.0,
+            "score_end": 2.0,
+            "score_warm_until": 0.4,
+        },
+
+        "pos_weight": {
+            "min": 1.0,
+            "max": 5.0,
+            "warm_until": 0.5,
+        },
+    },
+
+    "eval": {
+        "val_loss_interval": 1,
+        "eval_interval": 1,
+        "max_val_batches": 320,
+        "score_thr": 0.25,
+        "top_k": 20,
+        "nms_iou_thr": 0.5,
+        "best_metric": "map50",
+        "use_topk_fallback": True,
+    },
+
+    "log": {
+        "save_dir": None,
+        "resume_path": None,
+        "save_epoch_interval": 50,
+        "emit_step_metrics": True,
+        "log_interval": 10,
+    },
+}
+
+
+def deepcopy_cfg(cfg):
+    return copy.deepcopy(cfg)
+
+
+def deep_update(base, override):
+    for key, value in override.items():
+        if (
+            isinstance(value, dict)
+            and key in base
+            and isinstance(base[key], dict)
+        ):
+            deep_update(base[key], value)
+        else:
+            base[key] = value
+
+    return base
+
+
+def load_yaml(path):
+    if path is None:
+        return {}
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"YAML config not found: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    if cfg is None:
+        return {}
+
+    if not isinstance(cfg, dict):
+        raise ValueError(f"YAML config must be a dict: {path}")
+
+    return cfg
+
+
+def load_model_config(path):
+    cfg = deepcopy_cfg(DEFAULT_MODEL_CFG)
+    yaml_cfg = load_yaml(path)
+    return deep_update(cfg, yaml_cfg)
+
+
+def load_train_config(path):
+    cfg = deepcopy_cfg(DEFAULT_TRAIN_CFG)
+    yaml_cfg = load_yaml(path)
+    return deep_update(cfg, yaml_cfg)
+
+
+def normalize_device(device):
+    if device is None:
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    if isinstance(device, int):
+        return f"cuda:{device}" if torch.cuda.is_available() else "cpu"
+
+    if isinstance(device, str):
+        device = device.strip()
+
+        if device.isdigit():
+            return f"cuda:{device}" if torch.cuda.is_available() else "cpu"
+
+        return device
+
+    raise TypeError(f"Unsupported device type: {type(device)}")
+
+
+def set_deterministic(seed=42, deterministic=True):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
+    else:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+
+
+def cfg_to_args(model_cfg_all, train_cfg_all):
+    model_cfg = model_cfg_all["model"]
+
+    data_cfg = train_cfg_all["data"]
+    train_cfg = train_cfg_all["train"]
+    optim_cfg = train_cfg_all["optim"]
+    loss_cfg = train_cfg_all["loss"]
+    eval_cfg = train_cfg_all["eval"]
+    log_cfg = train_cfg_all["log"]
+
+    matcher_cfg = loss_cfg.get("matcher", {})
+    weight_cfg = loss_cfg.get("weight", {})
+    pos_weight_cfg = loss_cfg.get("pos_weight", {})
+
+    return SimpleNamespace(
+        # data
+        dir=data_cfg["dataset_dir"],
+        image_size=data_cfg["image_size"],
+        max_text_aug_per_image=data_cfg["max_text_aug_per_image"],
+
+        # train
+        epochs=train_cfg["epochs"],
+        batch_size=train_cfg["batch_size"],
+        warmup_epochs=train_cfg["warmup_epochs"],
+        num_workers=train_cfg["num_workers"],
+        device=train_cfg["device"],
+        seed=train_cfg["seed"],
+        deterministic=train_cfg["deterministic"],
+        use_amp=train_cfg["use_amp"],
+        use_ema=train_cfg["use_ema"],
+        ema_decay=train_cfg["ema_decay"],
+        grad_clip_norm=train_cfg["grad_clip_norm"],
+
+        # model
+        img_in_channels=model_cfg["img_in_channels"],
+        hidden_dim=model_cfg["hidden_dim"],
+        target_size=model_cfg["image_grid_size"],
+        text_max_length=model_cfg["text_max_length"],
+        fusion_token_num=model_cfg["fusion_token_num"],
+        num_heads=model_cfg["num_heads"],
+        num_layers=model_cfg["num_layers"],
+        mlp_ratio=model_cfg["mlp_ratio"],
+        dropout=model_cfg["dropout"],
+        freeze_bert=model_cfg["freeze_bert"],
+
+        # optimizer
+        lr_vision=optim_cfg["lr_vision"],
+        lr_text=optim_cfg["lr_text"],
+        lr_transformer=optim_cfg["lr_transformer"],
+        lr_head=optim_cfg["lr_head"],
+        weight_decay=optim_cfg["weight_decay"],
+        min_lr_ratio=optim_cfg["min_lr_ratio"],
+        max_warmup_steps=optim_cfg["max_warmup_steps"],
+
+        # matcher cost
+        cost_bbox=matcher_cfg.get("cost_bbox", 5.0),
+        cost_giou=matcher_cfg.get("cost_giou", 2.0),
+        cost_score=matcher_cfg.get("cost_score", 1.0),
+
+        # final loss weight
+        loss_dynamic=weight_cfg.get("dynamic", True),
+
+        lambda_bbox=weight_cfg.get("bbox", 5.0),
+        lambda_giou=weight_cfg.get("giou", 2.0),
+        lambda_score=weight_cfg.get("score", 1.0),
+
+        lambda_bbox_start=weight_cfg.get("bbox_start", 5.0),
+        lambda_bbox_end=weight_cfg.get("bbox_end", 3.0),
+        lambda_bbox_decay_until=weight_cfg.get("bbox_decay_until", 0.5),
+
+        lambda_score_start=weight_cfg.get("score_start", 1.0),
+        lambda_score_end=weight_cfg.get("score_end", 2.0),
+        lambda_score_warm_until=weight_cfg.get("score_warm_until", 0.4),
+
+        # BCE positive weight
+        min_pos_weight=pos_weight_cfg.get("min", 1.0),
+        max_pos_weight=pos_weight_cfg.get("max", 5.0),
+        pos_weight_warm_until=pos_weight_cfg.get("warm_until", 0.5),
+
+        # eval
+        val_loss_interval=eval_cfg["val_loss_interval"],
+        eval_interval=eval_cfg["eval_interval"],
+        max_val_batches=eval_cfg["max_val_batches"],
+        score_thr=eval_cfg["score_thr"],
+        top_k=eval_cfg["top_k"],
+        nms_iou_thr=eval_cfg["nms_iou_thr"],
+        best_metric=eval_cfg["best_metric"],
+        use_topk_fallback=eval_cfg.get("use_topk_fallback", True),
+
+        # log
+        save_dir=log_cfg["save_dir"],
+        resume_path=log_cfg["resume_path"],
+        save_epoch_interval=log_cfg["save_epoch_interval"],
+        emit_step_metrics=log_cfg["emit_step_metrics"],
+        log_interval=log_cfg["log_interval"],
+
+        # raw config
+        model_cfg=model_cfg_all,
+        train_cfg=train_cfg_all,
+    )
+
+
+def print_config_summary(model_cfg, train_cfg):
+    m = model_cfg["model"]
+    d = train_cfg["data"]
+    t = train_cfg["train"]
+    o = train_cfg["optim"]
+    l = train_cfg["loss"]
+    e = train_cfg["eval"]
+    log = train_cfg["log"]
+
+    matcher = l.get("matcher", {})
+    weight = l.get("weight", {})
+    pos_weight = l.get("pos_weight", {})
+
+    print("\n[LightDet] Training config")
+    print(f"  dataset     : {d['dataset_dir']}")
+    print(f"  image_size  : {d['image_size']}")
+    print(f"  epochs      : {t['epochs']}")
+    print(f"  batch       : {t['batch_size']}")
+    print(f"  workers     : {t['num_workers']}")
+    print(f"  device      : {t['device']}")
+    print(f"  seed        : {t['seed']}")
+    print(f"  save_dir    : {log['save_dir']}")
+
+    print(f"  hidden_dim  : {m['hidden_dim']}")
+    print(f"  grid        : {m['image_grid_size']}x{m['image_grid_size']}")
+    print(f"  num_layers  : {m['num_layers']}")
+    print(f"  num_heads   : {m['num_heads']}")
+    print(f"  mlp_ratio   : {m['mlp_ratio']}")
+
+    print(f"  lr_vision   : {o['lr_vision']}")
+    print(f"  lr_text     : {o['lr_text']}")
+    print(f"  lr_trans    : {o['lr_transformer']}")
+    print(f"  lr_head     : {o['lr_head']}")
+
+    print(
+        f"  matcher     : "
+        f"bbox={matcher.get('cost_bbox', 5.0)}, "
+        f"giou={matcher.get('cost_giou', 2.0)}, "
+        f"score={matcher.get('cost_score', 1.0)}"
+    )
+
+    print(
+        f"  loss weight : "
+        f"dynamic={weight.get('dynamic', True)}, "
+        f"bbox={weight.get('bbox_start', weight.get('bbox', 5.0))}"
+        f"->{weight.get('bbox_end', weight.get('bbox', 5.0))}, "
+        f"giou={weight.get('giou', 2.0)}, "
+        f"score={weight.get('score_start', weight.get('score', 1.0))}"
+        f"->{weight.get('score_end', weight.get('score', 1.0))}"
+    )
+
+    print(
+        f"  pos weight  : "
+        f"{pos_weight.get('min', 1.0)}->{pos_weight.get('max', 5.0)}"
+    )
+
+    print(
+        f"  eval        : "
+        f"metric={e['best_metric']}, "
+        f"score_thr={e['score_thr']}, "
+        f"top_k={e['top_k']}"
+    )
+    print("")
+
+
+class LightDet:
+    def __init__(self, model="cards/config/model.yaml"):
+        self.model_cfg_path = model
+        self.model_cfg = load_model_config(model)
+
+    def train(
+        self,
+        cfg="cards/config/train.yaml",
+        data=None,
+        epochs=None,
+        imgsz=None,
+        batch=None,
+        device=None,
+        workers=None,
+        seed=None,
+        deterministic=None,
+        project="runs/train",
+        name="exp",
+        resume=None,
+        lr=None,
+        lr_vision=None,
+        lr_text=None,
+        lr_transformer=None,
+        lr_head=None,
+        weight_decay=None,
+        score_thr=None,
+        top_k=None,
+        nms_iou_thr=None,
+        **kwargs,
+    ):
+        model_cfg = deepcopy_cfg(self.model_cfg)
+        train_cfg = load_train_config(cfg)
+
+        if data is not None:
+            train_cfg["data"]["dataset_dir"] = data
+
+        if epochs is not None:
+            train_cfg["train"]["epochs"] = epochs
+
+        if imgsz is not None:
+            train_cfg["data"]["image_size"] = imgsz
+
+        if batch is not None:
+            train_cfg["train"]["batch_size"] = batch
+
+        if device is not None:
+            train_cfg["train"]["device"] = normalize_device(device)
+        else:
+            train_cfg["train"]["device"] = normalize_device(
+                train_cfg["train"]["device"]
+            )
+
+        if workers is not None:
+            train_cfg["train"]["num_workers"] = workers
+
+        if seed is not None:
+            train_cfg["train"]["seed"] = seed
+
+        if deterministic is not None:
+            train_cfg["train"]["deterministic"] = deterministic
+
+        if resume is not None:
+            train_cfg["log"]["resume_path"] = resume
+
+        if project is not None and name is not None:
+            train_cfg["log"]["save_dir"] = os.path.join(project, name)
+
+        if lr is not None:
+            train_cfg["optim"]["lr_vision"] = lr
+            train_cfg["optim"]["lr_transformer"] = lr
+            train_cfg["optim"]["lr_head"] = lr
+
+        if lr_vision is not None:
+            train_cfg["optim"]["lr_vision"] = lr_vision
+
+        if lr_text is not None:
+            train_cfg["optim"]["lr_text"] = lr_text
+
+        if lr_transformer is not None:
+            train_cfg["optim"]["lr_transformer"] = lr_transformer
+
+        if lr_head is not None:
+            train_cfg["optim"]["lr_head"] = lr_head
+
+        if weight_decay is not None:
+            train_cfg["optim"]["weight_decay"] = weight_decay
+
+        if score_thr is not None:
+            train_cfg["eval"]["score_thr"] = score_thr
+
+        if top_k is not None:
+            train_cfg["eval"]["top_k"] = top_k
+
+        if nms_iou_thr is not None:
+            train_cfg["eval"]["nms_iou_thr"] = nms_iou_thr
+
+        if len(kwargs) > 0:
+            unknown = ", ".join(kwargs.keys())
+            raise TypeError(f"Unsupported train arguments: {unknown}")
+
+        set_deterministic(
+            seed=train_cfg["train"]["seed"],
+            deterministic=train_cfg["train"]["deterministic"],
+        )
+
+        args = cfg_to_args(
+            model_cfg_all=model_cfg,
+            train_cfg_all=train_cfg,
+        )
+
+        print_config_summary(
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+        )
+
+        return train(args)
+
+
+def main():
+    os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+
+    model = LightDet(
+        model="/home/soic/Desktop/LightDet/units/model/cards/config/model.yaml"
+    )
+
+    model.train(
+        cfg="/home/soic/Desktop/LightDet/units/model/cards/config/train.yaml",
+        data="/home/soic/Desktop/LightDet/datasets",
+        epochs=300,
+        imgsz=640,
+        batch=8,
+        device=1,
+        workers=16,
+        seed=42,
+        deterministic=True,
+        project="runs/train",
+        name="lightdet_seed42",
+    )
 
 
 if __name__ == "__main__":
-    DIR = "/home/soic/Desktop/LightDet/datasets"
-
-    train(
-        dir=DIR,
-        epochs=300,
-        batch_size=32,
-        image_size=(640, 640),
-        device=torch.device("cuda:1" if torch.cuda.is_available() else "cpu"),
-        num_workers=18,
-        infer_val_interval=1
-    )
+    main()

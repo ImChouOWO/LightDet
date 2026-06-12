@@ -1522,7 +1522,7 @@ DEFAULT_TRAIN_CFG = {
         "batch_size": 12,
         "warmup_epochs": 5,
         "num_workers": 8,
-        "device": "cuda:1",
+        "device": "cuda:0",
         "seed": 42,
         "deterministic": True,
         "use_amp": True,
@@ -1551,10 +1551,12 @@ DEFAULT_TRAIN_CFG = {
         "weight": {
             "dynamic": True,
 
+            # Static fallback values when dynamic=False
             "bbox": 5.0,
             "giou": 2.0,
             "score": 1.0,
 
+            # Dynamic schedule
             "bbox_start": 5.0,
             "bbox_end": 3.0,
             "bbox_decay_until": 0.5,
@@ -1597,6 +1599,12 @@ def deepcopy_cfg(cfg):
 
 
 def deep_update(base, override):
+    """
+    Recursively update config dict.
+    """
+    if override is None:
+        return base
+
     for key, value in override.items():
         if (
             isinstance(value, dict)
@@ -1642,6 +1650,17 @@ def load_train_config(path):
 
 
 def normalize_device(device):
+    """
+    支援 YOLO-like 寫法：
+
+    device=0         -> cuda:0
+    device=1         -> cuda:1
+    device="0"       -> cuda:0
+    device="1"       -> cuda:1
+    device="cpu"     -> cpu
+    device="cuda:1"  -> cuda:1
+    """
+
     if device is None:
         return "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -1681,6 +1700,10 @@ def set_deterministic(seed=42, deterministic=True):
 
 
 def cfg_to_args(model_cfg_all, train_cfg_all):
+    """
+    Convert separated model/train yaml configs into old train(args) compatible namespace.
+    """
+
     model_cfg = model_cfg_all["model"]
 
     data_cfg = train_cfg_all["data"]
@@ -1694,7 +1717,7 @@ def cfg_to_args(model_cfg_all, train_cfg_all):
     weight_cfg = loss_cfg.get("weight", {})
     pos_weight_cfg = loss_cfg.get("pos_weight", {})
 
-    return SimpleNamespace(
+    args = SimpleNamespace(
         # data
         dir=data_cfg["dataset_dir"],
         image_size=data_cfg["image_size"],
@@ -1734,12 +1757,12 @@ def cfg_to_args(model_cfg_all, train_cfg_all):
         min_lr_ratio=optim_cfg["min_lr_ratio"],
         max_warmup_steps=optim_cfg["max_warmup_steps"],
 
-        # matcher cost
+        # Hungarian matcher cost
         cost_bbox=matcher_cfg.get("cost_bbox", 5.0),
         cost_giou=matcher_cfg.get("cost_giou", 2.0),
         cost_score=matcher_cfg.get("cost_score", 1.0),
 
-        # final loss weight
+        # Final loss weights
         loss_dynamic=weight_cfg.get("dynamic", True),
 
         lambda_bbox=weight_cfg.get("bbox", 5.0),
@@ -1776,10 +1799,12 @@ def cfg_to_args(model_cfg_all, train_cfg_all):
         emit_step_metrics=log_cfg["emit_step_metrics"],
         log_interval=log_cfg["log_interval"],
 
-        # raw config
+        # raw config for checkpoint/debug
         model_cfg=model_cfg_all,
         train_cfg=train_cfg_all,
     )
+
+    return args
 
 
 def print_config_summary(model_cfg, train_cfg):
@@ -1842,12 +1867,34 @@ def print_config_summary(model_cfg, train_cfg):
         f"  eval        : "
         f"metric={e['best_metric']}, "
         f"score_thr={e['score_thr']}, "
-        f"top_k={e['top_k']}"
+        f"top_k={e['top_k']}, "
+        f"nms={e['nms_iou_thr']}"
     )
+
     print("")
 
 
 class LightDet:
+    """
+    YOLO-like training wrapper with separated model/train configs.
+
+    Example:
+        model = LightDet("cards/config/model.yaml")
+
+        model.train(
+            cfg="cards/config/train.yaml",
+            data="/home/soic/Desktop/LightDet/datasets",
+            epochs=300,
+            imgsz=640,
+            batch=12,
+            device=1,
+            workers=8,
+            seed=42,
+            project="runs/train",
+            name="lightdet_seed42"
+        )
+    """
+
     def __init__(self, model="cards/config/model.yaml"):
         self.model_cfg_path = model
         self.model_cfg = load_model_config(model)
@@ -1866,20 +1913,26 @@ class LightDet:
         project="runs/train",
         name="exp",
         resume=None,
+
+        # optimizer override
         lr=None,
         lr_vision=None,
         lr_text=None,
         lr_transformer=None,
         lr_head=None,
         weight_decay=None,
+
+        # eval override
         score_thr=None,
         top_k=None,
         nms_iou_thr=None,
+
         **kwargs,
     ):
         model_cfg = deepcopy_cfg(self.model_cfg)
         train_cfg = load_train_config(cfg)
 
+        # YOLO-like aliases
         if data is not None:
             train_cfg["data"]["dataset_dir"] = data
 
@@ -1914,6 +1967,7 @@ class LightDet:
         if project is not None and name is not None:
             train_cfg["log"]["save_dir"] = os.path.join(project, name)
 
+        # optimizer aliases
         if lr is not None:
             train_cfg["optim"]["lr_vision"] = lr
             train_cfg["optim"]["lr_transformer"] = lr
@@ -1934,6 +1988,7 @@ class LightDet:
         if weight_decay is not None:
             train_cfg["optim"]["weight_decay"] = weight_decay
 
+        # eval aliases
         if score_thr is not None:
             train_cfg["eval"]["score_thr"] = score_thr
 
@@ -1949,7 +2004,7 @@ class LightDet:
 
         set_deterministic(
             seed=train_cfg["train"]["seed"],
-            deterministic=train_cfg["train"]["deterministic"],
+            deterministic=train_cfg["train"]["deterministic"]
         )
 
         args = cfg_to_args(

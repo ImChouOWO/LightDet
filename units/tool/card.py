@@ -1,7 +1,7 @@
 import os
 import warnings
 from pathlib import Path
-
+import math
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
@@ -54,7 +54,8 @@ class FusionBlock(nn.Module):
     def forward(
         self,
         img_tokens,
-        text_tokens
+        text_tokens,
+        text_mask
     ):
         """
         img_tokens:
@@ -70,21 +71,84 @@ class FusionBlock(nn.Module):
 
         x = torch.cat(
             [fusion_tokens,img_tokens,text_tokens],dim=1)
+        if text_mask is not None:
 
-        return x
+            fusion_mask = torch.ones(
+                img_tokens.shape[0],
+                fusion_tokens.shape[1],
+                device=img_tokens.device,
+                dtype=text_mask.dtype
+            )
 
+            img_mask = torch.ones(
+                img_tokens.shape[0],
+                img_tokens.shape[1],
+                device=img_tokens.device,
+                dtype=text_mask.dtype
+            )
+
+            attention_mask = torch.cat(
+                [
+                    fusion_mask,
+                    img_mask,
+                    text_mask
+                ],
+                dim=1
+            )
+
+        else:
+            attention_mask = None
+        return x,attention_mask
+
+    
 class TransformerBlock(nn.Module):
     def __init__(
         self,
-        num_layer=1,
-        in_channel=512,
-        out_channel=512
-    
+        hidden_dim=512,
+        fusion_token_num=16,
+        num_heads=8,
+        num_layers=1,
+        mlp_ratio=4.0,
+        dropout=0.1
     ):
         super().__init__()
-        self.fuse = FusionBlock(in_channel,out_channel)
-    def forward(self,img_token, text_token):
-        x = self.fuse(img_token, text_token)
+
+        self.fuse = FusionBlock(
+            hidden_dim=hidden_dim,
+            fusion_token_num=fusion_token_num
+        )
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=int(hidden_dim * mlp_ratio),
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True
+        )
+
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
+
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, img_token, text_token, text_mask):
+        x, mask = self.fuse(img_token, text_token, text_mask)
+
+        padding_mask = None
+        if mask is not None:
+            padding_mask = torch.eq(mask, 0)
+
+        x = self.transformer(
+            x,
+            src_key_padding_mask=padding_mask
+        )
+
+        x = self.norm(x)
+
         return x
 
 
@@ -414,10 +478,12 @@ class ImgProjector(nn.Module):
         out_channels=512,
         layer_num=3,
         expand_ratio=2.0,
-        target_size = (40,40)
+        target_size=(40, 40)
     ):
         super().__init__()
-        self.target_size  = target_size
+
+        self.target_size = target_size
+
         self.larger_view = self._make_layers(
             in_channels,
             out_channels,
@@ -438,15 +504,18 @@ class ImgProjector(nn.Module):
             layer_num,
             expand_ratio
         )
+
+        
         self.resize_view = nn.Sequential(
-            nn.LazyConv2d(
-                512,
+            nn.Conv2d(
+                out_channels,
+                out_channels,
                 kernel_size=1,
                 stride=1,
                 padding=0,
                 bias=False
             ),
-            nn.BatchNorm2d(512),
+            nn.BatchNorm2d(out_channels),
             nn.SiLU(inplace=True)
         )
 
@@ -504,7 +573,7 @@ class ImgProjector(nn.Module):
             align_corners=False
         )
         middle_feat = F.interpolate(
-            large_feat,
+            middle_feat,
             size=target_size,
             mode="bilinear",
             align_corners=False
@@ -540,28 +609,182 @@ class BackBone(nn.Module):
         x = x.flatten(2).transpose(1, 2)
         return x
 
+class BottleNet(nn.Module):
+    def __init__(
+        self,
+        in_channels=3,
+        out_channels=1024
+    ):
+        super().__init__()
 
-if __name__ == "__main__":
-    img_model = BackBone(
-        in_channels=1024,
-        out_channels=512,
-        target_size=(20, 20)
-    )
+        self.stem = nn.Sequential(
+            ConvBNAct(in_channels, 64, kernel_size=3, stride=2),
+            ConvBNAct(64, 128, kernel_size=3, stride=2),
+            ConvBNAct(128, 256, kernel_size=3, stride=2),
+            ConvBNAct(256, 512, kernel_size=3, stride=2),
+            ConvBNAct(512, out_channels, kernel_size=1, stride=1),
+        )
 
-    text_model = Bert(
-        out_dim=512,
-        max_length=32,
+    def forward(self, x):
+        return self.stem(x)
+
+class DenseHead(nn.Module):
+    def __init__(
+        self,
+        hidden_dim=512,
+        num_fusion=16,
+        num_image=400,
+        num_text=32,
+        alpha=0.4
+    ):
+        super().__init__()
+
+        self.num_fusion = num_fusion
+        self.num_image = num_image
+        self.num_text = num_text
+        self.alpha = alpha
+        self.alpha_logit = nn.Parameter(torch.tensor(0.0))
+        self.img_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 5)
+        )
+
+        self.fusion_score = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, x):
+        fusion_tokens = x[:, :self.num_fusion, :]
+
+        img_tokens = x[
+            :,
+            self.num_fusion:self.num_fusion + self.num_image,
+            :
+        ]
+
+        img_pred = self.img_head(img_tokens)
+
+        bbox_raw = img_pred[..., :4].sigmoid()
+
+        x1 = torch.minimum(bbox_raw[..., 0], bbox_raw[..., 2])
+        y1 = torch.minimum(bbox_raw[..., 1], bbox_raw[..., 3])
+        x2 = torch.maximum(bbox_raw[..., 0], bbox_raw[..., 2])
+        y2 = torch.maximum(bbox_raw[..., 1], bbox_raw[..., 3])
+
+        bbox = torch.stack([x1, y1, x2, y2], dim=-1)
+        img_score = img_pred[..., 4:5]
+
+        fusion_global = fusion_tokens.mean(dim=1, keepdim=True)
+        fusion_score = self.fusion_score(fusion_global)
+        alpha = torch.sigmoid(self.alpha_logit)
+        score_logit = img_score + alpha * fusion_score
+        
+
+        return bbox, score_logit  
+    
+class VisionTextModel(nn.Module):
+    def __init__(
+        self,
+        img_in_channels=1024,
+        hidden_dim=512,
+        target_size=(20, 20),
+        text_max_length=32,
+        fusion_token_num=16,
+        num_heads=8,
+        num_layers=1,
+        mlp_ratio=4.0,
+        dropout=0.1,
         freeze_bert=True
-    )
-    transformer = TransformerBlock()
-    img = torch.randn(1, 1024, 40, 40)
-    texts = ["ship"]
-    img_token = img_model(img)
-    text_out = text_model(texts)
-    text_token = text_out["text_tokens"]
-    text_mask = text_out["text_mask"]
-    fuse = transformer(img_token,text_token)
-    print(fuse.shape)
+    ):
+        super().__init__()
 
+        self.hidden_dim = hidden_dim
+        self.target_size = target_size
+        self.fusion_token_num = fusion_token_num
+
+        self.num_image = target_size[0] * target_size[1]
+        self.num_text = text_max_length
+        self.bottle_net = BottleNet(in_channels=3, out_channels=img_in_channels)
+        self.img_model = BackBone(
+            in_channels=img_in_channels,
+            out_channels=hidden_dim,
+            target_size=target_size
+        )
+
+        self.text_model = Bert(
+            out_dim=hidden_dim,
+            max_length=text_max_length,
+            freeze_bert=freeze_bert
+        )
+
+        self.transformer = TransformerBlock(
+            hidden_dim=hidden_dim,
+            fusion_token_num=fusion_token_num,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            mlp_ratio=mlp_ratio,
+            dropout=dropout
+        )
+
+        self.head = DenseHead(
+            hidden_dim=hidden_dim,
+            num_fusion=fusion_token_num,
+            num_image=self.num_image,
+            num_text=self.num_text
+        )
+
+    def forward(self, img, texts):
+        img = self.bottle_net(img)
+        img_token = self.img_model(img)
+
+        text_out = self.text_model(texts)
+        text_token = text_out["text_tokens"]
+        text_mask = text_out["text_mask"]
+
+        transformer_out = self.transformer(
+            img_token,
+            text_token,
+            text_mask
+        )
+
+        bbox, score_logit = self.head(transformer_out)
+
+        return {
+            "bbox": bbox,
+            "score_logit": score_logit,
+            "transformer_out": transformer_out,
+            "img_token": img_token,
+            "text_token": text_token,
+            "text_mask": text_mask
+        }
+    
+if __name__ == "__main__":
+    model = VisionTextModel(
+        img_in_channels=1024,
+        hidden_dim=512,
+        target_size=(10, 10),
+        text_max_length=32,
+        fusion_token_num=16,
+        num_heads=8,
+        num_layers=1
+    )
+
+    img = torch.randn(1, 3, 640, 640)
+    texts = ["ship"]
+
+    with torch.no_grad():
+        out = model(img, texts)
+
+    print("bbox :", out["bbox"].shape)
+    print("score_logit:", out["score_logit"].shape)
+    print("transformer_out:", out["transformer_out"].shape)
+    print("img_token:", out["img_token"].shape)
+    print("text_token:", out["text_token"].shape)
+    print("text_mask:", out["text_mask"].shape)
     
    
