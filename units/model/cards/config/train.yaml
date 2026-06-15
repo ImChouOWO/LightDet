@@ -12,7 +12,7 @@ train:
   seed: 42
   deterministic: true
   use_amp: true
-  use_ema: true
+  use_ema: false
   ema_decay: 0.999
   grad_clip_norm: 1.0
 
@@ -57,10 +57,11 @@ eval:
   top_k: 20
   nms_iou_thr: 0.5
   best_metric: map50
+  use_topk_fallback: false
 
 log:
   save_dir: null
   resume_path: null
   save_epoch_interval: 50
-  emit_step_metrics: true
-  log_interval: 10
+  emit_step_metrics: false
+  log_interval: 50

@@ -160,7 +160,8 @@ class Bert(nn.Module):
         out_dim=512,
         max_length=32,
         max_cache_size=20000,
-        freeze_bert=True
+        freeze_bert=True,
+        precomputed_bert_path=None,
     ):
         super().__init__()
 
@@ -184,6 +185,8 @@ class Bert(nn.Module):
         self.max_length = max_length
         self.max_cache_size = max_cache_size
         self.cache = {}
+        self.precomputed_bert_path = precomputed_bert_path
+        self.precomputed_cache = None
 
         bert_dim = self.model.config.hidden_size
 
@@ -200,8 +203,37 @@ class Bert(nn.Module):
         else:
             self.model.train()
 
+        if precomputed_bert_path is not None and os.path.exists(precomputed_bert_path):
+            try:
+                obj = torch.load(
+                    precomputed_bert_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+            except TypeError:
+                obj = torch.load(
+                    precomputed_bert_path,
+                    map_location="cpu",
+                )
+
+            self.precomputed_cache = obj["cache"]
+
+            print(
+                f"[BERT] Loaded precomputed raw cache: "
+                f"{len(self.precomputed_cache)} texts"
+            )
+
     def clear_cache(self):
         self.cache.clear()
+
+    def _normalize_texts(self, texts):
+        if isinstance(texts, str):
+            texts = [texts]
+
+        return [
+            str(t).strip()
+            for t in texts
+        ]
 
     def _encode_texts(self, texts, device):
         inputs = self.tokenizer(
@@ -232,27 +264,25 @@ class Bert(nn.Module):
             "attention_mask": inputs["attention_mask"]
         }
 
+    @torch.no_grad()
+    def encode_raw(self, texts, device=None):
+        texts = self._normalize_texts(texts)
+
+        if device is None:
+            device = next(self.model.parameters()).device
+
+        encoded = self._encode_texts(texts, device)
+
+        return {
+            "last_hidden_state": encoded["last_hidden_state"],
+            "attention_mask": encoded["attention_mask"],
+        }
+
     def forward(self, texts):
-        """
-        texts:
-            str 或 List[str]
-
-        return:
-            text_tokens: [B, L, out_dim]
-            text_mask:   [B, L]
-        """
-
-        if isinstance(texts, str):
-            texts = [texts]
-
-        texts = [
-            str(t).strip()
-            for t in texts
-        ]
+        texts = self._normalize_texts(texts)
 
         device = next(self.proj.parameters()).device
 
-        # 如果 BERT 是 freeze，才使用 cache
         bert_trainable = any(
             p.requires_grad for p in self.model.parameters()
         )
@@ -270,8 +300,16 @@ class Bert(nn.Module):
             }
 
         missing = []
+
         for text in texts:
-            if text not in self.cache:
+            in_precomputed = (
+                self.precomputed_cache is not None
+                and text in self.precomputed_cache
+            )
+
+            in_runtime_cache = text in self.cache
+
+            if not in_precomputed and not in_runtime_cache:
                 missing.append(text)
 
         if len(missing) > 0:
@@ -283,27 +321,25 @@ class Bert(nn.Module):
 
                 self.cache[text] = {
                     "last_hidden_state": encoded["last_hidden_state"][i].detach().cpu(),
-                    "attention_mask": encoded["attention_mask"][i].detach().cpu()
+                    "attention_mask": encoded["attention_mask"][i].detach().cpu(),
                 }
 
         hidden_states = []
         masks = []
 
         for text in texts:
-            item = self.cache[text]
+            if self.precomputed_cache is not None and text in self.precomputed_cache:
+                item = self.precomputed_cache[text]
+            else:
+                item = self.cache[text]
 
-            hidden_states.append(
-                item["last_hidden_state"]
-            )
-
-            masks.append(
-                item["attention_mask"]
-            )
+            hidden_states.append(item["last_hidden_state"])
+            masks.append(item["attention_mask"])
 
         hidden_states = torch.stack(
             hidden_states,
             dim=0
-        ).to(device)
+        ).to(device=device, dtype=torch.float32)
 
         masks = torch.stack(
             masks,
@@ -699,7 +735,8 @@ class VisionTextModel(nn.Module):
         num_layers=1,
         mlp_ratio=4.0,
         dropout=0.1,
-        freeze_bert=True
+        freeze_bert=True,
+        precomputed_bert_path=None,
     ):
         super().__init__()
 
@@ -719,7 +756,8 @@ class VisionTextModel(nn.Module):
         self.text_model = Bert(
             out_dim=hidden_dim,
             max_length=text_max_length,
-            freeze_bert=freeze_bert
+            freeze_bert=freeze_bert,
+            precomputed_bert_path=precomputed_bert_path,
         )
 
         self.transformer = TransformerBlock(

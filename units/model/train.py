@@ -31,7 +31,7 @@ for path in [PROJECT_ROOT, UNITS_DIR, CURRENT_DIR]:
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from units.tool.card import VisionTextModel
+from units.tool.card import VisionTextModel, Bert
 from units.model.pipeline.data import build_dataloaders
 
 
@@ -170,6 +170,8 @@ def build_optimizer(
             continue
 
         if "text_model.model" in name:
+            lr = lr_text
+        elif "text_model.proj" in name:
             lr = lr_text
         elif "bottle_net" in name or "img_model" in name:
             lr = lr_vision
@@ -497,11 +499,8 @@ class GroundingLoss(nn.Module):
 
 def move_targets_to_device(batch, device):
     """
-    支援新版 dataloader:
+    dataloader:
         batch["targets"] = [{"boxes": ..., ...}, ...]
-
-    也支援你舊 collate 的 fallback:
-        batch["target_boxes_per_image"]
     """
 
     if "targets" in batch:
@@ -1211,7 +1210,126 @@ def load_checkpoint(
 
     return start_epoch, best_metric
 
+def collect_query_texts_from_datasets(*datasets):
+    texts = set()
 
+    for dataset in datasets:
+        if dataset is None:
+            continue
+
+        samples = getattr(dataset, "samples", None)
+
+        if samples is None:
+            continue
+
+        for sample in samples:
+            if not isinstance(sample, dict):
+                continue
+
+            text = sample.get("query_text", None)
+
+            if text is None:
+                continue
+
+            text = str(text).strip()
+
+            if text:
+                texts.add(text)
+
+    return sorted(texts)
+
+
+def ensure_precomputed_bert_raw_cache(
+    cache_path,
+    datasets,
+    device,
+    hidden_dim=512,
+    max_length=32,
+    batch_size=128,
+    enabled=True,
+):
+    if not enabled:
+        print("[BERT Precompute] Skip because freeze_bert=False")
+        return None
+
+    if cache_path is None:
+        print("[BERT Precompute] Skip because precomputed_bert_path=None")
+        return None
+
+    cache_path = os.path.abspath(str(cache_path))
+
+    if os.path.exists(cache_path):
+        print(f"[BERT Precompute] Found existing cache, skip: {cache_path}")
+        return cache_path
+
+    texts = collect_query_texts_from_datasets(*datasets)
+
+    if len(texts) == 0:
+        raise RuntimeError(
+            "[BERT Precompute] No query_text found from dataloader datasets."
+        )
+
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+
+    print(f"[BERT Precompute] Cache not found. Building: {cache_path}")
+    print(f"[BERT Precompute] Unique query texts: {len(texts)}")
+
+    bert = Bert( 
+        out_dim=hidden_dim,
+        max_length=max_length,
+        freeze_bert=True,
+        precomputed_bert_path=None,
+    ).to(device)
+
+    bert.eval()
+
+    cache = {}
+
+    with torch.no_grad():
+        for i in tqdm(
+            range(0, len(texts), batch_size),
+            desc="[BERT Precompute]",
+            dynamic_ncols=True,
+        ):
+            batch_texts = texts[i:i + batch_size]
+
+            encoded = bert.encode_raw(
+                batch_texts,
+                device=device,
+            )
+
+            hidden = encoded["last_hidden_state"].detach().cpu().half()
+            mask = encoded["attention_mask"].detach().cpu()
+
+            for j, text in enumerate(batch_texts):
+                cache[text] = {
+                    "last_hidden_state": hidden[j],
+                    "attention_mask": mask[j],
+                }
+
+    tmp_path = cache_path + ".tmp"
+
+    torch.save(
+        {
+            "type": "bert_raw_cache",
+            "max_length": max_length,
+            "hidden_size": int(hidden.shape[-1]),
+            "num_texts": len(cache),
+            "cache": cache,
+        },
+        tmp_path,
+    )
+
+    os.replace(tmp_path, cache_path)
+
+    del bert
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    print(f"[BERT Precompute] Done. Saved {len(cache)} texts to {cache_path}")
+
+    return cache_path
 
 # Main train
 
@@ -1244,6 +1362,19 @@ def train(args):
         random_seed=args.seed,
     )
 
+    args.precomputed_bert_path = ensure_precomputed_bert_raw_cache(
+        cache_path=args.precomputed_bert_path,
+        datasets=[
+            train_loader.dataset,
+            val_loader.dataset,
+        ],
+        device=device,
+        hidden_dim=args.hidden_dim,
+        max_length=args.text_max_length,
+        batch_size=args.batch_size,
+        enabled=bool(args.freeze_bert),
+    )
+
     model = VisionTextModel(
         img_in_channels=args.img_in_channels,
         hidden_dim=args.hidden_dim,
@@ -1255,6 +1386,7 @@ def train(args):
         mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
         freeze_bert=args.freeze_bert,
+        precomputed_bert_path=args.precomputed_bert_path,
     ).to(device)
 
     ema = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
@@ -1506,13 +1638,19 @@ DEFAULT_MODEL_CFG = {
         "fusion_token_num": 16,
         "dropout": 0.1,
         "freeze_bert": True,
+        "precomputed_bert_path": os.path.join(
+            CURRENT_DIR,
+            "cards",
+            "cache",
+            "bert_raw_cache.pt",
+        ),
     }
 }
 
 
 DEFAULT_TRAIN_CFG = {
     "data": {
-        "dataset_dir": "/home/soic/Desktop/LightDet/datasets",
+        "dataset_dir": os.path.join(PROJECT_ROOT, "datasets"),
         "image_size": 640,
         "max_text_aug_per_image": 1,
     },
@@ -1724,6 +1862,7 @@ def cfg_to_args(model_cfg_all, train_cfg_all):
         mlp_ratio=model_cfg["mlp_ratio"],
         dropout=model_cfg["dropout"],
         freeze_bert=model_cfg["freeze_bert"],
+        precomputed_bert_path=model_cfg.get("precomputed_bert_path", None),
 
         # optimizer
         lr_vision=optim_cfg["lr_vision"],
@@ -1810,7 +1949,7 @@ def print_config_summary(model_cfg, train_cfg):
     print(f"  num_layers  : {m['num_layers']}")
     print(f"  num_heads   : {m['num_heads']}")
     print(f"  mlp_ratio   : {m['mlp_ratio']}")
-
+    print(f"  bert_cache  : {m.get('precomputed_bert_path', None)}")
     print(f"  lr_vision   : {o['lr_vision']}")
     print(f"  lr_text     : {o['lr_text']}")
     print(f"  lr_trans    : {o['lr_transformer']}")
@@ -1977,13 +2116,13 @@ def main():
         data="/home/soic/Desktop/LightDet/datasets",
         epochs=300,
         imgsz=640,
-        batch=8,
+        batch=16,
         device=1,
-        workers=16,
-        seed=42,
+        workers=12,
+        seed=43,
         deterministic=True,
         project="runs/train",
-        name="lightdet_seed42",
+        name="lightdet_seed43",
     )
 
 

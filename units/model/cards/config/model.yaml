@@ -9,3 +9,4 @@ model:
   fusion_token_num: 16
   dropout: 0.1
   freeze_bert: true
+  precomputed_bert_path: /home/soic/Desktop/LightDet/units/model/cards/cache/bert_raw_cache.pt
