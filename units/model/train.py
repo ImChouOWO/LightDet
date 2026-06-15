@@ -2115,14 +2115,14 @@ def main():
         cfg="/home/soic/Desktop/LightDet/units/model/cards/config/train.yaml",
         data="/home/soic/Desktop/LightDet/datasets",
         epochs=300,
-        imgsz=640,
-        batch=16,
+        imgsz=512,
+        batch=24,
         device=1,
-        workers=12,
-        seed=43,
-        deterministic=True,
+        workers=8,
+        seed=44,
+        deterministic=False,
         project="runs/train",
-        name="lightdet_seed43",
+        name="lightdet_seed44",
     )
 
 

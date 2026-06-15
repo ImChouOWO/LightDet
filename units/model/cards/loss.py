@@ -1,11 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.optimize import linear_sum_assignment
-
-
-
-# Utils
 
 
 def box_area(box):
@@ -40,9 +35,7 @@ def generalized_box_iou(boxes1, boxes2):
     return giou
 
 
-
-# Hungarian Matcher
-class HungarianMatcher:
+class GreedyMatcher:
     def __init__(
         self,
         cost_bbox=5.0,
@@ -52,6 +45,59 @@ class HungarianMatcher:
         self.cost_bbox = float(cost_bbox)
         self.cost_giou = float(cost_giou)
         self.cost_score = float(cost_score)
+
+    @torch.no_grad()
+    def greedy_match(self, cost):
+        num_pred, num_gt = cost.shape
+        device = cost.device
+
+        if num_pred == 0 or num_gt == 0:
+            return (
+                torch.empty(0, dtype=torch.long, device=device),
+                torch.empty(0, dtype=torch.long, device=device),
+            )
+
+        flat_order = torch.argsort(
+            cost.reshape(-1)
+        ).detach().cpu().tolist()
+
+        used_pred = set()
+        used_gt = set()
+
+        pred_indices = []
+        gt_indices = []
+
+        max_match = min(num_pred, num_gt)
+
+        for flat_idx in flat_order:
+            pred_idx = flat_idx // num_gt
+            gt_idx = flat_idx % num_gt
+
+            if pred_idx in used_pred:
+                continue
+
+            if gt_idx in used_gt:
+                continue
+
+            used_pred.add(pred_idx)
+            used_gt.add(gt_idx)
+
+            pred_indices.append(pred_idx)
+            gt_indices.append(gt_idx)
+
+            if len(pred_indices) >= max_match:
+                break
+
+        if len(pred_indices) == 0:
+            return (
+                torch.empty(0, dtype=torch.long, device=device),
+                torch.empty(0, dtype=torch.long, device=device),
+            )
+
+        return (
+            torch.tensor(pred_indices, dtype=torch.long, device=device),
+            torch.tensor(gt_indices, dtype=torch.long, device=device),
+        )
 
     @torch.no_grad()
     def __call__(
@@ -110,28 +156,18 @@ class HungarianMatcher:
                 self.cost_score * cost_score
             )
 
-            pred_idx, gt_idx = linear_sum_assignment(
-                cost.detach().cpu().numpy()
-            )
+            cost = cost.float()
+
+            pred_idx, gt_idx = self.greedy_match(cost)
 
             indices.append((
-                torch.as_tensor(
-                    pred_idx,
-                    dtype=torch.long,
-                    device=pred_bbox.device,
-                ),
-                torch.as_tensor(
-                    gt_idx,
-                    dtype=torch.long,
-                    device=pred_bbox.device,
-                ),
+                pred_idx,
+                gt_idx,
             ))
 
         return indices
 
 
-
-# Loss
 class GroundingLoss(nn.Module):
     def __init__(
         self,
@@ -141,7 +177,7 @@ class GroundingLoss(nn.Module):
     ):
         super().__init__()
 
-        self.matcher = HungarianMatcher(
+        self.matcher = GreedyMatcher(
             cost_bbox=cost_bbox,
             cost_giou=cost_giou,
             cost_score=cost_score,
@@ -157,26 +193,6 @@ class GroundingLoss(nn.Module):
         lambda_score=1.0,
         pos_weight=1.0,
     ):
-        """
-        pred_bbox:
-            [B, N, 4], normalized xyxy, range 0~1
-
-        pred_score_logit:
-            [B, N, 1], raw logits, 不要先 sigmoid
-
-        targets:
-            list[dict], 每個 dict 至少包含：
-            {
-                "boxes": Tensor[M, 4] normalized xyxy
-            }
-
-        lambda_bbox / lambda_giou / lambda_score:
-            final loss 權重，可由 YAML 動態控制
-
-        pos_weight:
-            BCE 正樣本權重，可由 YAML 動態控制
-        """
-
         indices = self.matcher(
             pred_bbox=pred_bbox,
             pred_score_logit=pred_score_logit,
@@ -255,5 +271,3 @@ class GroundingLoss(nn.Module):
         }
 
         return loss, loss_dict
-
-
