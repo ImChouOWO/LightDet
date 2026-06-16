@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +14,9 @@ def box_area(box):
 
 
 def generalized_box_iou(boxes1, boxes2):
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return boxes1.new_zeros((boxes1.shape[0], boxes2.shape[0]))
+
     area1 = box_area(boxes1)
     area2 = box_area(boxes2)
 
@@ -40,7 +45,7 @@ class GreedyMatcher:
         self,
         cost_bbox=5.0,
         cost_giou=2.0,
-        cost_score=1.0,
+        cost_score=0.0,
     ):
         self.cost_bbox = float(cost_bbox)
         self.cost_giou = float(cost_giou)
@@ -57,9 +62,7 @@ class GreedyMatcher:
                 torch.empty(0, dtype=torch.long, device=device),
             )
 
-        flat_order = torch.argsort(
-            cost.reshape(-1)
-        ).detach().cpu().tolist()
+        flat_order = torch.argsort(cost.reshape(-1)).detach().cpu().tolist()
 
         used_pred = set()
         used_gt = set()
@@ -119,21 +122,12 @@ class GreedyMatcher:
 
             if tgt_bbox.numel() == 0:
                 indices.append((
-                    torch.empty(
-                        0,
-                        dtype=torch.long,
-                        device=pred_bbox.device,
-                    ),
-                    torch.empty(
-                        0,
-                        dtype=torch.long,
-                        device=pred_bbox.device,
-                    ),
+                    torch.empty(0, dtype=torch.long, device=pred_bbox.device),
+                    torch.empty(0, dtype=torch.long, device=pred_bbox.device),
                 ))
                 continue
 
             out_bbox = pred_bbox[b]
-            out_score = pred_score[b]
 
             cost_bbox = torch.cdist(
                 out_bbox,
@@ -146,15 +140,16 @@ class GreedyMatcher:
                 tgt_bbox,
             )
 
-            cost_score = -out_score[:, None]
-
             cost = (
                 self.cost_bbox * cost_bbox
                 +
                 self.cost_giou * cost_giou
-                +
-                self.cost_score * cost_score
             )
+
+            if self.cost_score > 0:
+                out_score = pred_score[b]
+                cost_score = -out_score[:, None]
+                cost = cost + self.cost_score * cost_score
 
             cost = cost.float()
 
@@ -173,7 +168,13 @@ class GroundingLoss(nn.Module):
         self,
         cost_bbox=5.0,
         cost_giou=2.0,
-        cost_score=1.0,
+        cost_score=0.0,
+        hard_negative_ratio=5,
+        positive_ratio=0.2,
+        max_positive_per_gt=5,
+        aux_positive_label=0.7,
+        expand_cost_bbox=5.0,
+        expand_cost_giou=2.0,
     ):
         super().__init__()
 
@@ -182,6 +183,159 @@ class GroundingLoss(nn.Module):
             cost_giou=cost_giou,
             cost_score=cost_score,
         )
+
+        self.hard_negative_ratio = int(hard_negative_ratio)
+        self.positive_ratio = float(positive_ratio)
+        self.max_positive_per_gt = int(max_positive_per_gt)
+        self.aux_positive_label = float(aux_positive_label)
+        self.expand_cost_bbox = float(expand_cost_bbox)
+        self.expand_cost_giou = float(expand_cost_giou)
+
+    @torch.no_grad()
+    def expand_score_targets(
+        self,
+        pred_bbox,
+        targets,
+        score_target,
+    ):
+        B, N, _ = pred_bbox.shape
+
+        positive_budget = max(
+            1,
+            int(round(N * self.positive_ratio)),
+        )
+
+        positive_budget = min(positive_budget, N)
+
+        for b in range(B):
+            tgt_bbox = targets[b]["boxes"].to(
+                device=pred_bbox.device,
+                dtype=pred_bbox.dtype,
+            )
+
+            num_gt = int(tgt_bbox.shape[0])
+
+            if num_gt == 0:
+                continue
+
+            current_pos = int((score_target[b, :, 0] > 0.0).sum().item())
+            remaining_budget = positive_budget - current_pos
+
+            if remaining_budget <= 0:
+                continue
+
+            k_per_gt = max(
+                1,
+                int(math.ceil(remaining_budget / max(num_gt, 1))),
+            )
+
+            k_per_gt = min(
+                k_per_gt,
+                self.max_positive_per_gt,
+                N,
+            )
+
+            cost_bbox = torch.cdist(
+                pred_bbox[b].detach(),
+                tgt_bbox,
+                p=1,
+            )
+
+            giou = generalized_box_iou(
+                pred_bbox[b].detach(),
+                tgt_bbox,
+            )
+
+            cost = (
+                self.expand_cost_bbox * cost_bbox
+                -
+                self.expand_cost_giou * giou
+            )
+
+            candidate_pred = []
+            candidate_cost = []
+
+            for gt_i in range(num_gt):
+                vals, top_idx = torch.topk(
+                    cost[:, gt_i],
+                    k=k_per_gt,
+                    largest=False,
+                )
+
+                candidate_pred.append(top_idx)
+                candidate_cost.append(vals)
+
+            if len(candidate_pred) == 0:
+                continue
+
+            candidate_pred = torch.cat(candidate_pred, dim=0)
+            candidate_cost = torch.cat(candidate_cost, dim=0)
+
+            order = torch.argsort(candidate_cost)
+
+            for idx in order:
+                pred_idx = candidate_pred[idx]
+
+                if score_target[b, pred_idx, 0] > 0.0:
+                    continue
+
+                score_target[b, pred_idx, 0] = torch.maximum(
+                    score_target[b, pred_idx, 0],
+                    score_target.new_tensor(self.aux_positive_label),
+                )
+
+                current_pos += 1
+
+                if current_pos >= positive_budget:
+                    break
+
+        return score_target
+
+    def score_loss_balanced(
+        self,
+        pred_score_logit,
+        score_target,
+        pos_weight=1.0,
+    ):
+        bce = F.binary_cross_entropy_with_logits(
+            pred_score_logit,
+            score_target,
+            reduction="none",
+        )
+
+        pos_mask = score_target > 0.0
+        neg_mask = score_target <= 0.0
+
+        if pos_mask.any():
+            loss_pos = bce[pos_mask].mean()
+        else:
+            loss_pos = pred_score_logit.new_tensor(0.0)
+
+        neg_loss_all = bce[neg_mask]
+
+        pos_count = int(pos_mask.sum().item())
+
+        if neg_loss_all.numel() > 0:
+            hard_neg_k = min(
+                neg_loss_all.numel(),
+                max(pos_count * self.hard_negative_ratio, 1),
+            )
+
+            loss_neg = torch.topk(
+                neg_loss_all.reshape(-1),
+                k=hard_neg_k,
+                largest=True,
+            ).values.mean()
+        else:
+            loss_neg = pred_score_logit.new_tensor(0.0)
+
+        loss_score = (
+            float(pos_weight) * loss_pos
+            +
+            loss_neg
+        ) / (float(pos_weight) + 1.0)
+
+        return loss_score, loss_pos, loss_neg, float(pos_count)
 
     def forward(
         self,
@@ -198,8 +352,6 @@ class GroundingLoss(nn.Module):
             pred_score_logit=pred_score_logit,
             targets=targets,
         )
-
-        B, N, _ = pred_bbox.shape
 
         score_target = torch.zeros_like(pred_score_logit)
 
@@ -236,18 +388,23 @@ class GroundingLoss(nn.Module):
 
             total_matched += int(pred_idx.numel())
 
+        score_target = self.expand_score_targets(
+            pred_bbox=pred_bbox,
+            targets=targets,
+            score_target=score_target,
+        )
+
         total = max(total_matched, 1)
 
         loss_bbox = loss_bbox / total
         loss_giou = loss_giou / total
 
-        pos_weight_tensor = pred_score_logit.new_tensor([float(pos_weight)])
-
-        loss_score = F.binary_cross_entropy_with_logits(
-            pred_score_logit,
-            score_target,
-            pos_weight=pos_weight_tensor,
-            reduction="mean",
+        loss_score, loss_score_pos, loss_score_neg, score_pos_count = (
+            self.score_loss_balanced(
+                pred_score_logit=pred_score_logit,
+                score_target=score_target,
+                pos_weight=pos_weight,
+            )
         )
 
         loss = (
@@ -263,7 +420,10 @@ class GroundingLoss(nn.Module):
             "loss_bbox": loss_bbox.detach(),
             "loss_giou": loss_giou.detach(),
             "loss_score": loss_score.detach(),
+            "loss_score_pos": loss_score_pos.detach(),
+            "loss_score_neg": loss_score_neg.detach(),
             "matched": float(total_matched),
+            "score_pos_count": float(score_pos_count),
             "lambda_bbox": float(lambda_bbox),
             "lambda_giou": float(lambda_giou),
             "lambda_score": float(lambda_score),

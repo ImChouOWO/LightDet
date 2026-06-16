@@ -19,7 +19,6 @@ import torch.multiprocessing as mp
 from torch.optim import AdamW
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
-from scipy.optimize import linear_sum_assignment
 from torchvision.ops import nms
 
 
@@ -33,6 +32,7 @@ for path in [PROJECT_ROOT, UNITS_DIR, CURRENT_DIR]:
 
 from units.tool.card import VisionTextModel, Bert
 from units.model.pipeline.data import build_dataloaders
+from units.model.cards import GroundingLoss
 
 
 mp.set_sharing_strategy("file_system")
@@ -321,176 +321,6 @@ def box_iou_xyxy(boxes1, boxes2, eps=1e-7):
 
     return inter / union.clamp(min=eps)
 
-
-def generalized_box_iou(boxes1, boxes2):
-    if boxes1.numel() == 0 or boxes2.numel() == 0:
-        return boxes1.new_zeros((boxes1.shape[0], boxes2.shape[0]))
-
-    area1 = box_area(boxes1)
-    area2 = box_area(boxes2)
-
-    lt = torch.max(boxes1[:, None, :2], boxes2[None, :, :2])
-    rb = torch.min(boxes1[:, None, 2:], boxes2[None, :, 2:])
-
-    wh = (rb - lt).clamp(min=0)
-    inter = wh[..., 0] * wh[..., 1]
-
-    union = area1[:, None] + area2[None, :] - inter
-    iou = inter / union.clamp(min=1e-6)
-
-    lt_c = torch.min(boxes1[:, None, :2], boxes2[None, :, :2])
-    rb_c = torch.max(boxes1[:, None, 2:], boxes2[None, :, 2:])
-
-    wh_c = (rb_c - lt_c).clamp(min=0)
-    area_c = wh_c[..., 0] * wh_c[..., 1]
-
-    giou = iou - (area_c - union) / area_c.clamp(min=1e-6)
-
-    return giou
-
-
-class HungarianMatcher:
-    def __init__(self, cost_bbox=5.0, cost_giou=2.0, cost_score=1.0):
-        self.cost_bbox = cost_bbox
-        self.cost_giou = cost_giou
-        self.cost_score = cost_score
-
-    @torch.no_grad()
-    def __call__(self, pred_bbox, pred_score_logit, targets):
-        B, N, _ = pred_bbox.shape
-        indices = []
-
-        pred_score = pred_score_logit.sigmoid().squeeze(-1)
-
-        for b in range(B):
-            tgt_bbox = targets[b]["boxes"].to(
-                device=pred_bbox.device,
-                dtype=pred_bbox.dtype
-            )
-
-            if tgt_bbox.numel() == 0:
-                indices.append((
-                    torch.empty(0, dtype=torch.long, device=pred_bbox.device),
-                    torch.empty(0, dtype=torch.long, device=pred_bbox.device),
-                ))
-                continue
-
-            out_bbox = pred_bbox[b]
-            out_score = pred_score[b]
-
-            cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
-            cost_giou = -generalized_box_iou(out_bbox, tgt_bbox)
-            cost_score = -out_score[:, None]
-
-            cost = (
-                self.cost_bbox * cost_bbox
-                +
-                self.cost_giou * cost_giou
-                +
-                self.cost_score * cost_score
-            )
-
-            pred_idx, gt_idx = linear_sum_assignment(cost.detach().cpu().numpy())
-
-            indices.append((
-                torch.as_tensor(pred_idx, dtype=torch.long, device=pred_bbox.device),
-                torch.as_tensor(gt_idx, dtype=torch.long, device=pred_bbox.device),
-            ))
-
-        return indices
-
-
-class GroundingLoss(nn.Module):
-    def __init__(
-        self,
-        cost_bbox=5.0,
-        cost_giou=2.0,
-        cost_score=1.0,
-    ):
-        super().__init__()
-
-        self.matcher = HungarianMatcher(
-            cost_bbox=cost_bbox,
-            cost_giou=cost_giou,
-            cost_score=cost_score,
-        )
-
-    def forward(
-        self,
-        pred_bbox,
-        pred_score_logit,
-        targets,
-        lambda_bbox=5.0,
-        lambda_giou=2.0,
-        lambda_score=1.0,
-        pos_weight=1.0,
-    ):
-        indices = self.matcher(pred_bbox, pred_score_logit, targets)
-
-        B, N, _ = pred_bbox.shape
-
-        score_target = torch.zeros_like(pred_score_logit)
-
-        loss_bbox = pred_bbox.new_tensor(0.0)
-        loss_giou = pred_bbox.new_tensor(0.0)
-        total_matched = 0
-
-        for b, (pred_idx, gt_idx) in enumerate(indices):
-            if pred_idx.numel() == 0:
-                continue
-
-            tgt_bbox = targets[b]["boxes"].to(
-                device=pred_bbox.device,
-                dtype=pred_bbox.dtype
-            )
-
-            matched_pred = pred_bbox[b, pred_idx]
-            matched_tgt = tgt_bbox[gt_idx]
-
-            score_target[b, pred_idx, 0] = 1.0
-
-            loss_bbox = loss_bbox + F.l1_loss(
-                matched_pred,
-                matched_tgt,
-                reduction="sum"
-            )
-
-            giou = generalized_box_iou(matched_pred, matched_tgt)
-            loss_giou = loss_giou + (1.0 - torch.diag(giou)).sum()
-
-            total_matched += int(pred_idx.numel())
-
-        total = max(total_matched, 1)
-
-        loss_bbox = loss_bbox / total
-        loss_giou = loss_giou / total
-
-        pos_weight_tensor = pred_score_logit.new_tensor([pos_weight])
-
-        loss_score = F.binary_cross_entropy_with_logits(
-            pred_score_logit,
-            score_target,
-            pos_weight=pos_weight_tensor,
-            reduction="mean"
-        )
-
-        loss = (
-            lambda_bbox * loss_bbox
-            +
-            lambda_giou * loss_giou
-            +
-            lambda_score * loss_score
-        )
-
-        loss_dict = {
-            "loss": loss.detach(),
-            "loss_bbox": loss_bbox.detach(),
-            "loss_giou": loss_giou.detach(),
-            "loss_score": loss_score.detach(),
-            "matched": float(total_matched),
-        }
-
-        return loss, loss_dict
 
 
 
@@ -1395,6 +1225,12 @@ def train(args):
         cost_bbox=args.cost_bbox,
         cost_giou=args.cost_giou,
         cost_score=args.cost_score,
+        hard_negative_ratio=args.hard_negative_ratio,
+        positive_ratio=args.positive_ratio,
+        max_positive_per_gt=args.max_positive_per_gt,
+        aux_positive_label=args.aux_positive_label,
+        expand_cost_bbox=args.expand_cost_bbox,
+        expand_cost_giou=args.expand_cost_giou,
     )
 
     total_params, trainable_params = count_parameters(model)
@@ -1683,7 +1519,16 @@ DEFAULT_TRAIN_CFG = {
         "matcher": {
             "cost_bbox": 5.0,
             "cost_giou": 2.0,
-            "cost_score": 1.0,
+            "cost_score": 0.0,
+        },
+
+        "score_sampling": {
+            "hard_negative_ratio": 5,
+            "positive_ratio": 0.2,
+            "max_positive_per_gt": 5,
+            "aux_positive_label": 0.7,
+            "expand_cost_bbox": 5.0,
+            "expand_cost_giou": 2.0,
         },
 
         "weight": {
@@ -1691,20 +1536,20 @@ DEFAULT_TRAIN_CFG = {
 
             "bbox": 5.0,
             "giou": 2.0,
-            "score": 1.0,
+            "score": 2.0,
 
             "bbox_start": 5.0,
             "bbox_end": 3.0,
             "bbox_decay_until": 0.5,
 
-            "score_start": 1.0,
-            "score_end": 2.0,
+            "score_start": 2.0,
+            "score_end": 4.0,
             "score_warm_until": 0.4,
         },
 
         "pos_weight": {
-            "min": 1.0,
-            "max": 5.0,
+            "min": 2.0,
+            "max": 8.0,
             "warm_until": 0.5,
         },
     },
@@ -1831,6 +1676,7 @@ def cfg_to_args(model_cfg_all, train_cfg_all):
     matcher_cfg = loss_cfg.get("matcher", {})
     weight_cfg = loss_cfg.get("weight", {})
     pos_weight_cfg = loss_cfg.get("pos_weight", {})
+    score_sampling_cfg = loss_cfg.get("score_sampling", {})
 
     return SimpleNamespace(
         # data
@@ -1877,6 +1723,13 @@ def cfg_to_args(model_cfg_all, train_cfg_all):
         cost_bbox=matcher_cfg.get("cost_bbox", 5.0),
         cost_giou=matcher_cfg.get("cost_giou", 2.0),
         cost_score=matcher_cfg.get("cost_score", 1.0),
+
+        hard_negative_ratio=score_sampling_cfg.get("hard_negative_ratio", 5),
+        positive_ratio=score_sampling_cfg.get("positive_ratio", 0.2),
+        max_positive_per_gt=score_sampling_cfg.get("max_positive_per_gt", 5),
+        aux_positive_label=score_sampling_cfg.get("aux_positive_label", 0.7),
+        expand_cost_bbox=score_sampling_cfg.get("expand_cost_bbox", 5.0),
+        expand_cost_giou=score_sampling_cfg.get("expand_cost_giou", 2.0),
 
         # final loss weight
         loss_dynamic=weight_cfg.get("dynamic", True),
