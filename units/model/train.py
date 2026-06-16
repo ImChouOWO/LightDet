@@ -32,7 +32,7 @@ for path in [PROJECT_ROOT, UNITS_DIR, CURRENT_DIR]:
 
 from units.tool.card import VisionTextModel, Bert
 from units.model.pipeline.data import build_dataloaders
-from units.model.cards import GroundingLoss
+from units.model.cards.loss import GroundingLoss
 
 
 mp.set_sharing_strategy("file_system")
