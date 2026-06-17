@@ -13,6 +13,29 @@ def box_area(box):
     )
 
 
+def box_iou(boxes1, boxes2):
+    """
+    boxes1: [N, 4], xyxy normalized or absolute
+    boxes2: [M, 4], xyxy normalized or absolute
+    return: [N, M]
+    """
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return boxes1.new_zeros((boxes1.shape[0], boxes2.shape[0]))
+
+    area1 = box_area(boxes1)
+    area2 = box_area(boxes2)
+
+    lt = torch.max(boxes1[:, None, :2], boxes2[None, :, :2])
+    rb = torch.min(boxes1[:, None, 2:], boxes2[None, :, 2:])
+
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[..., 0] * wh[..., 1]
+
+    union = area1[:, None] + area2[None, :] - inter
+
+    return inter / union.clamp(min=1e-6)
+
+
 def generalized_box_iou(boxes1, boxes2):
     if boxes1.numel() == 0 or boxes2.numel() == 0:
         return boxes1.new_zeros((boxes1.shape[0], boxes2.shape[0]))
@@ -38,6 +61,48 @@ def generalized_box_iou(boxes1, boxes2):
     giou = iou - (area_c - union) / area_c.clamp(min=1e-6)
 
     return giou
+
+
+def bounded_iou_quality(
+    iou,
+    iou_pos_thr=0.2,
+    quality_min=0.3,
+    quality_max=1.0,
+):
+    """
+    將 IoU 映射成非二元 score target。
+
+    IoU < iou_pos_thr:
+        target = 0.0
+
+    IoU >= iou_pos_thr:
+        target 會落在 [quality_min, quality_max]
+
+    例：
+        iou_pos_thr = 0.2
+        quality_min = 0.3
+        quality_max = 1.0
+
+        IoU 0.20 -> target 0.30
+        IoU 0.50 -> target 約 0.56
+        IoU 0.80 -> target 約 0.83
+        IoU 1.00 -> target 1.00
+    """
+    quality = torch.zeros_like(iou)
+
+    pos_mask = iou >= iou_pos_thr
+
+    quality[pos_mask] = (
+        quality_min
+        +
+        (quality_max - quality_min)
+        *
+        (iou[pos_mask] - iou_pos_thr)
+        /
+        max(1.0 - iou_pos_thr, 1e-6)
+    )
+
+    return quality.clamp(0.0, 1.0)
 
 
 class GreedyMatcher:
@@ -169,12 +234,32 @@ class GroundingLoss(nn.Module):
         cost_bbox=5.0,
         cost_giou=2.0,
         cost_score=0.0,
+
+        # 你的 FP 很多，negative 需要比 positive 多。
         hard_negative_ratio=5,
-        positive_ratio=0.2,
-        max_positive_per_gt=5,
+
+        # 原本 0.2 在 10x10 grid 下最多會擴張到 20 個 positive，
+        # 對目前 precision 很低的狀態偏多，先降到 0.05。
+        positive_ratio=0.05,
+        max_positive_per_gt=2,
+
+        # 保留參數相容性，但不再作為固定 final target。
+        # 只在 quality warmup 初期作為 aux positive 的過渡值。
         aux_positive_label=0.7,
+
         expand_cost_bbox=5.0,
         expand_cost_giou=2.0,
+
+        # quality-aware confidence 設定
+        iou_pos_thr=0.2,
+        quality_min=0.3,
+        quality_max=1.0,
+        qfl_beta=2.0,
+
+        # ranking loss 設定
+        rank_margin=0.1,
+        rank_min_quality_gap=0.1,
+        rank_max_pairs=512,
     ):
         super().__init__()
 
@@ -191,13 +276,69 @@ class GroundingLoss(nn.Module):
         self.expand_cost_bbox = float(expand_cost_bbox)
         self.expand_cost_giou = float(expand_cost_giou)
 
+        self.iou_pos_thr = float(iou_pos_thr)
+        self.quality_min = float(quality_min)
+        self.quality_max = float(quality_max)
+        self.qfl_beta = float(qfl_beta)
+
+        self.rank_margin = float(rank_margin)
+        self.rank_min_quality_gap = float(rank_min_quality_gap)
+        self.rank_max_pairs = int(rank_max_pairs)
+
+    def resolve_epoch_alpha(
+        self,
+        current_epoch=None,
+        quality_alpha=None,
+        rank_alpha=None,
+        quality_warmup_epoch=10,
+        rank_start_epoch=5,
+        rank_warmup_epoch=10,
+    ):
+        """
+        讓 epoch 可以控制：
+        1. score target 從 objectness 過渡到 IoU quality
+        2. ranking loss 從 0 慢慢打開
+        """
+        if quality_alpha is None:
+            if current_epoch is None:
+                quality_alpha = 1.0
+            else:
+                quality_alpha = min(
+                    1.0,
+                    max(0.0, float(current_epoch) / max(float(quality_warmup_epoch), 1.0)),
+                )
+
+        if rank_alpha is None:
+            if current_epoch is None:
+                rank_alpha = 1.0
+            else:
+                rank_alpha = min(
+                    1.0,
+                    max(
+                        0.0,
+                        (float(current_epoch) - float(rank_start_epoch))
+                        / max(float(rank_warmup_epoch), 1.0),
+                    ),
+                )
+
+        return float(quality_alpha), float(rank_alpha)
+
     @torch.no_grad()
     def expand_score_targets(
         self,
         pred_bbox,
         targets,
         score_target,
+        quality_alpha=1.0,
     ):
+        """
+        原本：
+            aux positive 固定給 0.7
+
+        現在：
+            aux positive 依照 IoU 轉成 bounded quality target。
+            IoU 很差的 candidate 不會被強制當 positive。
+        """
         B, N, _ = pred_bbox.shape
 
         positive_budget = max(
@@ -235,14 +376,16 @@ class GroundingLoss(nn.Module):
                 N,
             )
 
+            pred_bbox_b = pred_bbox[b].detach()
+
             cost_bbox = torch.cdist(
-                pred_bbox[b].detach(),
+                pred_bbox_b,
                 tgt_bbox,
                 p=1,
             )
 
             giou = generalized_box_iou(
-                pred_bbox[b].detach(),
+                pred_bbox_b,
                 tgt_bbox,
             )
 
@@ -250,6 +393,20 @@ class GroundingLoss(nn.Module):
                 self.expand_cost_bbox * cost_bbox
                 -
                 self.expand_cost_giou * giou
+            )
+
+            iou_mat = box_iou(
+                pred_bbox_b,
+                tgt_bbox,
+            )
+
+            max_iou = iou_mat.max(dim=1).values
+
+            quality_all = bounded_iou_quality(
+                max_iou,
+                iou_pos_thr=self.iou_pos_thr,
+                quality_min=self.quality_min,
+                quality_max=self.quality_max,
             )
 
             candidate_pred = []
@@ -279,9 +436,26 @@ class GroundingLoss(nn.Module):
                 if score_target[b, pred_idx, 0] > 0.0:
                     continue
 
+                quality = quality_all[pred_idx]
+
+                # IoU 太差，不再硬標成 aux positive。
+                # 這些樣本會保留 target = 0，成為 negative。
+                if quality <= 0.0:
+                    continue
+
+                # warmup 初期仍保留一點 objectness 性質，
+                # 後期完全轉成 IoU quality target。
+                quality_target = (
+                    (1.0 - quality_alpha)
+                    * score_target.new_tensor(self.aux_positive_label)
+                    +
+                    quality_alpha
+                    * quality
+                )
+
                 score_target[b, pred_idx, 0] = torch.maximum(
                     score_target[b, pred_idx, 0],
-                    score_target.new_tensor(self.aux_positive_label),
+                    quality_target,
                 )
 
                 current_pos += 1
@@ -291,35 +465,56 @@ class GroundingLoss(nn.Module):
 
         return score_target
 
-    def score_loss_balanced(
+    def score_loss_quality_balanced(
         self,
         pred_score_logit,
         score_target,
         pos_weight=1.0,
+        qfl_beta=None,
     ):
+        """
+        Quality Focal Loss + hard negative mining。
+
+        這裡仍然混合 positive / negative：
+        - positive: score_target > 0
+        - negative: score_target <= 0
+        - negative 只取 loss 最大的 top-k，避免 easy negative 淹沒訓練。
+        """
+        if qfl_beta is None:
+            qfl_beta = self.qfl_beta
+
+        pred_prob = pred_score_logit.sigmoid()
+
         bce = F.binary_cross_entropy_with_logits(
             pred_score_logit,
             score_target,
             reduction="none",
         )
 
+        qfl_weight = (score_target - pred_prob).abs().pow(float(qfl_beta))
+
+        loss_all = bce * qfl_weight
+
         pos_mask = score_target > 0.0
         neg_mask = score_target <= 0.0
 
         if pos_mask.any():
-            loss_pos = bce[pos_mask].mean()
+            loss_pos = loss_all[pos_mask].mean()
         else:
             loss_pos = pred_score_logit.new_tensor(0.0)
 
-        neg_loss_all = bce[neg_mask]
-
+        neg_loss_all = loss_all[neg_mask]
         pos_count = int(pos_mask.sum().item())
+
+        hard_neg_count = 0
 
         if neg_loss_all.numel() > 0:
             hard_neg_k = min(
                 neg_loss_all.numel(),
-                max(pos_count * self.hard_negative_ratio, 1),
+                max(pos_count * self.hard_negative_ratio, self.hard_negative_ratio),
             )
+
+            hard_neg_count = int(hard_neg_k)
 
             loss_neg = torch.topk(
                 neg_loss_all.reshape(-1),
@@ -335,7 +530,103 @@ class GroundingLoss(nn.Module):
             loss_neg
         ) / (float(pos_weight) + 1.0)
 
-        return loss_score, loss_pos, loss_neg, float(pos_count)
+        return (
+            loss_score,
+            loss_pos,
+            loss_neg,
+            float(pos_count),
+            float(hard_neg_count),
+        )
+
+    def pairwise_quality_rank_loss(
+        self,
+        pred_score_logit,
+        score_target,
+        margin=None,
+        min_quality_gap=None,
+    ):
+        """
+        ranking loss：
+
+        若 quality_i > quality_j，
+        則希望 score_i > score_j。
+
+        同時包含：
+        1. positive vs positive ranking
+        2. positive vs hard negative ranking
+        """
+        if margin is None:
+            margin = self.rank_margin
+
+        if min_quality_gap is None:
+            min_quality_gap = self.rank_min_quality_gap
+
+        score = pred_score_logit.sigmoid().reshape(-1)
+        quality = score_target.reshape(-1)
+
+        pos_idx = torch.nonzero(quality > 0.0, as_tuple=False).flatten()
+        neg_idx = torch.nonzero(quality <= 0.0, as_tuple=False).flatten()
+
+        losses = []
+
+        # positive vs positive：高 quality positive 分數要高於低 quality positive
+        if pos_idx.numel() >= 2:
+            q = quality[pos_idx]
+            s = score[pos_idx]
+
+            qi = q[:, None]
+            qj = q[None, :]
+
+            si = s[:, None]
+            sj = s[None, :]
+
+            rank_mask = qi > (qj + float(min_quality_gap))
+
+            if rank_mask.any():
+                diff = si - sj
+                loss_pp = F.relu(float(margin) - diff)[rank_mask]
+
+                if loss_pp.numel() > self.rank_max_pairs:
+                    perm = torch.randperm(
+                        loss_pp.numel(),
+                        device=loss_pp.device,
+                    )[:self.rank_max_pairs]
+                    loss_pp = loss_pp[perm]
+
+                losses.append(loss_pp.mean())
+
+        # positive vs hard negative：positive 分數要高於高分 negative
+        if pos_idx.numel() > 0 and neg_idx.numel() > 0:
+            pos_score = score[pos_idx]
+            neg_score = score[neg_idx]
+
+            hard_neg_k = min(
+                neg_score.numel(),
+                max(pos_idx.numel() * self.hard_negative_ratio, 1),
+            )
+
+            hard_neg_score = torch.topk(
+                neg_score,
+                k=hard_neg_k,
+                largest=True,
+            ).values
+
+            diff = pos_score[:, None] - hard_neg_score[None, :]
+            loss_pn = F.relu(float(margin) - diff).reshape(-1)
+
+            if loss_pn.numel() > self.rank_max_pairs:
+                perm = torch.randperm(
+                    loss_pn.numel(),
+                    device=loss_pn.device,
+                )[:self.rank_max_pairs]
+                loss_pn = loss_pn[perm]
+
+            losses.append(loss_pn.mean())
+
+        if len(losses) == 0:
+            return pred_score_logit.new_tensor(0.0)
+
+        return torch.stack(losses).mean()
 
     def forward(
         self,
@@ -346,7 +637,27 @@ class GroundingLoss(nn.Module):
         lambda_giou=2.0,
         lambda_score=1.0,
         pos_weight=1.0,
+
+        # 新增：ranking / quality schedule
+        current_epoch=None,
+        quality_alpha=None,
+        rank_alpha=None,
+        quality_warmup_epoch=10,
+        rank_start_epoch=5,
+        rank_warmup_epoch=10,
+
+        # 新增：ranking loss 權重
+        lambda_rank=0.25,
     ):
+        quality_alpha, rank_alpha = self.resolve_epoch_alpha(
+            current_epoch=current_epoch,
+            quality_alpha=quality_alpha,
+            rank_alpha=rank_alpha,
+            quality_warmup_epoch=quality_warmup_epoch,
+            rank_start_epoch=rank_start_epoch,
+            rank_warmup_epoch=rank_warmup_epoch,
+        )
+
         indices = self.matcher(
             pred_bbox=pred_bbox,
             pred_score_logit=pred_score_logit,
@@ -371,7 +682,33 @@ class GroundingLoss(nn.Module):
             matched_pred = pred_bbox[b, pred_idx]
             matched_tgt = tgt_bbox[gt_idx]
 
-            score_target[b, pred_idx, 0] = 1.0
+            with torch.no_grad():
+                iou = box_iou(
+                    matched_pred.detach(),
+                    matched_tgt,
+                )
+
+                matched_iou = torch.diag(iou).clamp(0.0, 1.0)
+
+                quality = bounded_iou_quality(
+                    matched_iou,
+                    iou_pos_thr=self.iou_pos_thr,
+                    quality_min=self.quality_min,
+                    quality_max=self.quality_max,
+                )
+
+                # warmup：
+                # early: 接近 objectness target = 1
+                # later: 完整 quality target = bounded IoU
+                quality_target = (
+                    (1.0 - quality_alpha) * torch.ones_like(quality)
+                    +
+                    quality_alpha * quality
+                )
+
+            # 原本是固定 1.0
+            # 現在變成非二元 quality-aware target
+            score_target[b, pred_idx, 0] = quality_target
 
             loss_bbox = loss_bbox + F.l1_loss(
                 matched_pred,
@@ -392,6 +729,7 @@ class GroundingLoss(nn.Module):
             pred_bbox=pred_bbox,
             targets=targets,
             score_target=score_target,
+            quality_alpha=quality_alpha,
         )
 
         total = max(total_matched, 1)
@@ -399,13 +737,27 @@ class GroundingLoss(nn.Module):
         loss_bbox = loss_bbox / total
         loss_giou = loss_giou / total
 
-        loss_score, loss_score_pos, loss_score_neg, score_pos_count = (
-            self.score_loss_balanced(
-                pred_score_logit=pred_score_logit,
-                score_target=score_target,
-                pos_weight=pos_weight,
-            )
+        (
+            loss_score,
+            loss_score_pos,
+            loss_score_neg,
+            score_pos_count,
+            hard_neg_count,
+        ) = self.score_loss_quality_balanced(
+            pred_score_logit=pred_score_logit,
+            score_target=score_target,
+            pos_weight=pos_weight,
+            qfl_beta=self.qfl_beta,
         )
+
+        loss_rank_raw = self.pairwise_quality_rank_loss(
+            pred_score_logit=pred_score_logit,
+            score_target=score_target,
+            margin=self.rank_margin,
+            min_quality_gap=self.rank_min_quality_gap,
+        )
+
+        loss_rank = float(rank_alpha) * loss_rank_raw
 
         loss = (
             float(lambda_bbox) * loss_bbox
@@ -413,21 +765,49 @@ class GroundingLoss(nn.Module):
             float(lambda_giou) * loss_giou
             +
             float(lambda_score) * loss_score
+            +
+            float(lambda_rank) * loss_rank
         )
+
+        pos_mask = score_target > 0.0
+
+        if pos_mask.any():
+            score_target_pos_mean = score_target[pos_mask].mean()
+            score_target_pos_max = score_target[pos_mask].max()
+            score_target_pos_min = score_target[pos_mask].min()
+        else:
+            score_target_pos_mean = pred_bbox.new_tensor(0.0)
+            score_target_pos_max = pred_bbox.new_tensor(0.0)
+            score_target_pos_min = pred_bbox.new_tensor(0.0)
 
         loss_dict = {
             "loss": loss.detach(),
             "loss_bbox": loss_bbox.detach(),
             "loss_giou": loss_giou.detach(),
+
             "loss_score": loss_score.detach(),
             "loss_score_pos": loss_score_pos.detach(),
             "loss_score_neg": loss_score_neg.detach(),
+
+            "loss_rank": loss_rank.detach(),
+            "loss_rank_raw": loss_rank_raw.detach(),
+
             "matched": float(total_matched),
             "score_pos_count": float(score_pos_count),
+            "hard_neg_count": float(hard_neg_count),
+
+            "score_target_pos_mean": score_target_pos_mean.detach(),
+            "score_target_pos_min": score_target_pos_min.detach(),
+            "score_target_pos_max": score_target_pos_max.detach(),
+
             "lambda_bbox": float(lambda_bbox),
             "lambda_giou": float(lambda_giou),
             "lambda_score": float(lambda_score),
+            "lambda_rank": float(lambda_rank),
+
             "pos_weight": float(pos_weight),
+            "quality_alpha": float(quality_alpha),
+            "rank_alpha": float(rank_alpha),
         }
 
         return loss, loss_dict

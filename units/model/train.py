@@ -7,14 +7,9 @@ import time
 import math
 import copy
 import random
-import shutil
-from pathlib import Path
-
 import yaml
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.multiprocessing as mp
 from torch.optim import AdamW
 from torch.amp import autocast, GradScaler
@@ -272,28 +267,10 @@ def get_loss_weights(epoch, total_epochs, args):
     return lambda_bbox, lambda_giou, lambda_score
 
 
-def get_pos_weight(epoch, total_epochs, args):
-    progress = epoch / max(1, total_epochs)
-
-    warm_until = max(1e-8, float(args.pos_weight_warm_until))
-    ratio = min(progress / warm_until, 1.0)
-
-    pos_weight = (
-        float(args.min_pos_weight)
-        +
-        (
-            float(args.max_pos_weight)
-            -
-            float(args.min_pos_weight)
-        )
-        * ratio
-    )
-
-    return pos_weight
 
 
 
-# Loss: normalized xyxy + Hungarian matcher
+# Eval IoU helper: normalized xyxy
 
 
 def box_area(box):
@@ -398,7 +375,11 @@ def train_one_epoch(
     lambda_bbox=5.0,
     lambda_giou=2.0,
     lambda_score=1.0,
+    lambda_rank=0.25,
     pos_weight=1.0,
+    quality_warmup_epoch=10,
+    rank_start_epoch=5,
+    rank_warmup_epoch=10,
     log_interval=10,
     step_metrics_path=None,
 ):
@@ -408,6 +389,7 @@ def train_one_epoch(
     total_bbox_sum = 0.0
     total_giou_sum = 0.0
     total_score_sum = 0.0
+    total_rank_sum = 0.0
 
     amp_enabled = get_amp_enabled(device, use_amp)
 
@@ -441,7 +423,12 @@ def train_one_epoch(
                 lambda_bbox=lambda_bbox,
                 lambda_giou=lambda_giou,
                 lambda_score=lambda_score,
+                lambda_rank=lambda_rank,
                 pos_weight=pos_weight,
+                current_epoch=epoch,
+                quality_warmup_epoch=quality_warmup_epoch,
+                rank_start_epoch=rank_start_epoch,
+                rank_warmup_epoch=rank_warmup_epoch,
             )
 
         if amp_enabled:
@@ -470,11 +457,13 @@ def train_one_epoch(
         bbox_item = float(loss_dict["loss_bbox"].item())
         giou_item = float(loss_dict["loss_giou"].item())
         score_item = float(loss_dict["loss_score"].item())
+        rank_item = float(loss_dict.get("loss_rank", pred_bbox.new_tensor(0.0)).item())
 
         total_loss_sum += loss_item
         total_bbox_sum += bbox_item
         total_giou_sum += giou_item
         total_score_sum += score_item
+        total_rank_sum += rank_item
 
         avg_loss = total_loss_sum / (step + 1)
         current_lr = scheduler.get_lr()[0]
@@ -486,6 +475,7 @@ def train_one_epoch(
             "bbox": f"{bbox_item:.4f}",
             "giou": f"{giou_item:.4f}",
             "score": f"{score_item:.4f}",
+            "rank": f"{rank_item:.4f}",
             "lb": f"{lambda_bbox:.2f}",
             "lg": f"{lambda_giou:.2f}",
             "ls": f"{lambda_score:.2f}",
@@ -505,10 +495,15 @@ def train_one_epoch(
                 "loss_bbox": bbox_item,
                 "loss_giou": giou_item,
                 "loss_score": score_item,
+                "loss_rank": rank_item,
                 "lambda_bbox": lambda_bbox,
                 "lambda_giou": lambda_giou,
                 "lambda_score": lambda_score,
+                "lambda_rank": lambda_rank,
                 "pos_weight": pos_weight,
+                "quality_alpha": float(loss_dict.get("quality_alpha", 1.0)),
+                "rank_alpha": float(loss_dict.get("rank_alpha", 1.0)),
+                "score_target_pos_mean": float(loss_dict.get("score_target_pos_mean", 0.0)),
             })
 
     n = max(1, len(train_loader))
@@ -518,6 +513,7 @@ def train_one_epoch(
         "train_loss_bbox": total_bbox_sum / n,
         "train_loss_giou": total_giou_sum / n,
         "train_loss_score": total_score_sum / n,
+        "train_loss_rank": total_rank_sum / n,
     }
 
 
@@ -532,7 +528,11 @@ def validate_loss_one_epoch(
     lambda_bbox=5.0,
     lambda_giou=2.0,
     lambda_score=1.0,
+    lambda_rank=0.25,
     pos_weight=1.0,
+    quality_warmup_epoch=10,
+    rank_start_epoch=5,
+    rank_warmup_epoch=10,
 ):
     model.eval()
 
@@ -540,6 +540,7 @@ def validate_loss_one_epoch(
     total_bbox_sum = 0.0
     total_giou_sum = 0.0
     total_score_sum = 0.0
+    total_rank_sum = 0.0
 
     amp_enabled = get_amp_enabled(device, use_amp)
 
@@ -569,18 +570,25 @@ def validate_loss_one_epoch(
                 lambda_bbox=lambda_bbox,
                 lambda_giou=lambda_giou,
                 lambda_score=lambda_score,
+                lambda_rank=lambda_rank,
                 pos_weight=pos_weight,
+                current_epoch=epoch,
+                quality_warmup_epoch=quality_warmup_epoch,
+                rank_start_epoch=rank_start_epoch,
+                rank_warmup_epoch=rank_warmup_epoch,
             )
 
         loss_item = float(loss.item())
         bbox_item = float(loss_dict["loss_bbox"].item())
         giou_item = float(loss_dict["loss_giou"].item())
         score_item = float(loss_dict["loss_score"].item())
+        rank_item = float(loss_dict.get("loss_rank", pred_bbox.new_tensor(0.0)).item())
 
         total_loss_sum += loss_item
         total_bbox_sum += bbox_item
         total_giou_sum += giou_item
         total_score_sum += score_item
+        total_rank_sum += rank_item
 
         avg_loss = total_loss_sum / (step + 1)
 
@@ -590,6 +598,7 @@ def validate_loss_one_epoch(
             "bbox": f"{bbox_item:.4f}",
             "giou": f"{giou_item:.4f}",
             "score": f"{score_item:.4f}",
+            "rank": f"{rank_item:.4f}",
         })
 
     n = max(1, len(val_loader))
@@ -599,6 +608,7 @@ def validate_loss_one_epoch(
         "val_loss_bbox": total_bbox_sum / n,
         "val_loss_giou": total_giou_sum / n,
         "val_loss_score": total_score_sum / n,
+        "val_loss_rank": total_rank_sum / n,
     }
 
 
@@ -1231,6 +1241,17 @@ def train(args):
         aux_positive_label=args.aux_positive_label,
         expand_cost_bbox=args.expand_cost_bbox,
         expand_cost_giou=args.expand_cost_giou,
+
+        # quality-aware confidence
+        iou_pos_thr=args.iou_pos_thr,
+        quality_min=args.quality_min,
+        quality_max=args.quality_max,
+        qfl_beta=args.qfl_beta,
+
+        # ranking loss
+        rank_margin=args.rank_margin,
+        rank_min_quality_gap=args.rank_min_quality_gap,
+        rank_max_pairs=args.rank_max_pairs,
     )
 
     total_params, trainable_params = count_parameters(model)
@@ -1323,11 +1344,9 @@ def train(args):
             args=args,
         )
 
-        pos_weight = get_pos_weight(
-            epoch=epoch,
-            total_epochs=args.epochs,
-            args=args,
-        )
+        # 固定 pos_weight。quality-aware score 已經使用 soft target，
+        # 不建議再用 2->8 的 positive weight schedule 拉高 FP。
+        pos_weight = float(args.pos_weight)
 
         train_metrics = train_one_epoch(
             model=model,
@@ -1345,7 +1364,11 @@ def train(args):
             lambda_bbox=lambda_bbox,
             lambda_giou=lambda_giou,
             lambda_score=lambda_score,
+            lambda_rank=args.lambda_rank,
             pos_weight=pos_weight,
+            quality_warmup_epoch=args.quality_warmup_epoch,
+            rank_start_epoch=args.rank_start_epoch,
+            rank_warmup_epoch=args.rank_warmup_epoch,
             log_interval=args.log_interval,
             step_metrics_path=step_metrics_path if args.emit_step_metrics else None,
         )
@@ -1361,7 +1384,11 @@ def train(args):
                 lambda_bbox=lambda_bbox,
                 lambda_giou=lambda_giou,
                 lambda_score=lambda_score,
+                lambda_rank=args.lambda_rank,
                 pos_weight=pos_weight,
+                quality_warmup_epoch=args.quality_warmup_epoch,
+                rank_start_epoch=args.rank_start_epoch,
+                rank_warmup_epoch=args.rank_warmup_epoch,
             )
         else:
             val_loss_metrics = {}
@@ -1386,7 +1413,11 @@ def train(args):
             "lambda_bbox": lambda_bbox,
             "lambda_giou": lambda_giou,
             "lambda_score": lambda_score,
+            "lambda_rank": float(args.lambda_rank),
             "pos_weight": pos_weight,
+            "quality_warmup_epoch": int(args.quality_warmup_epoch),
+            "rank_start_epoch": int(args.rank_start_epoch),
+            "rank_warmup_epoch": int(args.rank_warmup_epoch),
         }
 
         metric_row = {
@@ -1455,6 +1486,7 @@ def train(args):
             f"lb={lambda_bbox:.2f} "
             f"lg={lambda_giou:.2f} "
             f"ls={lambda_score:.2f} "
+            f"lrk={args.lambda_rank:.2f} "
             f"pw={pos_weight:.2f}"
         )
 
@@ -1524,11 +1556,28 @@ DEFAULT_TRAIN_CFG = {
 
         "score_sampling": {
             "hard_negative_ratio": 5,
-            "positive_ratio": 0.2,
-            "max_positive_per_gt": 5,
+            "positive_ratio": 0.05,
+            "max_positive_per_gt": 2,
             "aux_positive_label": 0.7,
             "expand_cost_bbox": 5.0,
             "expand_cost_giou": 2.0,
+        },
+
+        "quality": {
+            "iou_pos_thr": 0.2,
+            "quality_min": 0.3,
+            "quality_max": 1.0,
+            "qfl_beta": 2.0,
+            "quality_warmup_epoch": 10,
+        },
+
+        "ranking": {
+            "lambda_rank": 0.25,
+            "rank_margin": 0.1,
+            "rank_min_quality_gap": 0.1,
+            "rank_max_pairs": 512,
+            "rank_start_epoch": 5,
+            "rank_warmup_epoch": 10,
         },
 
         "weight": {
@@ -1548,9 +1597,7 @@ DEFAULT_TRAIN_CFG = {
         },
 
         "pos_weight": {
-            "min": 2.0,
-            "max": 8.0,
-            "warm_until": 0.5,
+            "value": 1.0,
         },
     },
 
@@ -1562,7 +1609,7 @@ DEFAULT_TRAIN_CFG = {
         "top_k": 20,
         "nms_iou_thr": 0.5,
         "best_metric": "map50",
-        "use_topk_fallback": True,
+        "use_topk_fallback": False,
     },
 
     "log": {
@@ -1677,6 +1724,8 @@ def cfg_to_args(model_cfg_all, train_cfg_all):
     weight_cfg = loss_cfg.get("weight", {})
     pos_weight_cfg = loss_cfg.get("pos_weight", {})
     score_sampling_cfg = loss_cfg.get("score_sampling", {})
+    quality_cfg = loss_cfg.get("quality", {})
+    ranking_cfg = loss_cfg.get("ranking", {})
 
     return SimpleNamespace(
         # data
@@ -1746,10 +1795,23 @@ def cfg_to_args(model_cfg_all, train_cfg_all):
         lambda_score_end=weight_cfg.get("score_end", 2.0),
         lambda_score_warm_until=weight_cfg.get("score_warm_until", 0.4),
 
-        # BCE positive weight
-        min_pos_weight=pos_weight_cfg.get("min", 1.0),
-        max_pos_weight=pos_weight_cfg.get("max", 5.0),
-        pos_weight_warm_until=pos_weight_cfg.get("warm_until", 0.5),
+        # quality-aware score positive weight
+        pos_weight=pos_weight_cfg.get("value", 1.0),
+
+        # quality-aware confidence
+        iou_pos_thr=quality_cfg.get("iou_pos_thr", 0.2),
+        quality_min=quality_cfg.get("quality_min", 0.3),
+        quality_max=quality_cfg.get("quality_max", 1.0),
+        qfl_beta=quality_cfg.get("qfl_beta", 2.0),
+        quality_warmup_epoch=quality_cfg.get("quality_warmup_epoch", 10),
+
+        # ranking
+        lambda_rank=ranking_cfg.get("lambda_rank", 0.25),
+        rank_margin=ranking_cfg.get("rank_margin", 0.1),
+        rank_min_quality_gap=ranking_cfg.get("rank_min_quality_gap", 0.1),
+        rank_max_pairs=ranking_cfg.get("rank_max_pairs", 512),
+        rank_start_epoch=ranking_cfg.get("rank_start_epoch", 5),
+        rank_warmup_epoch=ranking_cfg.get("rank_warmup_epoch", 10),
 
         # eval
         val_loss_interval=eval_cfg["val_loss_interval"],
@@ -1786,6 +1848,9 @@ def print_config_summary(model_cfg, train_cfg):
     matcher = l.get("matcher", {})
     weight = l.get("weight", {})
     pos_weight = l.get("pos_weight", {})
+    quality = l.get("quality", {})
+    ranking = l.get("ranking", {})
+    score_sampling = l.get("score_sampling", {})
 
     print("\n[LightDet] Training config")
     print(f"  dataset     : {d['dataset_dir']}")
@@ -1826,8 +1891,29 @@ def print_config_summary(model_cfg, train_cfg):
     )
 
     print(
+        f"  score sample: "
+        f"pos_ratio={score_sampling.get('positive_ratio', 0.05)}, "
+        f"max_pos/gt={score_sampling.get('max_positive_per_gt', 2)}, "
+        f"neg:pos={score_sampling.get('hard_negative_ratio', 5)}:1"
+    )
+
+    print(
+        f"  quality     : "
+        f"iou_thr={quality.get('iou_pos_thr', 0.2)}, "
+        f"q=[{quality.get('quality_min', 0.3)}, {quality.get('quality_max', 1.0)}], "
+        f"warmup={quality.get('quality_warmup_epoch', 10)}"
+    )
+
+    print(
+        f"  ranking     : "
+        f"lambda={ranking.get('lambda_rank', 0.25)}, "
+        f"start={ranking.get('rank_start_epoch', 5)}, "
+        f"warmup={ranking.get('rank_warmup_epoch', 10)}"
+    )
+
+    print(
         f"  pos weight  : "
-        f"{pos_weight.get('min', 1.0)}->{pos_weight.get('max', 5.0)}"
+        f"{pos_weight.get('value', 1.0)}"
     )
 
     print(
@@ -1867,6 +1953,20 @@ class LightDet:
         score_thr=None,
         top_k=None,
         nms_iou_thr=None,
+        use_topk_fallback=None,
+
+        # loss sampling / quality / ranking overrides
+        hard_negative_ratio=None,
+        positive_ratio=None,
+        max_positive_per_gt=None,
+        iou_pos_thr=None,
+        quality_min=None,
+        quality_max=None,
+        qfl_beta=None,
+        quality_warmup_epoch=None,
+        lambda_rank=None,
+        rank_start_epoch=None,
+        rank_warmup_epoch=None,
         **kwargs,
     ):
         model_cfg = deepcopy_cfg(self.model_cfg)
@@ -1935,6 +2035,42 @@ class LightDet:
         if nms_iou_thr is not None:
             train_cfg["eval"]["nms_iou_thr"] = nms_iou_thr
 
+        if use_topk_fallback is not None:
+            train_cfg["eval"]["use_topk_fallback"] = bool(use_topk_fallback)
+
+        if hard_negative_ratio is not None:
+            train_cfg["loss"]["score_sampling"]["hard_negative_ratio"] = hard_negative_ratio
+
+        if positive_ratio is not None:
+            train_cfg["loss"]["score_sampling"]["positive_ratio"] = positive_ratio
+
+        if max_positive_per_gt is not None:
+            train_cfg["loss"]["score_sampling"]["max_positive_per_gt"] = max_positive_per_gt
+
+        if iou_pos_thr is not None:
+            train_cfg["loss"]["quality"]["iou_pos_thr"] = iou_pos_thr
+
+        if quality_min is not None:
+            train_cfg["loss"]["quality"]["quality_min"] = quality_min
+
+        if quality_max is not None:
+            train_cfg["loss"]["quality"]["quality_max"] = quality_max
+
+        if qfl_beta is not None:
+            train_cfg["loss"]["quality"]["qfl_beta"] = qfl_beta
+
+        if quality_warmup_epoch is not None:
+            train_cfg["loss"]["quality"]["quality_warmup_epoch"] = quality_warmup_epoch
+
+        if lambda_rank is not None:
+            train_cfg["loss"]["ranking"]["lambda_rank"] = lambda_rank
+
+        if rank_start_epoch is not None:
+            train_cfg["loss"]["ranking"]["rank_start_epoch"] = rank_start_epoch
+
+        if rank_warmup_epoch is not None:
+            train_cfg["loss"]["ranking"]["rank_warmup_epoch"] = rank_warmup_epoch
+
         if len(kwargs) > 0:
             unknown = ", ".join(kwargs.keys())
             raise TypeError(f"Unsupported train arguments: {unknown}")
@@ -1971,8 +2107,8 @@ def main():
         imgsz=512,
         batch=24,
         device=1,
-        workers=8,
-        seed=44,
+        workers=4,
+        seed=45,
         deterministic=False,
         project="runs/train",
         name="lightdet_seed44",

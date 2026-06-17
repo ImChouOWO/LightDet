@@ -1,89 +1,19 @@
 # ============================================================
-# LightDet train.yaml
+# LightDet train.yaml - quality-aware confidence + ranking loss
 # ============================================================
-# data:
-#   dataset_dir              : 資料集根目錄，底下需包含 images/train、images/val、labels/train、labels/val
-#   image_size               : 輸入影像 resize 尺寸
-#   max_text_aug_per_image   : 每張圖最多抽取幾組文字增強 query
-#
-# train:
-#   epochs                   : 訓練總 epoch 數
-#   batch_size               : batch size
-#   warmup_epochs            : warmup epoch 數
-#   num_workers              : DataLoader worker 數量
-#   device                   : 使用 GPU，例如 cuda:0、cuda:1
-#   seed                     : 隨機種子
-#   deterministic            : 是否啟用 deterministic，true 較穩但通常較慢
-#   use_amp                  : 是否使用 AMP 混合精度
-#   use_ema                  : 是否使用 EMA 權重平均，正式訓練可開，速度測試可關
-#   ema_decay                : EMA decay 係數
-#   grad_clip_norm           : gradient clipping 上限
-#
-# optim:
-#   lr_vision                : image branch learning rate
-#   lr_text                  : text projection / BERT learning rate
-#   lr_transformer           : transformer learning rate
-#   lr_head                  : bbox / score head learning rate
-#   weight_decay             : AdamW weight decay
-#   min_lr_ratio             : cosine scheduler 最低 lr 比例
-#   max_warmup_steps         : warmup 最大 step 數
-#
-# loss.matcher:
-#   cost_bbox                : matching 時 bbox L1 cost 權重
-#   cost_giou                : matching 時 GIoU cost 權重
-#   cost_score               : matching 時 score cost 權重；建議先設 0，避免早期 score 不穩干擾配對
-#
-# loss.score_sampling:
-#   hard_negative_ratio      : hard negative 數量 = score positives 數量 * hard_negative_ratio
-#   positive_ratio           : 每張圖 score positive 上限比例；100 predictions、0.2 = 最多 20 個
-#   max_positive_per_gt      : 每個 GT 最多額外分配幾個 score positives
-#   aux_positive_label       : 額外 top-k positive 的 soft label，matcher positive 仍是 1.0
-#   expand_cost_bbox         : 擴增 positive 時 bbox cost 權重
-#   expand_cost_giou         : 擴增 positive 時 GIoU cost 權重
-#
-# loss.weight:
-#   dynamic                  : 是否使用動態 loss 權重
-#   bbox_start / bbox_end    : bbox loss 權重由 start 線性變化到 end
-#   bbox_decay_until         : bbox 權重變化完成比例
-#   giou                     : GIoU loss 權重
-#   score_start / score_end  : score loss 權重由 start 線性變化到 end
-#   score_warm_until         : score 權重變化完成比例
-#
-# loss.pos_weight:
-#   min / max                : score positive 權重範圍
-#   warm_until               : positive weight 變化完成比例
-#
-# eval:
-#   val_loss_interval        : 每幾個 epoch 跑一次 validation loss
-#   eval_interval            : 每幾個 epoch 跑一次 detection eval
-#   max_val_batches          : eval 最多使用多少 val batches
-#   score_thr                : eval score 閥值；前期建議低一點觀察 bbox 是否有學到
-#   top_k                    : 每張圖最多保留幾個 prediction
-#   nms_iou_thr              : NMS IoU threshold
-#   best_metric              : best checkpoint 使用的指標
-#   use_topk_fallback        : 若沒有 prediction 通過 score_thr，是否強制取 top-k
-#
-# log:
-#   save_dir                 : checkpoint / metrics 儲存位置，null 則使用預設
-#   resume_path              : resume checkpoint path
-#   save_epoch_interval      : 每幾個 epoch 額外保存一次 checkpoint
-#   emit_step_metrics        : 是否輸出 step 級 metrics
-#   log_interval             : 每幾個 step 記錄一次 log
-# ============================================================
-
 
 data:
   dataset_dir: /home/soic/Desktop/LightDet/datasets
-  image_size: 640
+  image_size: 512
   max_text_aug_per_image: 1
 
 train:
   epochs: 300
-  batch_size: 32
+  batch_size: 24
   warmup_epochs: 5
-  num_workers: 18
+  num_workers: 8
   device: cuda:1
-  seed: 42
+  seed: 44
   deterministic: false
   use_amp: true
   use_ema: false
@@ -107,35 +37,51 @@ loss:
 
   score_sampling:
     hard_negative_ratio: 5
-    positive_ratio: 0.2
-    max_positive_per_gt: 5
+    positive_ratio: 0.05
+    max_positive_per_gt: 2
     aux_positive_label: 0.7
     expand_cost_bbox: 5.0
     expand_cost_giou: 2.0
 
+  quality:
+    iou_pos_thr: 0.2
+    quality_min: 0.3
+    quality_max: 1.0
+    qfl_beta: 2.0
+    quality_warmup_epoch: 10
+
+  ranking:
+    lambda_rank: 0.25
+    rank_margin: 0.1
+    rank_min_quality_gap: 0.1
+    rank_max_pairs: 512
+    rank_start_epoch: 5
+    rank_warmup_epoch: 10
+
   weight:
     dynamic: true
+
     bbox: 5.0
     bbox_start: 5.0
     bbox_end: 3.0
     bbox_decay_until: 0.5
+
     giou: 2.0
+
     score: 2.0
     score_start: 2.0
     score_end: 4.0
     score_warm_until: 0.4
 
   pos_weight:
-    min: 2.0
-    max: 8.0
-    warm_until: 0.5
+    value: 1.0
 
 eval:
-  val_loss_interval: 1
+  val_loss_interval: 5
   eval_interval: 1
   max_val_batches: 320
-  score_thr: 0.001
-  top_k: 100
+  score_thr: 0.25
+  top_k: 20
   nms_iou_thr: 0.5
   best_metric: map50
   use_topk_fallback: false
@@ -146,4 +92,3 @@ log:
   save_epoch_interval: 50
   emit_step_metrics: false
   log_interval: 50
-
