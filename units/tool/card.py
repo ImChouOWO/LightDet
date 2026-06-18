@@ -32,7 +32,7 @@ print("Card Root :",CARD_ROOT)
 class FusionBlock(nn.Module):
     def __init__(
         self,
-        hidden_dim=512,
+        hidden_dim=256,
         fusion_token_num=16
     ):
         super().__init__()

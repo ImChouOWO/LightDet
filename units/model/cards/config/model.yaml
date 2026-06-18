@@ -1,6 +1,6 @@
 model:
   img_in_channels: 1024
-  hidden_dim: 512
+  hidden_dim: 384
   num_heads: 8
   num_layers: 2
   mlp_ratio: 3.5
