@@ -375,11 +375,12 @@ def train_one_epoch(
     lambda_bbox=5.0,
     lambda_giou=2.0,
     lambda_score=1.0,
-    lambda_rank=0.25,
+    lambda_rank=0.10,
     pos_weight=1.0,
-    quality_warmup_epoch=10,
-    rank_start_epoch=5,
-    rank_warmup_epoch=10,
+    quality_warmup_epoch=20,
+    rank_start_epoch=15,
+    rank_warmup_epoch=30,
+    rank_alpha_min=1e-4,
     log_interval=10,
     step_metrics_path=None,
 ):
@@ -389,7 +390,10 @@ def train_one_epoch(
     total_bbox_sum = 0.0
     total_giou_sum = 0.0
     total_score_sum = 0.0
-    total_rank_sum = 0.0
+
+    # 這裡累積的是 ranking 真正加進 total loss 的 contribution。
+    total_rank_contrib_sum = 0.0
+    total_rank_raw_sum = 0.0
 
     amp_enabled = get_amp_enabled(device, use_amp)
 
@@ -423,12 +427,17 @@ def train_one_epoch(
                 lambda_bbox=lambda_bbox,
                 lambda_giou=lambda_giou,
                 lambda_score=lambda_score,
+
+                # lambda_rank 是 ranking 上限；實際權重由 loss 內部的
+                # lambda_rank_eff = lambda_rank * rank_alpha 決定。
                 lambda_rank=lambda_rank,
+
                 pos_weight=pos_weight,
                 current_epoch=epoch,
                 quality_warmup_epoch=quality_warmup_epoch,
                 rank_start_epoch=rank_start_epoch,
                 rank_warmup_epoch=rank_warmup_epoch,
+                rank_alpha_min=rank_alpha_min,
             )
 
         if amp_enabled:
@@ -453,17 +462,35 @@ def train_one_epoch(
         if ema is not None:
             ema.update(model)
 
+        zero = pred_bbox.new_tensor(0.0)
+
         loss_item = float(loss.item())
         bbox_item = float(loss_dict["loss_bbox"].item())
         giou_item = float(loss_dict["loss_giou"].item())
         score_item = float(loss_dict["loss_score"].item())
-        rank_item = float(loss_dict.get("loss_rank", pred_bbox.new_tensor(0.0)).item())
+
+        rank_raw_item = float(loss_dict.get("loss_rank_raw", zero).item())
+        rank_item = float(loss_dict.get("loss_rank", zero).item())
+        rank_contrib_item = float(
+            loss_dict.get("loss_rank_contrib", loss_dict.get("loss_rank", zero)).item()
+        )
+
+        rank_alpha_item = float(loss_dict.get("rank_alpha", 0.0))
+        lambda_rank_eff_item = float(loss_dict.get("lambda_rank_eff", 0.0))
+        quality_alpha_item = float(loss_dict.get("quality_alpha", 1.0))
+
+        score_target_pos_mean = loss_dict.get("score_target_pos_mean", zero)
+        if torch.is_tensor(score_target_pos_mean):
+            score_target_pos_mean = float(score_target_pos_mean.detach().item())
+        else:
+            score_target_pos_mean = float(score_target_pos_mean)
 
         total_loss_sum += loss_item
         total_bbox_sum += bbox_item
         total_giou_sum += giou_item
         total_score_sum += score_item
-        total_rank_sum += rank_item
+        total_rank_contrib_sum += rank_contrib_item
+        total_rank_raw_sum += rank_raw_item
 
         avg_loss = total_loss_sum / (step + 1)
         current_lr = scheduler.get_lr()[0]
@@ -475,7 +502,17 @@ def train_one_epoch(
             "bbox": f"{bbox_item:.4f}",
             "giou": f"{giou_item:.4f}",
             "score": f"{score_item:.4f}",
-            "rank": f"{rank_item:.4f}",
+
+            # ranking 顯示：
+            # rank = 實際加入 total loss 的量
+            # raw  = 原始 pairwise ranking loss
+            # ra   = rank_alpha
+            # lrk  = lambda_rank_eff
+            "rank": f"{rank_contrib_item:.4f}",
+            "raw": f"{rank_raw_item:.4f}",
+            "ra": f"{rank_alpha_item:.4f}",
+            "lrk": f"{lambda_rank_eff_item:.4f}",
+
             "lb": f"{lambda_bbox:.2f}",
             "lg": f"{lambda_giou:.2f}",
             "ls": f"{lambda_score:.2f}",
@@ -490,20 +527,31 @@ def train_one_epoch(
                 "step": step + 1,
                 "global_step": global_step,
                 "lr": current_lr,
+
                 "train_loss": loss_item,
                 "train_loss_avg": avg_loss,
+
                 "loss_bbox": bbox_item,
                 "loss_giou": giou_item,
                 "loss_score": score_item,
+
+                "loss_rank_raw": rank_raw_item,
                 "loss_rank": rank_item,
+                "loss_rank_contrib": rank_contrib_item,
+
                 "lambda_bbox": lambda_bbox,
                 "lambda_giou": lambda_giou,
                 "lambda_score": lambda_score,
-                "lambda_rank": lambda_rank,
+
+                # lambda_rank 是上限；lambda_rank_eff 才是本 step 實際權重。
+                "lambda_rank_max": float(lambda_rank),
+                "lambda_rank_eff": lambda_rank_eff_item,
+
                 "pos_weight": pos_weight,
-                "quality_alpha": float(loss_dict.get("quality_alpha", 1.0)),
-                "rank_alpha": float(loss_dict.get("rank_alpha", 1.0)),
-                "score_target_pos_mean": float(loss_dict.get("score_target_pos_mean", 0.0)),
+                "quality_alpha": quality_alpha_item,
+                "rank_alpha": rank_alpha_item,
+                "rank_alpha_min": float(rank_alpha_min),
+                "score_target_pos_mean": score_target_pos_mean,
             })
 
     n = max(1, len(train_loader))
@@ -513,7 +561,8 @@ def train_one_epoch(
         "train_loss_bbox": total_bbox_sum / n,
         "train_loss_giou": total_giou_sum / n,
         "train_loss_score": total_score_sum / n,
-        "train_loss_rank": total_rank_sum / n,
+        "train_loss_rank_raw": total_rank_raw_sum / n,
+        "train_loss_rank": total_rank_contrib_sum / n,
     }
 
 
@@ -528,11 +577,12 @@ def validate_loss_one_epoch(
     lambda_bbox=5.0,
     lambda_giou=2.0,
     lambda_score=1.0,
-    lambda_rank=0.25,
+    lambda_rank=0.10,
     pos_weight=1.0,
-    quality_warmup_epoch=10,
-    rank_start_epoch=5,
-    rank_warmup_epoch=10,
+    quality_warmup_epoch=20,
+    rank_start_epoch=15,
+    rank_warmup_epoch=30,
+    rank_alpha_min=1e-4,
 ):
     model.eval()
 
@@ -540,7 +590,8 @@ def validate_loss_one_epoch(
     total_bbox_sum = 0.0
     total_giou_sum = 0.0
     total_score_sum = 0.0
-    total_rank_sum = 0.0
+    total_rank_contrib_sum = 0.0
+    total_rank_raw_sum = 0.0
 
     amp_enabled = get_amp_enabled(device, use_amp)
 
@@ -576,19 +627,29 @@ def validate_loss_one_epoch(
                 quality_warmup_epoch=quality_warmup_epoch,
                 rank_start_epoch=rank_start_epoch,
                 rank_warmup_epoch=rank_warmup_epoch,
+                rank_alpha_min=rank_alpha_min,
             )
+
+        zero = pred_bbox.new_tensor(0.0)
 
         loss_item = float(loss.item())
         bbox_item = float(loss_dict["loss_bbox"].item())
         giou_item = float(loss_dict["loss_giou"].item())
         score_item = float(loss_dict["loss_score"].item())
-        rank_item = float(loss_dict.get("loss_rank", pred_bbox.new_tensor(0.0)).item())
+
+        rank_raw_item = float(loss_dict.get("loss_rank_raw", zero).item())
+        rank_contrib_item = float(
+            loss_dict.get("loss_rank_contrib", loss_dict.get("loss_rank", zero)).item()
+        )
+        rank_alpha_item = float(loss_dict.get("rank_alpha", 0.0))
+        lambda_rank_eff_item = float(loss_dict.get("lambda_rank_eff", 0.0))
 
         total_loss_sum += loss_item
         total_bbox_sum += bbox_item
         total_giou_sum += giou_item
         total_score_sum += score_item
-        total_rank_sum += rank_item
+        total_rank_contrib_sum += rank_contrib_item
+        total_rank_raw_sum += rank_raw_item
 
         avg_loss = total_loss_sum / (step + 1)
 
@@ -598,7 +659,10 @@ def validate_loss_one_epoch(
             "bbox": f"{bbox_item:.4f}",
             "giou": f"{giou_item:.4f}",
             "score": f"{score_item:.4f}",
-            "rank": f"{rank_item:.4f}",
+            "rank": f"{rank_contrib_item:.4f}",
+            "raw": f"{rank_raw_item:.4f}",
+            "ra": f"{rank_alpha_item:.4f}",
+            "lrk": f"{lambda_rank_eff_item:.4f}",
         })
 
     n = max(1, len(val_loader))
@@ -608,7 +672,8 @@ def validate_loss_one_epoch(
         "val_loss_bbox": total_bbox_sum / n,
         "val_loss_giou": total_giou_sum / n,
         "val_loss_score": total_score_sum / n,
-        "val_loss_rank": total_rank_sum / n,
+        "val_loss_rank_raw": total_rank_raw_sum / n,
+        "val_loss_rank": total_rank_contrib_sum / n,
     }
 
 
@@ -1369,6 +1434,7 @@ def train(args):
             quality_warmup_epoch=args.quality_warmup_epoch,
             rank_start_epoch=args.rank_start_epoch,
             rank_warmup_epoch=args.rank_warmup_epoch,
+            rank_alpha_min=args.rank_alpha_min,
             log_interval=args.log_interval,
             step_metrics_path=step_metrics_path if args.emit_step_metrics else None,
         )
@@ -1389,6 +1455,7 @@ def train(args):
                 quality_warmup_epoch=args.quality_warmup_epoch,
                 rank_start_epoch=args.rank_start_epoch,
                 rank_warmup_epoch=args.rank_warmup_epoch,
+                rank_alpha_min=args.rank_alpha_min,
             )
         else:
             val_loss_metrics = {}
@@ -1413,11 +1480,16 @@ def train(args):
             "lambda_bbox": lambda_bbox,
             "lambda_giou": lambda_giou,
             "lambda_score": lambda_score,
-            "lambda_rank": float(args.lambda_rank),
+
+            # lambda_rank 是 ranking 上限；每個 step 實際權重會寫在
+            # step metrics 的 lambda_rank_eff。
+            "lambda_rank_max": float(args.lambda_rank),
+
             "pos_weight": pos_weight,
             "quality_warmup_epoch": int(args.quality_warmup_epoch),
             "rank_start_epoch": int(args.rank_start_epoch),
             "rank_warmup_epoch": int(args.rank_warmup_epoch),
+            "rank_alpha_min": float(args.rank_alpha_min),
         }
 
         metric_row = {
@@ -1475,10 +1547,15 @@ def train(args):
             epoch_path = os.path.join(save_path, f"epoch_{epoch:03d}.pt")
             torch.save(ckpt, epoch_path)
 
+        val_loss_text = (
+            f"{val_loss_metrics['val_loss']:.4f}"
+            if "val_loss" in val_loss_metrics
+            else "skip"
+        )
         tqdm.write(
             f"Epoch [{epoch}/{args.epochs}] "
             f"train_loss={train_metrics.get('train_loss', -1):.4f} "
-            f"val_loss={val_loss_metrics.get('val_loss', -1):.4f} "
+            f"val_loss={val_loss_text} "
             f"mAP50={eval_metrics.get('map50', -1):.4f} "
             f"mAP50-95={eval_metrics.get('map50_95', -1):.4f} "
             f"P={eval_metrics.get('precision', -1):.4f} "
@@ -1486,13 +1563,15 @@ def train(args):
             f"lb={lambda_bbox:.2f} "
             f"lg={lambda_giou:.2f} "
             f"ls={lambda_score:.2f} "
-            f"lrk={args.lambda_rank:.2f} "
+            f"lrk_max={args.lambda_rank:.2f} "
+            f"rank_start={args.rank_start_epoch} "
+            f"rank_warm={args.rank_warmup_epoch} "
             f"pw={pos_weight:.2f}"
         )
 
-# ============================================================
+
 # Config
-# ============================================================
+
 
 DEFAULT_MODEL_CFG = {
     "model": {
@@ -1564,20 +1643,24 @@ DEFAULT_TRAIN_CFG = {
         },
 
         "quality": {
-            "iou_pos_thr": 0.2,
-            "quality_min": 0.3,
+            "iou_pos_thr": 0.15,
+            "quality_min": 0.25,
             "quality_max": 1.0,
             "qfl_beta": 2.0,
-            "quality_warmup_epoch": 10,
+            "quality_warmup_epoch": 20,
         },
 
         "ranking": {
-            "lambda_rank": 0.25,
+            # lambda_rank 是 ranking 上限，不是每個 epoch 的實際權重。
+            # 實際權重由 GroundingLoss 內部的
+            # lambda_rank_eff = lambda_rank * rank_alpha 決定。
+            "lambda_rank": 0.10,
             "rank_margin": 0.1,
             "rank_min_quality_gap": 0.1,
             "rank_max_pairs": 512,
-            "rank_start_epoch": 5,
-            "rank_warmup_epoch": 10,
+            "rank_start_epoch": 15,
+            "rank_warmup_epoch": 30,
+            "rank_alpha_min": 1e-4,
         },
 
         "weight": {
@@ -1799,19 +1882,20 @@ def cfg_to_args(model_cfg_all, train_cfg_all):
         pos_weight=pos_weight_cfg.get("value", 1.0),
 
         # quality-aware confidence
-        iou_pos_thr=quality_cfg.get("iou_pos_thr", 0.2),
-        quality_min=quality_cfg.get("quality_min", 0.3),
+        iou_pos_thr=quality_cfg.get("iou_pos_thr", 0.15),
+        quality_min=quality_cfg.get("quality_min", 0.25),
         quality_max=quality_cfg.get("quality_max", 1.0),
         qfl_beta=quality_cfg.get("qfl_beta", 2.0),
-        quality_warmup_epoch=quality_cfg.get("quality_warmup_epoch", 10),
+        quality_warmup_epoch=quality_cfg.get("quality_warmup_epoch", 20),
 
         # ranking
-        lambda_rank=ranking_cfg.get("lambda_rank", 0.25),
+        lambda_rank=ranking_cfg.get("lambda_rank", 0.10),
         rank_margin=ranking_cfg.get("rank_margin", 0.1),
         rank_min_quality_gap=ranking_cfg.get("rank_min_quality_gap", 0.1),
         rank_max_pairs=ranking_cfg.get("rank_max_pairs", 512),
-        rank_start_epoch=ranking_cfg.get("rank_start_epoch", 5),
-        rank_warmup_epoch=ranking_cfg.get("rank_warmup_epoch", 10),
+        rank_start_epoch=ranking_cfg.get("rank_start_epoch", 15),
+        rank_warmup_epoch=ranking_cfg.get("rank_warmup_epoch", 30),
+        rank_alpha_min=ranking_cfg.get("rank_alpha_min", 1e-4),
 
         # eval
         val_loss_interval=eval_cfg["val_loss_interval"],
@@ -1899,16 +1983,17 @@ def print_config_summary(model_cfg, train_cfg):
 
     print(
         f"  quality     : "
-        f"iou_thr={quality.get('iou_pos_thr', 0.2)}, "
-        f"q=[{quality.get('quality_min', 0.3)}, {quality.get('quality_max', 1.0)}], "
-        f"warmup={quality.get('quality_warmup_epoch', 10)}"
+        f"iou_thr={quality.get('iou_pos_thr', 0.15)}, "
+        f"q=[{quality.get('quality_min', 0.25)}, {quality.get('quality_max', 1.0)}], "
+        f"warmup={quality.get('quality_warmup_epoch', 20)}"
     )
 
     print(
         f"  ranking     : "
-        f"lambda={ranking.get('lambda_rank', 0.25)}, "
-        f"start={ranking.get('rank_start_epoch', 5)}, "
-        f"warmup={ranking.get('rank_warmup_epoch', 10)}"
+        f"lambda_max={ranking.get('lambda_rank', 0.10)}, "
+        f"start={ranking.get('rank_start_epoch', 15)}, "
+        f"warmup={ranking.get('rank_warmup_epoch', 30)}, "
+        f"alpha_min={ranking.get('rank_alpha_min', 1e-4)}"
     )
 
     print(
@@ -1967,6 +2052,7 @@ class LightDet:
         lambda_rank=None,
         rank_start_epoch=None,
         rank_warmup_epoch=None,
+        rank_alpha_min=None,
         **kwargs,
     ):
         model_cfg = deepcopy_cfg(self.model_cfg)
@@ -2071,6 +2157,9 @@ class LightDet:
         if rank_warmup_epoch is not None:
             train_cfg["loss"]["ranking"]["rank_warmup_epoch"] = rank_warmup_epoch
 
+        if rank_alpha_min is not None:
+            train_cfg["loss"]["ranking"]["rank_alpha_min"] = rank_alpha_min
+
         if len(kwargs) > 0:
             unknown = ", ".join(kwargs.keys())
             raise TypeError(f"Unsupported train arguments: {unknown}")
@@ -2107,11 +2196,11 @@ def main():
         imgsz=512,
         batch=24,
         device=1,
-        workers=4,
+        workers=12,
         seed=45,
         deterministic=False,
         project="runs/train",
-        name="lightdet_seed44",
+        name="lightdet_rank_smooth_010",
     )
 
 

@@ -5,6 +5,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def clamp01(x):
+    return min(max(float(x), 0.0), 1.0)
+
+
+def smoothstep(x):
+    """
+    平滑 warmup 曲線。
+
+    特性：
+        x = 0 -> 0
+        x = 1 -> 1
+        前期成長慢
+        中期平滑上升
+        後期趨緩
+
+    比線性 warmup 更適合 ranking loss，
+    因為 ranking 不應該太早強烈干擾 bbox / score 主目標。
+    """
+    x = clamp01(x)
+    return x * x * (3.0 - 2.0 * x)
+
+
 def box_area(box):
     return (
         (box[..., 2] - box[..., 0]).clamp(min=0)
@@ -77,16 +99,6 @@ def bounded_iou_quality(
 
     IoU >= iou_pos_thr:
         target 會落在 [quality_min, quality_max]
-
-    例：
-        iou_pos_thr = 0.2
-        quality_min = 0.3
-        quality_max = 1.0
-
-        IoU 0.20 -> target 0.30
-        IoU 0.50 -> target 約 0.56
-        IoU 0.80 -> target 約 0.83
-        IoU 1.00 -> target 1.00
     """
     quality = torch.zeros_like(iou)
 
@@ -235,28 +247,22 @@ class GroundingLoss(nn.Module):
         cost_giou=2.0,
         cost_score=0.0,
 
-        # 你的 FP 很多，negative 需要比 positive 多。
         hard_negative_ratio=5,
-
-        # 原本 0.2 在 10x10 grid 下最多會擴張到 20 個 positive，
-        # 對目前 precision 很低的狀態偏多，先降到 0.05。
         positive_ratio=0.05,
         max_positive_per_gt=2,
 
-        # 保留參數相容性，但不再作為固定 final target。
-        # 只在 quality warmup 初期作為 aux positive 的過渡值。
         aux_positive_label=0.7,
 
         expand_cost_bbox=5.0,
         expand_cost_giou=2.0,
 
-        # quality-aware confidence 設定
+        # quality-aware confidence
         iou_pos_thr=0.2,
         quality_min=0.3,
         quality_max=1.0,
         qfl_beta=2.0,
 
-        # ranking loss 設定
+        # ranking loss
         rank_margin=0.1,
         rank_min_quality_gap=0.1,
         rank_max_pairs=512,
@@ -290,36 +296,65 @@ class GroundingLoss(nn.Module):
         current_epoch=None,
         quality_alpha=None,
         rank_alpha=None,
-        quality_warmup_epoch=10,
-        rank_start_epoch=5,
-        rank_warmup_epoch=10,
+        quality_warmup_epoch=20,
+        rank_start_epoch=15,
+        rank_warmup_epoch=30,
+        rank_alpha_min=1e-4,
     ):
         """
-        讓 epoch 可以控制：
-        1. score target 從 objectness 過渡到 IoU quality
-        2. ranking loss 從 0 慢慢打開
+        控制兩件事：
+
+        1. quality_alpha:
+           score target 從 objectness target 緩慢轉成 IoU quality target。
+
+        2. rank_alpha:
+           ranking loss 從 0 緩慢成長到 1。
+
+        注意：
+            lambda_rank 是上限。
+            實際 ranking 權重為：
+
+                lambda_rank_eff = lambda_rank * rank_alpha
         """
+
+        # quality_alpha 仍使用線性 warmup。
+        # 原因：score target 從 objectness -> quality 本身是主 score 目標的一部分，
+        # 不需要像 ranking 那麼慢。
         if quality_alpha is None:
             if current_epoch is None:
                 quality_alpha = 1.0
             else:
                 quality_alpha = min(
                     1.0,
-                    max(0.0, float(current_epoch) / max(float(quality_warmup_epoch), 1.0)),
+                    max(
+                        0.0,
+                        float(current_epoch) / max(float(quality_warmup_epoch), 1.0),
+                    ),
                 )
 
+        # rank_alpha 使用 smoothstep。
         if rank_alpha is None:
             if current_epoch is None:
                 rank_alpha = 1.0
             else:
-                rank_alpha = min(
-                    1.0,
-                    max(
-                        0.0,
-                        (float(current_epoch) - float(rank_start_epoch))
-                        / max(float(rank_warmup_epoch), 1.0),
-                    ),
-                )
+                if float(current_epoch) < float(rank_start_epoch):
+                    rank_alpha = 0.0
+                else:
+                    t = (
+                        float(current_epoch) - float(rank_start_epoch)
+                    ) / max(float(rank_warmup_epoch), 1.0)
+
+                    curve = smoothstep(t)
+
+                    # rank_start_epoch 當下給一個極小值，
+                    # 避免從完全 0 突然切到非 0。
+                    rank_alpha = (
+                        float(rank_alpha_min)
+                        +
+                        (1.0 - float(rank_alpha_min)) * curve
+                    )
+
+                    rank_alpha = min(max(rank_alpha, 0.0), 1.0)
 
         return float(quality_alpha), float(rank_alpha)
 
@@ -331,14 +366,6 @@ class GroundingLoss(nn.Module):
         score_target,
         quality_alpha=1.0,
     ):
-        """
-        原本：
-            aux positive 固定給 0.7
-
-        現在：
-            aux positive 依照 IoU 轉成 bounded quality target。
-            IoU 很差的 candidate 不會被強制當 positive。
-        """
         B, N, _ = pred_bbox.shape
 
         positive_budget = max(
@@ -438,13 +465,9 @@ class GroundingLoss(nn.Module):
 
                 quality = quality_all[pred_idx]
 
-                # IoU 太差，不再硬標成 aux positive。
-                # 這些樣本會保留 target = 0，成為 negative。
                 if quality <= 0.0:
                     continue
 
-                # warmup 初期仍保留一點 objectness 性質，
-                # 後期完全轉成 IoU quality target。
                 quality_target = (
                     (1.0 - quality_alpha)
                     * score_target.new_tensor(self.aux_positive_label)
@@ -474,11 +497,6 @@ class GroundingLoss(nn.Module):
     ):
         """
         Quality Focal Loss + hard negative mining。
-
-        這裡仍然混合 positive / negative：
-        - positive: score_target > 0
-        - negative: score_target <= 0
-        - negative 只取 loss 最大的 top-k，避免 easy negative 淹沒訓練。
         """
         if qfl_beta is None:
             qfl_beta = self.qfl_beta
@@ -551,7 +569,7 @@ class GroundingLoss(nn.Module):
         若 quality_i > quality_j，
         則希望 score_i > score_j。
 
-        同時包含：
+        包含：
         1. positive vs positive ranking
         2. positive vs hard negative ranking
         """
@@ -569,7 +587,7 @@ class GroundingLoss(nn.Module):
 
         losses = []
 
-        # positive vs positive：高 quality positive 分數要高於低 quality positive
+        # positive vs positive
         if pos_idx.numel() >= 2:
             q = quality[pos_idx]
             s = score[pos_idx]
@@ -595,7 +613,7 @@ class GroundingLoss(nn.Module):
 
                 losses.append(loss_pp.mean())
 
-        # positive vs hard negative：positive 分數要高於高分 negative
+        # positive vs hard negative
         if pos_idx.numel() > 0 and neg_idx.numel() > 0:
             pos_score = score[pos_idx]
             neg_score = score[neg_idx]
@@ -638,16 +656,21 @@ class GroundingLoss(nn.Module):
         lambda_score=1.0,
         pos_weight=1.0,
 
-        # 新增：ranking / quality schedule
+        # schedule
         current_epoch=None,
         quality_alpha=None,
         rank_alpha=None,
-        quality_warmup_epoch=10,
-        rank_start_epoch=5,
-        rank_warmup_epoch=10,
 
-        # 新增：ranking loss 權重
-        lambda_rank=0.25,
+        # 建議比原本更慢
+        quality_warmup_epoch=20,
+        rank_start_epoch=15,
+        rank_warmup_epoch=30,
+        rank_alpha_min=1e-4,
+
+        # 注意：
+        # 這裡的 lambda_rank 是 ranking 上限。
+        # 實際權重是 lambda_rank * rank_alpha。
+        lambda_rank=0.15,
     ):
         quality_alpha, rank_alpha = self.resolve_epoch_alpha(
             current_epoch=current_epoch,
@@ -656,6 +679,7 @@ class GroundingLoss(nn.Module):
             quality_warmup_epoch=quality_warmup_epoch,
             rank_start_epoch=rank_start_epoch,
             rank_warmup_epoch=rank_warmup_epoch,
+            rank_alpha_min=rank_alpha_min,
         )
 
         indices = self.matcher(
@@ -697,17 +721,12 @@ class GroundingLoss(nn.Module):
                     quality_max=self.quality_max,
                 )
 
-                # warmup：
-                # early: 接近 objectness target = 1
-                # later: 完整 quality target = bounded IoU
                 quality_target = (
                     (1.0 - quality_alpha) * torch.ones_like(quality)
                     +
                     quality_alpha * quality
                 )
 
-            # 原本是固定 1.0
-            # 現在變成非二元 quality-aware target
             score_target[b, pred_idx, 0] = quality_target
 
             loss_bbox = loss_bbox + F.l1_loss(
@@ -757,17 +776,25 @@ class GroundingLoss(nn.Module):
             min_quality_gap=self.rank_min_quality_gap,
         )
 
-        loss_rank = float(rank_alpha) * loss_rank_raw
+        # ranking 實際影響力：
+        # lambda_rank_eff = lambda_rank * rank_alpha
+        lambda_rank_eff = float(lambda_rank) * float(rank_alpha)
 
-        loss = (
+        # loss_rank_raw      : ranking 原始值
+        # loss_rank          : rank_alpha 加權後，但尚未乘 lambda_rank
+        # loss_rank_contrib  : 實際加入 total loss 的 ranking contribution
+        loss_rank = float(rank_alpha) * loss_rank_raw
+        loss_rank_contrib = float(lambda_rank) * loss_rank
+
+        loss_main = (
             float(lambda_bbox) * loss_bbox
             +
             float(lambda_giou) * loss_giou
             +
             float(lambda_score) * loss_score
-            +
-            float(lambda_rank) * loss_rank
         )
+
+        loss = loss_main + loss_rank_contrib
 
         pos_mask = score_target > 0.0
 
@@ -782,6 +809,8 @@ class GroundingLoss(nn.Module):
 
         loss_dict = {
             "loss": loss.detach(),
+            "loss_main": loss_main.detach(),
+
             "loss_bbox": loss_bbox.detach(),
             "loss_giou": loss_giou.detach(),
 
@@ -791,6 +820,7 @@ class GroundingLoss(nn.Module):
 
             "loss_rank": loss_rank.detach(),
             "loss_rank_raw": loss_rank_raw.detach(),
+            "loss_rank_contrib": loss_rank_contrib.detach(),
 
             "matched": float(total_matched),
             "score_pos_count": float(score_pos_count),
@@ -803,7 +833,12 @@ class GroundingLoss(nn.Module):
             "lambda_bbox": float(lambda_bbox),
             "lambda_giou": float(lambda_giou),
             "lambda_score": float(lambda_score),
+
+            # lambda_rank 是上限
             "lambda_rank": float(lambda_rank),
+
+            # lambda_rank_eff 才是實際 ranking 權重
+            "lambda_rank_eff": float(lambda_rank_eff),
 
             "pos_weight": float(pos_weight),
             "quality_alpha": float(quality_alpha),
