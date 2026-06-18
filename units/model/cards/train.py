@@ -33,8 +33,8 @@ from units.model.cards.loss import GroundingLoss
 mp.set_sharing_strategy("file_system")
 
 
-# Basic utils
 
+# Basic utils
 def set_seed(seed):
     if seed is None:
         return
@@ -45,31 +45,6 @@ def set_seed(seed):
 
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def enable_gpu_perf(
-    allow_tf32=True,
-    cudnn_benchmark=True,
-    matmul_precision="high",
-):
-    """
-    RTX 5000 Ada acceleration switch.
-
-    - TF32 improves remaining FP32 matmul / conv paths.
-    - cudnn.benchmark lets cuDNN pick faster kernels for fixed image size.
-    - matmul_precision='high' allows PyTorch 2.x to use faster internal matmul precision.
-    """
-    if not torch.cuda.is_available():
-        return
-
-    torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32)
-    torch.backends.cudnn.allow_tf32 = bool(allow_tf32)
-    torch.backends.cudnn.benchmark = bool(cudnn_benchmark)
-
-    try:
-        torch.set_float32_matmul_precision(str(matmul_precision))
-    except Exception:
-        pass
 
 
 def count_parameters(model):
@@ -124,28 +99,8 @@ def restore_rng_state(rng_state):
             pass
 
 
-def get_amp_dtype(name="bf16"):
-    name = str(name or "bf16").lower().strip()
-    if name in ["bf16", "bfloat16"]:
-        return torch.bfloat16
-    if name in ["fp16", "float16", "half"]:
-        return torch.float16
-    if name in ["fp32", "float32", "none", "off"]:
-        return torch.float32
-    raise ValueError(f"Unsupported amp dtype: {name}")
-
-
-def get_amp_enabled(device, use_amp=True, amp_dtype=torch.bfloat16):
-    if not bool(use_amp):
-        return False
-    if device.type != "cuda":
-        return False
-    return amp_dtype in (torch.float16, torch.bfloat16)
-
-
-def build_scaler(device, amp_enabled=True, amp_dtype=torch.bfloat16):
-    # BF16 usually does not need GradScaler. FP16 does.
-    enabled = bool(device.type == "cuda" and amp_enabled and amp_dtype == torch.float16)
+def build_scaler(device):
+    enabled = device.type == "cuda"
 
     try:
         return GradScaler(device.type, enabled=enabled)
@@ -153,122 +108,13 @@ def build_scaler(device, amp_enabled=True, amp_dtype=torch.bfloat16):
         return GradScaler(enabled=enabled)
 
 
-def scaler_is_enabled(scaler):
-    return scaler is not None and hasattr(scaler, "is_enabled") and scaler.is_enabled()
+def get_amp_enabled(device, use_amp=True):
+    return bool(use_amp and device.type == "cuda")
 
-
-def prepare_images(
-    images,
-    device,
-    channels_last=False,
-    image_mean=None,
-    image_std=None,
-):
-    """
-    Moves images to GPU first, then converts uint8 cache to float.
-    This preserves the 4x smaller uint8 CPU memory / H2D transfer path.
-    """
-    images = images.to(device, non_blocking=True)
-
-    if images.dtype == torch.uint8:
-        images = images.float().div_(255.0)
-    elif images.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
-        images = images.float()
-
-    if image_mean is not None and image_std is not None:
-        mean = torch.tensor(image_mean, device=device, dtype=images.dtype).view(1, 3, 1, 1)
-        std = torch.tensor(image_std, device=device, dtype=images.dtype).view(1, 3, 1, 1)
-        images = (images - mean) / std.clamp_min(1e-12)
-
-    if channels_last and images.ndim == 4:
-        images = images.contiguous(memory_format=torch.channels_last)
-
-    return images
-
-
-def move_targets_to_device(batch, device):
-    if "targets" in batch:
-        raw_targets = batch["targets"]
-    else:
-        raw_targets = []
-        boxes_list = batch["target_boxes_per_image"]
-        labels_list = batch.get("target_labels_per_image", None)
-
-        for i, boxes in enumerate(boxes_list):
-            target = {"boxes": boxes}
-            if labels_list is not None:
-                target["labels"] = labels_list[i]
-            raw_targets.append(target)
-
-    targets = []
-    for t in raw_targets:
-        nt = {}
-        for k, v in t.items():
-            if torch.is_tensor(v):
-                nt[k] = v.to(device, non_blocking=True)
-            else:
-                nt[k] = v
-
-        if "boxes" not in nt:
-            raise KeyError("target must contain key: boxes")
-
-        targets.append(nt)
-
-    return targets
-
-
-def get_score_logit(outputs):
-    if "score_logit" in outputs:
-        return outputs["score_logit"]
-    if "score" in outputs:
-        return outputs["score"]
-    raise KeyError("Model output must contain score_logit")
-
-
-def get_batch_images_and_indices(batch, device, channels_last=False, image_mean=None, image_std=None):
-    if "unique_images" in batch:
-        images = prepare_images(
-            batch["unique_images"],
-            device=device,
-            channels_last=channels_last,
-            image_mean=image_mean,
-            image_std=image_std,
-        )
-        image_indices = batch["image_indices"].to(device, non_blocking=True)
-    else:
-        images = prepare_images(
-            batch["images"],
-            device=device,
-            channels_last=channels_last,
-            image_mean=image_mean,
-            image_std=image_std,
-        )
-        image_indices = None
-
-    return images, image_indices
-
-
-def forward_model(model, images, query_texts, image_indices=None):
-    if image_indices is None:
-        return model(images, query_texts)
-    return model(images, query_texts, image_indices=image_indices)
-
-
-def sync_tensor_items(tensors):
-    """Synchronize multiple scalar tensors with one CPU transfer."""
-    vals = []
-    stack_items = []
-    for x in tensors:
-        if torch.is_tensor(x):
-            stack_items.append(x.detach().float().reshape(()))
-        else:
-            vals.append(float(x))
-    if len(stack_items) > 0:
-        vals = torch.stack(stack_items).cpu().tolist()
-    return [float(v) for v in vals]
 
 
 # EMA
+
 
 class ModelEMA:
     def __init__(self, model, decay=0.999):
@@ -292,7 +138,9 @@ class ModelEMA:
                 ema_v.copy_(model_v)
 
 
+
 # Optimizer / Scheduler
+
 
 def build_optimizer(
     model,
@@ -356,8 +204,12 @@ class WarmupCosineScheduler:
         if self.step_num <= self.warmup_steps:
             factor = self.step_num / max(1, self.warmup_steps)
         else:
-            progress = (self.step_num - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
+            progress = (self.step_num - self.warmup_steps) / max(
+                1,
+                self.total_steps - self.warmup_steps
+            )
             progress = min(max(progress, 0.0), 1.0)
+
             cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
             factor = self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cosine
 
@@ -368,31 +220,65 @@ class WarmupCosineScheduler:
         return [group["lr"] for group in self.optimizer.param_groups]
 
 
+
 # Dynamic training schedule
+
 
 def get_loss_weights(epoch, total_epochs, args):
     progress = epoch / max(1, total_epochs)
 
     if not args.loss_dynamic:
-        return float(args.lambda_bbox), float(args.lambda_giou), float(args.lambda_score)
+        return (
+            float(args.lambda_bbox),
+            float(args.lambda_giou),
+            float(args.lambda_score),
+        )
 
     bbox_decay_until = max(1e-8, float(args.lambda_bbox_decay_until))
     bbox_ratio = min(progress / bbox_decay_until, 1.0)
-    lambda_bbox = float(args.lambda_bbox_start) + (float(args.lambda_bbox_end) - float(args.lambda_bbox_start)) * bbox_ratio
+
+    lambda_bbox = (
+        float(args.lambda_bbox_start)
+        +
+        (
+            float(args.lambda_bbox_end)
+            -
+            float(args.lambda_bbox_start)
+        )
+        * bbox_ratio
+    )
 
     lambda_giou = float(args.lambda_giou)
 
     score_warm_until = max(1e-8, float(args.lambda_score_warm_until))
     score_ratio = min(progress / score_warm_until, 1.0)
-    lambda_score = float(args.lambda_score_start) + (float(args.lambda_score_end) - float(args.lambda_score_start)) * score_ratio
+
+    lambda_score = (
+        float(args.lambda_score_start)
+        +
+        (
+            float(args.lambda_score_end)
+            -
+            float(args.lambda_score_start)
+        )
+        * score_ratio
+    )
 
     return lambda_bbox, lambda_giou, lambda_score
 
 
+
+
+
 # Eval IoU helper: normalized xyxy
 
+
 def box_area(box):
-    return (box[..., 2] - box[..., 0]).clamp(min=0) * (box[..., 3] - box[..., 1]).clamp(min=0)
+    return (
+        (box[..., 2] - box[..., 0]).clamp(min=0)
+        *
+        (box[..., 3] - box[..., 1]).clamp(min=0)
+    )
 
 
 def box_iou_xyxy(boxes1, boxes2, eps=1e-7):
@@ -407,12 +293,71 @@ def box_iou_xyxy(boxes1, boxes2, eps=1e-7):
 
     wh = (rb - lt).clamp(min=0)
     inter = wh[..., 0] * wh[..., 1]
+
     union = area1[:, None] + area2[None, :] - inter
 
     return inter / union.clamp(min=eps)
 
 
+
+
+# Batch helper
+
+
+def move_targets_to_device(batch, device):
+    """
+    dataloader:
+        batch["targets"] = [{"boxes": ..., ...}, ...]
+    """
+
+    if "targets" in batch:
+        raw_targets = batch["targets"]
+    else:
+        raw_targets = []
+
+        boxes_list = batch["target_boxes_per_image"]
+        labels_list = batch.get("target_labels_per_image", None)
+
+        for i, boxes in enumerate(boxes_list):
+            target = {"boxes": boxes}
+
+            if labels_list is not None:
+                target["labels"] = labels_list[i]
+
+            raw_targets.append(target)
+
+    targets = []
+
+    for t in raw_targets:
+        nt = {}
+
+        for k, v in t.items():
+            if torch.is_tensor(v):
+                nt[k] = v.to(device, non_blocking=True)
+            else:
+                nt[k] = v
+
+        if "boxes" not in nt:
+            raise KeyError("target must contain key: boxes")
+
+        targets.append(nt)
+
+    return targets
+
+
+def get_score_logit(outputs):
+    if "score_logit" in outputs:
+        return outputs["score_logit"]
+
+    if "score" in outputs:
+        return outputs["score"]
+
+    raise KeyError("Model output must contain score_logit")
+
+
+
 # Train / Val loss
+
 
 def train_one_epoch(
     model,
@@ -426,12 +371,6 @@ def train_one_epoch(
     epoch,
     num_epochs,
     use_amp=True,
-    amp_dtype=torch.bfloat16,
-    channels_last=False,
-    image_mean=None,
-    image_std=None,
-    profile_steps=False,
-    profile_interval=50,
     grad_clip_norm=1.0,
     lambda_bbox=5.0,
     lambda_giou=2.0,
@@ -454,43 +393,30 @@ def train_one_epoch(
     total_rank_contrib_sum = torch.zeros((), device=device)
     total_rank_raw_sum = torch.zeros((), device=device)
 
-    amp_enabled = get_amp_enabled(device, use_amp, amp_dtype)
-    use_scaler = scaler_is_enabled(scaler)
+    amp_enabled = get_amp_enabled(device, use_amp)
 
     pbar = tqdm(
         enumerate(train_loader),
         total=len(train_loader),
         desc=f"Epoch {epoch}/{num_epochs} [Train]",
         dynamic_ncols=True,
-        leave=True,
+        leave=True
     )
 
-    if hasattr(getattr(train_loader, "batch_sampler", None), "set_epoch"):
-        train_loader.batch_sampler.set_epoch(epoch)
+    last_log = {}
 
     for step, batch in pbar:
         global_step = (epoch - 1) * len(train_loader) + step + 1
-        do_profile = bool(profile_steps and (step + 1) % max(1, int(profile_interval)) == 0)
-        t0 = time.perf_counter() if do_profile else None
 
-        images, image_indices = get_batch_images_and_indices(
-            batch,
-            device=device,
-            channels_last=channels_last,
-            image_mean=image_mean,
-            image_std=image_std,
-        )
+        images = batch["images"].to(device, non_blocking=True)
         query_texts = batch["query_texts"]
         targets = move_targets_to_device(batch, device)
 
-        if do_profile and device.type == "cuda":
-            torch.cuda.synchronize()
-        t1 = time.perf_counter() if do_profile else None
-
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            outputs = forward_model(model, images, query_texts, image_indices=image_indices)
+        with autocast(device_type=device.type, enabled=amp_enabled):
+            outputs = model(images, query_texts)
+
             pred_bbox = outputs["bbox"]
             pred_score_logit = get_score_logit(outputs)
 
@@ -510,21 +436,21 @@ def train_one_epoch(
                 rank_alpha_min=rank_alpha_min,
             )
 
-        if do_profile and device.type == "cuda":
-            torch.cuda.synchronize()
-        t2 = time.perf_counter() if do_profile else None
-
-        if use_scaler:
+        if amp_enabled:
             scaler.scale(loss).backward()
+
             if grad_clip_norm is not None:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
+
             if grad_clip_norm is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+
             optimizer.step()
 
         scheduler.step()
@@ -532,18 +458,18 @@ def train_one_epoch(
         if ema is not None:
             ema.update(model)
 
-        if do_profile and device.type == "cuda":
-            torch.cuda.synchronize()
-        t3 = time.perf_counter() if do_profile else None
-
         zero = pred_bbox.new_tensor(0.0)
+
         loss_det = loss.detach()
         bbox_det = loss_dict["loss_bbox"].detach()
         giou_det = loss_dict["loss_giou"].detach()
         score_det = loss_dict["loss_score"].detach()
         rank_raw_det = loss_dict.get("loss_rank_raw", zero).detach()
         rank_det = loss_dict.get("loss_rank", zero).detach()
-        rank_contrib_det = loss_dict.get("loss_rank_contrib", loss_dict.get("loss_rank", zero)).detach()
+        rank_contrib_det = loss_dict.get(
+            "loss_rank_contrib",
+            loss_dict.get("loss_rank", zero),
+        ).detach()
 
         total_loss_sum += loss_det
         total_bbox_sum += bbox_det
@@ -556,26 +482,14 @@ def train_one_epoch(
         should_log = (step + 1) % max(1, int(log_interval)) == 0 or (step + 1) == len(train_loader)
 
         if should_log:
-            values = torch.stack([
-                loss_det.float().reshape(()),
-                bbox_det.float().reshape(()),
-                giou_det.float().reshape(()),
-                score_det.float().reshape(()),
-                rank_raw_det.float().reshape(()),
-                rank_det.float().reshape(()),
-                rank_contrib_det.float().reshape(()),
-                (total_loss_sum / (step + 1)).float().reshape(()),
-            ]).detach().cpu().tolist()
-            (
-                loss_item,
-                bbox_item,
-                giou_item,
-                score_item,
-                rank_raw_item,
-                rank_item,
-                rank_contrib_item,
-                avg_loss,
-            ) = [float(v) for v in values]
+            loss_item = float(loss_det.item())
+            bbox_item = float(bbox_det.item())
+            giou_item = float(giou_det.item())
+            score_item = float(score_det.item())
+            rank_raw_item = float(rank_raw_det.item())
+            rank_item = float(rank_det.item())
+            rank_contrib_item = float(rank_contrib_det.item())
+            avg_loss = float((total_loss_sum / (step + 1)).item())
 
             rank_alpha_item = float(loss_dict.get("rank_alpha", 0.0))
             lambda_rank_eff_item = float(loss_dict.get("lambda_rank_eff", 0.0))
@@ -583,15 +497,11 @@ def train_one_epoch(
 
             score_target_pos_mean = loss_dict.get("score_target_pos_mean", zero)
             if torch.is_tensor(score_target_pos_mean):
-                score_target_pos_mean = float(score_target_pos_mean.detach().float().cpu().item())
+                score_target_pos_mean = float(score_target_pos_mean.detach().item())
             else:
                 score_target_pos_mean = float(score_target_pos_mean)
 
-            num_unique = int(images.shape[0])
-            num_queries = int(len(query_texts))
-            qpi = num_queries / max(1, num_unique)
-
-            postfix = {
+            last_log = {
                 "lr": f"{current_lr:.2e}",
                 "loss": f"{loss_item:.4f}",
                 "avg": f"{avg_loss:.4f}",
@@ -600,9 +510,6 @@ def train_one_epoch(
                 "score": f"{score_item:.4f}",
                 "rank": f"{rank_contrib_item:.4f}",
                 "raw": f"{rank_raw_item:.4f}",
-                "uq": f"{num_unique}",
-                "q": f"{num_queries}",
-                "q/i": f"{qpi:.1f}",
                 "ra": f"{rank_alpha_item:.4f}",
                 "lrk": f"{lambda_rank_eff_item:.4f}",
                 "lb": f"{lambda_bbox:.2f}",
@@ -610,18 +517,10 @@ def train_one_epoch(
                 "ls": f"{lambda_score:.2f}",
                 "pw": f"{pos_weight:.2f}",
             }
-
-            if do_profile:
-                postfix.update({
-                    "to_gpu": f"{t1 - t0:.3f}s",
-                    "fwd": f"{t2 - t1:.3f}s",
-                    "bwd": f"{t3 - t2:.3f}s",
-                })
-
-            pbar.set_postfix(postfix)
+            pbar.set_postfix(last_log)
 
             if step_metrics_path is not None:
-                row = {
+                append_jsonl(step_metrics_path, {
                     "type": "step",
                     "time": time.time(),
                     "epoch": epoch,
@@ -646,26 +545,17 @@ def train_one_epoch(
                     "rank_alpha": rank_alpha_item,
                     "rank_alpha_min": float(rank_alpha_min),
                     "score_target_pos_mean": score_target_pos_mean,
-                    "num_unique_images": num_unique,
-                    "num_queries": num_queries,
-                    "query_per_image": qpi,
-                }
-                if do_profile:
-                    row.update({
-                        "time_to_gpu": t1 - t0,
-                        "time_forward_loss": t2 - t1,
-                        "time_backward_step": t3 - t2,
-                    })
-                append_jsonl(step_metrics_path, row)
+                })
 
     n = max(1, len(train_loader))
+
     return {
-        "train_loss": float((total_loss_sum / n).detach().cpu().item()),
-        "train_loss_bbox": float((total_bbox_sum / n).detach().cpu().item()),
-        "train_loss_giou": float((total_giou_sum / n).detach().cpu().item()),
-        "train_loss_score": float((total_score_sum / n).detach().cpu().item()),
-        "train_loss_rank_raw": float((total_rank_raw_sum / n).detach().cpu().item()),
-        "train_loss_rank": float((total_rank_contrib_sum / n).detach().cpu().item()),
+        "train_loss": float((total_loss_sum / n).item()),
+        "train_loss_bbox": float((total_bbox_sum / n).item()),
+        "train_loss_giou": float((total_giou_sum / n).item()),
+        "train_loss_score": float((total_score_sum / n).item()),
+        "train_loss_rank_raw": float((total_rank_raw_sum / n).item()),
+        "train_loss_rank": float((total_rank_contrib_sum / n).item()),
     }
 
 
@@ -677,10 +567,6 @@ def validate_loss_one_epoch(
     device,
     epoch,
     use_amp=True,
-    amp_dtype=torch.bfloat16,
-    channels_last=False,
-    image_mean=None,
-    image_std=None,
     lambda_bbox=5.0,
     lambda_giou=2.0,
     lambda_score=1.0,
@@ -701,29 +587,24 @@ def validate_loss_one_epoch(
     total_rank_contrib_sum = torch.zeros((), device=device)
     total_rank_raw_sum = torch.zeros((), device=device)
 
-    amp_enabled = get_amp_enabled(device, use_amp, amp_dtype)
+    amp_enabled = get_amp_enabled(device, use_amp)
 
     pbar = tqdm(
         enumerate(val_loader),
         total=len(val_loader),
         desc=f"Epoch {epoch} [Val Loss]",
         dynamic_ncols=True,
-        leave=True,
+        leave=True
     )
 
     for step, batch in pbar:
-        images, image_indices = get_batch_images_and_indices(
-            batch,
-            device=device,
-            channels_last=channels_last,
-            image_mean=image_mean,
-            image_std=image_std,
-        )
+        images = batch["images"].to(device, non_blocking=True)
         query_texts = batch["query_texts"]
         targets = move_targets_to_device(batch, device)
 
-        with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            outputs = forward_model(model, images, query_texts, image_indices=image_indices)
+        with autocast(device_type=device.type, enabled=amp_enabled):
+            outputs = model(images, query_texts)
+
             pred_bbox = outputs["bbox"]
             pred_score_logit = get_score_logit(outputs)
 
@@ -744,12 +625,16 @@ def validate_loss_one_epoch(
             )
 
         zero = pred_bbox.new_tensor(0.0)
+
         loss_det = loss.detach()
         bbox_det = loss_dict["loss_bbox"].detach()
         giou_det = loss_dict["loss_giou"].detach()
         score_det = loss_dict["loss_score"].detach()
         rank_raw_det = loss_dict.get("loss_rank_raw", zero).detach()
-        rank_contrib_det = loss_dict.get("loss_rank_contrib", loss_dict.get("loss_rank", zero)).detach()
+        rank_contrib_det = loss_dict.get(
+            "loss_rank_contrib",
+            loss_dict.get("loss_rank", zero),
+        ).detach()
 
         total_loss_sum += loss_det
         total_bbox_sum += bbox_det
@@ -759,17 +644,15 @@ def validate_loss_one_epoch(
         total_rank_raw_sum += rank_raw_det
 
         should_log = (step + 1) % max(1, int(log_interval)) == 0 or (step + 1) == len(val_loader)
+
         if should_log:
-            values = torch.stack([
-                loss_det.float().reshape(()),
-                bbox_det.float().reshape(()),
-                giou_det.float().reshape(()),
-                score_det.float().reshape(()),
-                rank_raw_det.float().reshape(()),
-                rank_contrib_det.float().reshape(()),
-                (total_loss_sum / (step + 1)).float().reshape(()),
-            ]).detach().cpu().tolist()
-            loss_item, bbox_item, giou_item, score_item, rank_raw_item, rank_contrib_item, avg_loss = [float(v) for v in values]
+            loss_item = float(loss_det.item())
+            bbox_item = float(bbox_det.item())
+            giou_item = float(giou_det.item())
+            score_item = float(score_det.item())
+            rank_raw_item = float(rank_raw_det.item())
+            rank_contrib_item = float(rank_contrib_det.item())
+            avg_loss = float((total_loss_sum / (step + 1)).item())
             rank_alpha_item = float(loss_dict.get("rank_alpha", 0.0))
             lambda_rank_eff_item = float(loss_dict.get("lambda_rank_eff", 0.0))
 
@@ -781,23 +664,25 @@ def validate_loss_one_epoch(
                 "score": f"{score_item:.4f}",
                 "rank": f"{rank_contrib_item:.4f}",
                 "raw": f"{rank_raw_item:.4f}",
-                "q": len(query_texts),
                 "ra": f"{rank_alpha_item:.4f}",
                 "lrk": f"{lambda_rank_eff_item:.4f}",
             })
 
     n = max(1, len(val_loader))
+
     return {
-        "val_loss": float((total_loss_sum / n).detach().cpu().item()),
-        "val_loss_bbox": float((total_bbox_sum / n).detach().cpu().item()),
-        "val_loss_giou": float((total_giou_sum / n).detach().cpu().item()),
-        "val_loss_score": float((total_score_sum / n).detach().cpu().item()),
-        "val_loss_rank_raw": float((total_rank_raw_sum / n).detach().cpu().item()),
-        "val_loss_rank": float((total_rank_contrib_sum / n).detach().cpu().item()),
+        "val_loss": float((total_loss_sum / n).item()),
+        "val_loss_bbox": float((total_bbox_sum / n).item()),
+        "val_loss_giou": float((total_giou_sum / n).item()),
+        "val_loss_score": float((total_score_sum / n).item()),
+        "val_loss_rank_raw": float((total_rank_raw_sum / n).item()),
+        "val_loss_rank": float((total_rank_contrib_sum / n).item()),
     }
 
 
+
 # Detection metrics: query-conditioned binary detection
+
 
 @torch.no_grad()
 def select_predictions(
@@ -808,17 +693,28 @@ def select_predictions(
     nms_iou_thr=0.5,
     use_topk_fallback=True,
 ):
+    """
+    boxes:
+        [N, 4], normalized xyxy
+
+    scores:
+        [N], sigmoid score
+    """
+
     N = boxes.shape[0]
+
     if N == 0:
         return boxes.new_zeros((0, 4)), scores.new_zeros((0,))
 
     keep = scores >= score_thr
+
     if keep.sum() > 0:
         selected_boxes = boxes[keep]
         selected_scores = scores[keep]
     else:
         if not use_topk_fallback:
             return boxes.new_zeros((0, 4)), scores.new_zeros((0,))
+
         k = min(top_k, N)
         selected_scores, top_idx = scores.topk(k=k)
         selected_boxes = boxes[top_idx]
@@ -830,8 +726,16 @@ def select_predictions(
     if selected_boxes.numel() == 0:
         return selected_boxes, selected_scores
 
-    keep_idx = nms(selected_boxes.float(), selected_scores.float(), iou_threshold=nms_iou_thr)
-    return selected_boxes[keep_idx], selected_scores[keep_idx]
+    keep_idx = nms(
+        selected_boxes.float(),
+        selected_scores.float(),
+        iou_threshold=nms_iou_thr,
+    )
+
+    selected_boxes = selected_boxes[keep_idx]
+    selected_scores = selected_scores[keep_idx]
+
+    return selected_boxes, selected_scores
 
 
 def compute_ap_from_pr(precision, recall):
@@ -843,6 +747,7 @@ def compute_ap_from_pr(precision, recall):
         recall,
         torch.tensor([1.0], dtype=recall.dtype),
     ])
+
     mpre = torch.cat([
         torch.tensor([0.0], dtype=precision.dtype),
         precision,
@@ -854,10 +759,23 @@ def compute_ap_from_pr(precision, recall):
 
     idx = torch.where(mrec[1:] != mrec[:-1])[0]
     ap = torch.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])
+
     return float(ap.item())
 
 
 def evaluate_ap_at_iou(pred_records, gt_by_sample, iou_thr=0.5):
+    """
+    pred_records:
+        list of {
+            "sample_id": int,
+            "score": float,
+            "box": Tensor[4] CPU
+        }
+
+    gt_by_sample:
+        list of Tensor[M, 4] CPU
+    """
+
     num_gt = sum(int(gt.shape[0]) for gt in gt_by_sample)
 
     if num_gt == 0:
@@ -871,11 +789,20 @@ def evaluate_ap_at_iou(pred_records, gt_by_sample, iou_thr=0.5):
             "num_pred": len(pred_records),
         }
 
-    pred_records = sorted(pred_records, key=lambda x: x["score"], reverse=True)
-    matched = [torch.zeros((gt.shape[0],), dtype=torch.bool) for gt in gt_by_sample]
+    pred_records = sorted(
+        pred_records,
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    matched = [
+        torch.zeros((gt.shape[0],), dtype=torch.bool)
+        for gt in gt_by_sample
+    ]
 
     tp = []
     fp = []
+
     for rec in pred_records:
         sample_id = rec["sample_id"]
         pred_box = rec["box"].view(1, 4)
@@ -910,15 +837,18 @@ def evaluate_ap_at_iou(pred_records, gt_by_sample, iou_thr=0.5):
 
     tp = torch.tensor(tp, dtype=torch.float32)
     fp = torch.tensor(fp, dtype=torch.float32)
+
     cum_tp = torch.cumsum(tp, dim=0)
     cum_fp = torch.cumsum(fp, dim=0)
 
     recall = cum_tp / max(1, num_gt)
     precision = cum_tp / torch.clamp(cum_tp + cum_fp, min=1e-6)
+
     ap = compute_ap_from_pr(precision, recall)
 
     final_tp = int(cum_tp[-1].item())
     final_fp = int(cum_fp[-1].item())
+
     final_precision = final_tp / max(1, final_tp + final_fp)
     final_recall = final_tp / max(1, num_gt)
 
@@ -940,10 +870,6 @@ def evaluate_detection_one_epoch(
     device,
     epoch,
     use_amp=True,
-    amp_dtype=torch.bfloat16,
-    channels_last=False,
-    image_mean=None,
-    image_std=None,
     score_thr=0.25,
     top_k=20,
     nms_iou_thr=0.5,
@@ -951,43 +877,45 @@ def evaluate_detection_one_epoch(
     use_topk_fallback=True,
 ):
     model.eval()
-    amp_enabled = get_amp_enabled(device, use_amp, amp_dtype)
+
+    amp_enabled = get_amp_enabled(device, use_amp)
 
     pred_records = []
     gt_by_sample = []
+
     sample_id = 0
     skipped_empty_gt = 0
     total_selected = 0
 
-    pbar_total = len(val_loader) if max_val_batches is None else min(len(val_loader), max_val_batches)
+    pbar_total = (
+        len(val_loader)
+        if max_val_batches is None
+        else min(len(val_loader), max_val_batches)
+    )
+
     pbar = tqdm(
         enumerate(val_loader),
         total=pbar_total,
         desc=f"Epoch {epoch} [Eval]",
         dynamic_ncols=True,
-        leave=True,
+        leave=True
     )
 
     for step, batch in pbar:
         if max_val_batches is not None and step >= max_val_batches:
             break
 
-        images, image_indices = get_batch_images_and_indices(
-            batch,
-            device=device,
-            channels_last=channels_last,
-            image_mean=image_mean,
-            image_std=image_std,
-        )
+        images = batch["images"].to(device, non_blocking=True)
         query_texts = batch["query_texts"]
         targets = move_targets_to_device(batch, device)
 
-        with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            outputs = forward_model(model, images, query_texts, image_indices=image_indices)
+        with autocast(device_type=device.type, enabled=amp_enabled):
+            outputs = model(images, query_texts)
 
         pred_bbox = outputs["bbox"]
         pred_score_logit = get_score_logit(outputs)
         pred_scores = pred_score_logit.sigmoid().squeeze(-1)
+
         B = pred_bbox.shape[0]
 
         for b in range(B):
@@ -999,6 +927,7 @@ def evaluate_detection_one_epoch(
 
             boxes_b = pred_bbox[b].detach()
             scores_b = pred_scores[b].detach()
+
             selected_boxes, selected_scores = select_predictions(
                 boxes=boxes_b,
                 scores=scores_b,
@@ -1009,12 +938,14 @@ def evaluate_detection_one_epoch(
             )
 
             total_selected += int(selected_boxes.shape[0])
+
             for box, score in zip(selected_boxes, selected_scores):
                 pred_records.append({
                     "sample_id": sample_id,
                     "score": float(score.item()),
                     "box": box.detach().float().cpu(),
                 })
+
             sample_id += 1
 
         pbar.set_postfix({
@@ -1022,7 +953,6 @@ def evaluate_detection_one_epoch(
             "pred": len(pred_records),
             "sel/img": f"{total_selected / max(1, sample_id):.2f}",
             "skip_empty": skipped_empty_gt,
-            "q": len(query_texts),
         })
 
     ap50 = evaluate_ap_at_iou(pred_records, gt_by_sample, iou_thr=0.50)
@@ -1033,6 +963,7 @@ def evaluate_detection_one_epoch(
         ap_list.append(ap_t["ap"])
 
     map50_95 = float(np.mean(ap_list)) if len(ap_list) > 0 else 0.0
+
     metrics = {
         "map50": ap50["ap"],
         "map50_95": map50_95,
@@ -1063,34 +994,47 @@ def evaluate_detection_one_epoch(
     return metrics
 
 
-# Metrics logging
+
+# Metrics logging for external watcher
+
 
 def append_jsonl(path, row):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def write_latest_json(path, row):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+
     tmp_path = path + ".tmp"
+
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(row, f, ensure_ascii=False, indent=2)
+
     os.replace(tmp_path, path)
 
 
 def append_csv(path, row):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+
     write_header = not os.path.exists(path)
+
     fieldnames = list(row.keys())
+
     with open(path, "a", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
+
         if write_header:
             writer.writeheader()
+
         writer.writerow(row)
 
 
+
 # Checkpoint
+
 
 def build_checkpoint(
     model,
@@ -1109,16 +1053,20 @@ def build_checkpoint(
 ):
     return {
         "epoch": epoch,
+
         "model": model.state_dict(),
         "ema": ema.ema.state_dict() if ema is not None else None,
         "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict() if scaler is not None else None,
+        "scaler": scaler.state_dict(),
         "scheduler_step": scheduler.step_num,
+
         "best_metric": best_metric,
         "best_metric_name": best_metric_name,
+
         "train_metrics": train_metrics,
         "val_loss_metrics": val_loss_metrics,
         "eval_metrics": eval_metrics,
+
         "train_config": train_config,
         "dynamic_config": dynamic_config,
         "scheduler_config": {
@@ -1129,11 +1077,20 @@ def build_checkpoint(
             "step_num": scheduler.step_num,
             "base_lrs": scheduler.base_lrs,
         },
+
         "rng_state": get_rng_state_dict(),
     }
 
 
-def load_checkpoint(resume_path, model, ema, optimizer, scaler, scheduler, device):
+def load_checkpoint(
+    resume_path,
+    model,
+    ema,
+    optimizer,
+    scaler,
+    scheduler,
+    device,
+):
     ckpt = torch.load(resume_path, map_location=device)
 
     if "model" in ckpt:
@@ -1147,7 +1104,7 @@ def load_checkpoint(resume_path, model, ema, optimizer, scaler, scheduler, devic
     if "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])
 
-    if scaler is not None and ckpt.get("scaler", None) is not None:
+    if "scaler" in ckpt:
         scaler.load_state_dict(ckpt["scaler"])
 
     if "scheduler_step" in ckpt:
@@ -1158,26 +1115,35 @@ def load_checkpoint(resume_path, model, ema, optimizer, scaler, scheduler, devic
 
     start_epoch = int(ckpt.get("epoch", 0)) + 1
     best_metric = float(ckpt.get("best_metric", -1.0))
-    return start_epoch, best_metric
 
+    return start_epoch, best_metric
 
 def collect_query_texts_from_datasets(*datasets):
     texts = set()
+
     for dataset in datasets:
         if dataset is None:
             continue
+
         samples = getattr(dataset, "samples", None)
+
         if samples is None:
             continue
+
         for sample in samples:
             if not isinstance(sample, dict):
                 continue
+
             text = sample.get("query_text", None)
+
             if text is None:
                 continue
+
             text = str(text).strip()
+
             if text:
                 texts.add(text)
+
     return sorted(texts)
 
 
@@ -1205,26 +1171,41 @@ def ensure_precomputed_bert_raw_cache(
         return cache_path
 
     texts = collect_query_texts_from_datasets(*datasets)
+
     if len(texts) == 0:
-        raise RuntimeError("[BERT Precompute] No query_text found from dataloader datasets.")
+        raise RuntimeError(
+            "[BERT Precompute] No query_text found from dataloader datasets."
+        )
 
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+
     print(f"[BERT Precompute] Cache not found. Building: {cache_path}")
     print(f"[BERT Precompute] Unique query texts: {len(texts)}")
 
-    bert = Bert(
+    bert = Bert( 
         out_dim=hidden_dim,
         max_length=max_length,
         freeze_bert=True,
         precomputed_bert_path=None,
     ).to(device)
+
     bert.eval()
 
     cache = {}
+
     with torch.no_grad():
-        for i in tqdm(range(0, len(texts), batch_size), desc="[BERT Precompute]", dynamic_ncols=True):
+        for i in tqdm(
+            range(0, len(texts), batch_size),
+            desc="[BERT Precompute]",
+            dynamic_ncols=True,
+        ):
             batch_texts = texts[i:i + batch_size]
-            encoded = bert.encode_raw(batch_texts, device=device)
+
+            encoded = bert.encode_raw(
+                batch_texts,
+                device=device,
+            )
+
             hidden = encoded["last_hidden_state"].detach().cpu().half()
             mask = encoded["attention_mask"].detach().cpu()
 
@@ -1235,42 +1216,31 @@ def ensure_precomputed_bert_raw_cache(
                 }
 
     tmp_path = cache_path + ".tmp"
-    torch.save({
-        "type": "bert_raw_cache",
-        "max_length": max_length,
-        "hidden_size": int(hidden.shape[-1]),
-        "num_texts": len(cache),
-        "cache": cache,
-    }, tmp_path)
+
+    torch.save(
+        {
+            "type": "bert_raw_cache",
+            "max_length": max_length,
+            "hidden_size": int(hidden.shape[-1]),
+            "num_texts": len(cache),
+            "cache": cache,
+        },
+        tmp_path,
+    )
+
     os.replace(tmp_path, cache_path)
 
     del bert
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     print(f"[BERT Precompute] Done. Saved {len(cache)} texts to {cache_path}")
+
     return cache_path
 
-
-def maybe_compile_model(model, enabled=False, mode="reduce-overhead"):
-    if not enabled:
-        return model
-    if not hasattr(torch, "compile"):
-        print("[Compile] torch.compile not available, skip")
-        return model
-
-    print(f"[Compile] enabled=True, mode={mode}")
-    for name in ["bottle_net", "img_model", "transformer", "head"]:
-        if hasattr(model, name):
-            try:
-                setattr(model, name, torch.compile(getattr(model, name), mode=mode))
-                print(f"[Compile] compiled submodule: {name}")
-            except Exception as exc:
-                print(f"[Compile] skip {name}: {exc}")
-    return model
-
-
 # Main train
+
 
 def train(args):
     set_seed(args.seed)
@@ -1280,18 +1250,11 @@ def train(args):
     else:
         device = torch.device(args.device)
 
-    enable_gpu_perf(
-        allow_tf32=args.allow_tf32,
-        cudnn_benchmark=args.cudnn_benchmark and not args.deterministic,
-        matmul_precision=args.matmul_precision,
-    )
-
-    amp_dtype = get_amp_dtype(args.amp_dtype)
-    amp_enabled = get_amp_enabled(device, args.use_amp, amp_dtype)
-
     dataset_dir = args.dir
+
     train_image_dir = os.path.join(dataset_dir, "images", "train")
     train_anno_dir = os.path.join(dataset_dir, "labels", "train")
+
     val_image_dir = os.path.join(dataset_dir, "images", "val")
     val_anno_dir = os.path.join(dataset_dir, "labels", "val")
 
@@ -1309,14 +1272,14 @@ def train(args):
         image_cache_dir=args.image_cache_dir,
         prebuild_image_cache=args.prebuild_image_cache,
         prefetch_factor=args.prefetch_factor,
-        cache_workers=args.cache_workers,
-        pin_memory=args.pin_memory,
-        query_budget_batching=args.query_budget_batching,
     )
 
     args.precomputed_bert_path = ensure_precomputed_bert_raw_cache(
         cache_path=args.precomputed_bert_path,
-        datasets=[train_loader.dataset, val_loader.dataset],
+        datasets=[
+            train_loader.dataset,
+            val_loader.dataset,
+        ],
         device=device,
         hidden_dim=args.hidden_dim,
         max_length=args.text_max_length,
@@ -1338,10 +1301,6 @@ def train(args):
         precomputed_bert_path=args.precomputed_bert_path,
     ).to(device)
 
-    if args.channels_last:
-        model = model.to(memory_format=torch.channels_last)
-
-    model = maybe_compile_model(model, enabled=args.compile_model, mode=args.compile_mode)
     ema = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
 
     criterion = GroundingLoss(
@@ -1354,20 +1313,22 @@ def train(args):
         aux_positive_label=args.aux_positive_label,
         expand_cost_bbox=args.expand_cost_bbox,
         expand_cost_giou=args.expand_cost_giou,
+
+        # quality-aware confidence
         iou_pos_thr=args.iou_pos_thr,
         quality_min=args.quality_min,
         quality_max=args.quality_max,
         qfl_beta=args.qfl_beta,
+
+        # ranking loss
         rank_margin=args.rank_margin,
         rank_min_quality_gap=args.rank_min_quality_gap,
         rank_max_pairs=args.rank_max_pairs,
     )
 
     total_params, trainable_params = count_parameters(model)
+
     print(f"[Info] Device: {device}")
-    print(f"[Info] AMP: enabled={amp_enabled}, dtype={args.amp_dtype}, scaler={amp_dtype == torch.float16}")
-    print(f"[Info] TF32: allow={args.allow_tf32}, matmul_precision={args.matmul_precision}")
-    print(f"[Info] DataLoader: pin_memory={args.pin_memory}, workers={args.num_workers}, prefetch={args.prefetch_factor}, query_budget={args.query_budget_batching}")
     print(f"[Info] Model parameters: total={total_params}, trainable={trainable_params}")
     print(f"[Info] Train batches: {len(train_loader)}")
     print(f"[Info] Val batches: {len(val_loader)}")
@@ -1383,23 +1344,29 @@ def train(args):
 
     total_steps = args.epochs * len(train_loader)
     warmup_steps = min(args.max_warmup_steps, args.warmup_epochs * len(train_loader))
+
     scheduler = WarmupCosineScheduler(
         optimizer=optimizer,
         warmup_steps=warmup_steps,
         total_steps=total_steps,
         min_lr_ratio=args.min_lr_ratio,
     )
-    scaler = build_scaler(device, amp_enabled=amp_enabled, amp_dtype=amp_dtype)
+
+    scaler = build_scaler(device)
 
     if args.resume_path is not None:
         save_path = os.path.dirname(os.path.abspath(args.resume_path))
     else:
         if args.save_dir is None:
-            save_path = os.path.join("checkpoints", f"results_{time.strftime('%Y-%m-%d_%H-%M-%S')}")
+            save_path = os.path.join(
+                "checkpoints",
+                f"results_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
+            )
         else:
             save_path = args.save_dir
 
     os.makedirs(save_path, exist_ok=True)
+
     epoch_metrics_path = os.path.join(save_path, "metrics_epoch.jsonl")
     step_metrics_path = os.path.join(save_path, "metrics_step.jsonl")
     latest_metrics_path = os.path.join(save_path, "latest_metrics.json")
@@ -1424,6 +1391,7 @@ def train(args):
             scheduler=scheduler,
             device=device,
         )
+
         print(f"[Info] Resume from: {args.resume_path}")
         print(f"[Info] Start epoch: {start_epoch}")
         print(f"[Info] Best {best_metric_name}: {best_metric:.4f}")
@@ -1442,7 +1410,14 @@ def train(args):
     })
 
     for epoch in range(start_epoch, args.epochs + 1):
-        lambda_bbox, lambda_giou, lambda_score = get_loss_weights(epoch=epoch, total_epochs=args.epochs, args=args)
+        lambda_bbox, lambda_giou, lambda_score = get_loss_weights(
+            epoch=epoch,
+            total_epochs=args.epochs,
+            args=args,
+        )
+
+        # 固定 pos_weight。quality-aware score 已經使用 soft target，
+        # 不建議再用 2->8 的 positive weight schedule 拉高 FP。
         pos_weight = float(args.pos_weight)
 
         train_metrics = train_one_epoch(
@@ -1457,12 +1432,6 @@ def train(args):
             epoch=epoch,
             num_epochs=args.epochs,
             use_amp=args.use_amp,
-            amp_dtype=amp_dtype,
-            channels_last=args.channels_last,
-            image_mean=args.image_mean,
-            image_std=args.image_std,
-            profile_steps=args.profile_steps,
-            profile_interval=args.profile_interval,
             grad_clip_norm=args.grad_clip_norm,
             lambda_bbox=lambda_bbox,
             lambda_giou=lambda_giou,
@@ -1485,10 +1454,6 @@ def train(args):
                 device=device,
                 epoch=epoch,
                 use_amp=args.use_amp,
-                amp_dtype=amp_dtype,
-                channels_last=args.channels_last,
-                image_mean=args.image_mean,
-                image_std=args.image_std,
                 lambda_bbox=lambda_bbox,
                 lambda_giou=lambda_giou,
                 lambda_score=lambda_score,
@@ -1510,10 +1475,6 @@ def train(args):
                 device=device,
                 epoch=epoch,
                 use_amp=args.use_amp,
-                amp_dtype=amp_dtype,
-                channels_last=args.channels_last,
-                image_mean=args.image_mean,
-                image_std=args.image_std,
                 score_thr=args.score_thr,
                 top_k=args.top_k,
                 nms_iou_thr=args.nms_iou_thr,
@@ -1527,16 +1488,16 @@ def train(args):
             "lambda_bbox": lambda_bbox,
             "lambda_giou": lambda_giou,
             "lambda_score": lambda_score,
+
+            # lambda_rank 是 ranking 上限；每個 step 實際權重會寫在
+            # step metrics 的 lambda_rank_eff。
             "lambda_rank_max": float(args.lambda_rank),
+
             "pos_weight": pos_weight,
             "quality_warmup_epoch": int(args.quality_warmup_epoch),
             "rank_start_epoch": int(args.rank_start_epoch),
             "rank_warmup_epoch": int(args.rank_warmup_epoch),
             "rank_alpha_min": float(args.rank_alpha_min),
-            "amp_dtype": args.amp_dtype,
-            "allow_tf32": bool(args.allow_tf32),
-            "channels_last": bool(args.channels_last),
-            "query_budget_batching": bool(args.query_budget_batching),
         }
 
         metric_row = {
@@ -1555,7 +1516,9 @@ def train(args):
         write_latest_json(latest_metrics_path, metric_row)
 
         save_metric = float(eval_metrics.get(best_metric_name, -1.0))
+
         is_best = False
+
         if save_metric > best_metric:
             best_metric = save_metric
             is_best = True
@@ -1582,13 +1545,21 @@ def train(args):
         if is_best:
             best_path = os.path.join(save_path, f"best_{best_metric_name}.pt")
             torch.save(ckpt, best_path)
-            tqdm.write(f"Saved best checkpoint: epoch={epoch}, {best_metric_name}={best_metric:.4f}")
+
+            tqdm.write(
+                f"Saved best checkpoint: "
+                f"epoch={epoch}, {best_metric_name}={best_metric:.4f}"
+            )
 
         if args.save_epoch_interval > 0 and epoch % args.save_epoch_interval == 0:
             epoch_path = os.path.join(save_path, f"epoch_{epoch:03d}.pt")
             torch.save(ckpt, epoch_path)
 
-        val_loss_text = f"{val_loss_metrics['val_loss']:.4f}" if "val_loss" in val_loss_metrics else "skip"
+        val_loss_text = (
+            f"{val_loss_metrics['val_loss']:.4f}"
+            if "val_loss" in val_loss_metrics
+            else "skip"
+        )
         tqdm.write(
             f"Epoch [{epoch}/{args.epochs}] "
             f"train_loss={train_metrics.get('train_loss', -1):.4f} "
@@ -1609,6 +1580,7 @@ def train(args):
 
 # Config
 
+
 DEFAULT_MODEL_CFG = {
     "model": {
         "img_in_channels": 1024,
@@ -1621,7 +1593,12 @@ DEFAULT_MODEL_CFG = {
         "fusion_token_num": 16,
         "dropout": 0.1,
         "freeze_bert": True,
-        "precomputed_bert_path": os.path.join(CURRENT_DIR, "cards", "cache", "bert_raw_cache.pt"),
+        "precomputed_bert_path": os.path.join(
+            CURRENT_DIR,
+            "cards",
+            "cache",
+            "bert_raw_cache.pt",
+        ),
     }
 }
 
@@ -1635,12 +1612,8 @@ DEFAULT_TRAIN_CFG = {
         "image_cache_dir": None,
         "prebuild_image_cache": False,
         "prefetch_factor": 4,
-        "cache_workers": 8,
-        "pin_memory": True,
-        "query_budget_batching": True,
-        "image_mean": None,
-        "image_std": None,
     },
+
     "train": {
         "epochs": 300,
         "batch_size": 12,
@@ -1648,21 +1621,13 @@ DEFAULT_TRAIN_CFG = {
         "num_workers": 8,
         "device": "cuda:1",
         "seed": 42,
-        "deterministic": False,
+        "deterministic": True,
         "use_amp": True,
-        "amp_dtype": "bf16",
-        "allow_tf32": True,
-        "cudnn_benchmark": True,
-        "matmul_precision": "high",
-        "channels_last": False,
-        "compile_model": False,
-        "compile_mode": "reduce-overhead",
-        "profile_steps": False,
-        "profile_interval": 50,
         "use_ema": True,
         "ema_decay": 0.999,
         "grad_clip_norm": 1.0,
     },
+
     "optim": {
         "lr_vision": 1e-4,
         "lr_text": 1e-5,
@@ -1672,8 +1637,14 @@ DEFAULT_TRAIN_CFG = {
         "min_lr_ratio": 0.05,
         "max_warmup_steps": 3000,
     },
+
     "loss": {
-        "matcher": {"cost_bbox": 5.0, "cost_giou": 2.0, "cost_score": 0.0},
+        "matcher": {
+            "cost_bbox": 5.0,
+            "cost_giou": 2.0,
+            "cost_score": 0.0,
+        },
+
         "score_sampling": {
             "hard_negative_ratio": 5,
             "positive_ratio": 0.05,
@@ -1682,6 +1653,7 @@ DEFAULT_TRAIN_CFG = {
             "expand_cost_bbox": 5.0,
             "expand_cost_giou": 2.0,
         },
+
         "quality": {
             "iou_pos_thr": 0.15,
             "quality_min": 0.25,
@@ -1689,7 +1661,11 @@ DEFAULT_TRAIN_CFG = {
             "qfl_beta": 2.0,
             "quality_warmup_epoch": 20,
         },
+
         "ranking": {
+            # lambda_rank 是 ranking 上限，不是每個 epoch 的實際權重。
+            # 實際權重由 GroundingLoss 內部的
+            # lambda_rank_eff = lambda_rank * rank_alpha 決定。
             "lambda_rank": 0.10,
             "rank_margin": 0.1,
             "rank_min_quality_gap": 0.1,
@@ -1698,20 +1674,28 @@ DEFAULT_TRAIN_CFG = {
             "rank_warmup_epoch": 30,
             "rank_alpha_min": 1e-4,
         },
+
         "weight": {
             "dynamic": True,
+
             "bbox": 5.0,
             "giou": 2.0,
             "score": 2.0,
+
             "bbox_start": 5.0,
             "bbox_end": 3.0,
             "bbox_decay_until": 0.5,
+
             "score_start": 2.0,
             "score_end": 4.0,
             "score_warm_until": 0.4,
         },
-        "pos_weight": {"value": 1.0},
+
+        "pos_weight": {
+            "value": 1.0,
+        },
     },
+
     "eval": {
         "val_loss_interval": 5,
         "eval_interval": 1,
@@ -1722,6 +1706,7 @@ DEFAULT_TRAIN_CFG = {
         "best_metric": "map50",
         "use_topk_fallback": False,
     },
+
     "log": {
         "save_dir": None,
         "resume_path": None,
@@ -1738,24 +1723,34 @@ def deepcopy_cfg(cfg):
 
 def deep_update(base, override):
     for key, value in override.items():
-        if isinstance(value, dict) and key in base and isinstance(base[key], dict):
+        if (
+            isinstance(value, dict)
+            and key in base
+            and isinstance(base[key], dict)
+        ):
             deep_update(base[key], value)
         else:
             base[key] = value
+
     return base
 
 
 def load_yaml(path):
     if path is None:
         return {}
+
     if not os.path.exists(path):
         raise FileNotFoundError(f"YAML config not found: {path}")
+
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
+
     if cfg is None:
         return {}
+
     if not isinstance(cfg, dict):
         raise ValueError(f"YAML config must be a dict: {path}")
+
     return cfg
 
 
@@ -1774,13 +1769,18 @@ def load_train_config(path):
 def normalize_device(device):
     if device is None:
         return "cuda:0" if torch.cuda.is_available() else "cpu"
+
     if isinstance(device, int):
         return f"cuda:{device}" if torch.cuda.is_available() else "cpu"
+
     if isinstance(device, str):
         device = device.strip()
+
         if device.isdigit():
             return f"cuda:{device}" if torch.cuda.is_available() else "cpu"
+
         return device
+
     raise TypeError(f"Unsupported device type: {type(device)}")
 
 
@@ -1788,12 +1788,14 @@ def set_deterministic(seed=42, deterministic=True):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
     if deterministic:
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
+
         try:
             torch.use_deterministic_algorithms(True, warn_only=True)
         except Exception:
@@ -1805,6 +1807,7 @@ def set_deterministic(seed=42, deterministic=True):
 
 def cfg_to_args(model_cfg_all, train_cfg_all):
     model_cfg = model_cfg_all["model"]
+
     data_cfg = train_cfg_all["data"]
     train_cfg = train_cfg_all["train"]
     optim_cfg = train_cfg_all["optim"]
@@ -1820,6 +1823,7 @@ def cfg_to_args(model_cfg_all, train_cfg_all):
     ranking_cfg = loss_cfg.get("ranking", {})
 
     return SimpleNamespace(
+        # data
         dir=data_cfg["dataset_dir"],
         image_size=data_cfg["image_size"],
         max_text_aug_per_image=data_cfg["max_text_aug_per_image"],
@@ -1827,12 +1831,8 @@ def cfg_to_args(model_cfg_all, train_cfg_all):
         image_cache_dir=data_cfg.get("image_cache_dir", None),
         prebuild_image_cache=data_cfg.get("prebuild_image_cache", False),
         prefetch_factor=data_cfg.get("prefetch_factor", 4),
-        cache_workers=data_cfg.get("cache_workers", 8),
-        pin_memory=data_cfg.get("pin_memory", True),
-        query_budget_batching=data_cfg.get("query_budget_batching", True),
-        image_mean=data_cfg.get("image_mean", None),
-        image_std=data_cfg.get("image_std", None),
 
+        # train
         epochs=train_cfg["epochs"],
         batch_size=train_cfg["batch_size"],
         warmup_epochs=train_cfg["warmup_epochs"],
@@ -1841,19 +1841,11 @@ def cfg_to_args(model_cfg_all, train_cfg_all):
         seed=train_cfg["seed"],
         deterministic=train_cfg["deterministic"],
         use_amp=train_cfg["use_amp"],
-        amp_dtype=train_cfg.get("amp_dtype", "bf16"),
-        allow_tf32=train_cfg.get("allow_tf32", True),
-        cudnn_benchmark=train_cfg.get("cudnn_benchmark", True),
-        matmul_precision=train_cfg.get("matmul_precision", "high"),
-        channels_last=train_cfg.get("channels_last", False),
-        compile_model=train_cfg.get("compile_model", False),
-        compile_mode=train_cfg.get("compile_mode", "reduce-overhead"),
-        profile_steps=train_cfg.get("profile_steps", False),
-        profile_interval=train_cfg.get("profile_interval", 50),
         use_ema=train_cfg["use_ema"],
         ema_decay=train_cfg["ema_decay"],
         grad_clip_norm=train_cfg["grad_clip_norm"],
 
+        # model
         img_in_channels=model_cfg["img_in_channels"],
         hidden_dim=model_cfg["hidden_dim"],
         target_size=model_cfg["image_grid_size"],
@@ -1866,6 +1858,7 @@ def cfg_to_args(model_cfg_all, train_cfg_all):
         freeze_bert=model_cfg["freeze_bert"],
         precomputed_bert_path=model_cfg.get("precomputed_bert_path", None),
 
+        # optimizer
         lr_vision=optim_cfg["lr_vision"],
         lr_text=optim_cfg["lr_text"],
         lr_transformer=optim_cfg["lr_transformer"],
@@ -1874,9 +1867,11 @@ def cfg_to_args(model_cfg_all, train_cfg_all):
         min_lr_ratio=optim_cfg["min_lr_ratio"],
         max_warmup_steps=optim_cfg["max_warmup_steps"],
 
+        # matcher cost
         cost_bbox=matcher_cfg.get("cost_bbox", 5.0),
         cost_giou=matcher_cfg.get("cost_giou", 2.0),
         cost_score=matcher_cfg.get("cost_score", 1.0),
+
         hard_negative_ratio=score_sampling_cfg.get("hard_negative_ratio", 5),
         positive_ratio=score_sampling_cfg.get("positive_ratio", 0.2),
         max_positive_per_gt=score_sampling_cfg.get("max_positive_per_gt", 5),
@@ -1884,24 +1879,32 @@ def cfg_to_args(model_cfg_all, train_cfg_all):
         expand_cost_bbox=score_sampling_cfg.get("expand_cost_bbox", 5.0),
         expand_cost_giou=score_sampling_cfg.get("expand_cost_giou", 2.0),
 
+        # final loss weight
         loss_dynamic=weight_cfg.get("dynamic", True),
+
         lambda_bbox=weight_cfg.get("bbox", 5.0),
         lambda_giou=weight_cfg.get("giou", 2.0),
         lambda_score=weight_cfg.get("score", 1.0),
+
         lambda_bbox_start=weight_cfg.get("bbox_start", 5.0),
         lambda_bbox_end=weight_cfg.get("bbox_end", 3.0),
         lambda_bbox_decay_until=weight_cfg.get("bbox_decay_until", 0.5),
+
         lambda_score_start=weight_cfg.get("score_start", 1.0),
         lambda_score_end=weight_cfg.get("score_end", 2.0),
         lambda_score_warm_until=weight_cfg.get("score_warm_until", 0.4),
+
+        # quality-aware score positive weight
         pos_weight=pos_weight_cfg.get("value", 1.0),
 
+        # quality-aware confidence
         iou_pos_thr=quality_cfg.get("iou_pos_thr", 0.15),
         quality_min=quality_cfg.get("quality_min", 0.25),
         quality_max=quality_cfg.get("quality_max", 1.0),
         qfl_beta=quality_cfg.get("qfl_beta", 2.0),
         quality_warmup_epoch=quality_cfg.get("quality_warmup_epoch", 20),
 
+        # ranking
         lambda_rank=ranking_cfg.get("lambda_rank", 0.10),
         rank_margin=ranking_cfg.get("rank_margin", 0.1),
         rank_min_quality_gap=ranking_cfg.get("rank_min_quality_gap", 0.1),
@@ -1910,6 +1913,7 @@ def cfg_to_args(model_cfg_all, train_cfg_all):
         rank_warmup_epoch=ranking_cfg.get("rank_warmup_epoch", 30),
         rank_alpha_min=ranking_cfg.get("rank_alpha_min", 1e-4),
 
+        # eval
         val_loss_interval=eval_cfg["val_loss_interval"],
         eval_interval=eval_cfg["eval_interval"],
         max_val_batches=eval_cfg["max_val_batches"],
@@ -1919,12 +1923,14 @@ def cfg_to_args(model_cfg_all, train_cfg_all):
         best_metric=eval_cfg["best_metric"],
         use_topk_fallback=eval_cfg.get("use_topk_fallback", True),
 
+        # log
         save_dir=log_cfg["save_dir"],
         resume_path=log_cfg["resume_path"],
         save_epoch_interval=log_cfg["save_epoch_interval"],
         emit_step_metrics=log_cfg["emit_step_metrics"],
         log_interval=log_cfg["log_interval"],
 
+        # raw config
         model_cfg=model_cfg_all,
         train_cfg=train_cfg_all,
     )
@@ -1954,23 +1960,14 @@ def print_config_summary(model_cfg, train_cfg):
         f"enabled={d.get('cache_images', False)}, "
         f"prebuild={d.get('prebuild_image_cache', False)}, "
         f"prefetch={d.get('prefetch_factor', 4)}, "
-        f"cache_workers={d.get('cache_workers', 8)}, "
         f"dir={d.get('image_cache_dir', None)}"
     )
-    print(f"  query budget: {d.get('query_budget_batching', True)}")
-    print(f"  pin memory  : {d.get('pin_memory', True)}")
     print(f"  epochs      : {t['epochs']}")
     print(f"  batch       : {t['batch_size']}")
     print(f"  workers     : {t['num_workers']}")
     print(f"  device      : {t['device']}")
     print(f"  seed        : {t['seed']}")
     print(f"  save_dir    : {log['save_dir']}")
-
-    print(f"  AMP         : use={t.get('use_amp', True)}, dtype={t.get('amp_dtype', 'bf16')}")
-    print(f"  TF32        : allow={t.get('allow_tf32', True)}, matmul={t.get('matmul_precision', 'high')}")
-    print(f"  channels_last: {t.get('channels_last', False)}")
-    print(f"  compile     : {t.get('compile_model', False)}, mode={t.get('compile_mode', 'reduce-overhead')}")
-    print(f"  profile     : {t.get('profile_steps', False)}, interval={t.get('profile_interval', 50)}")
 
     print(f"  hidden_dim  : {m['hidden_dim']}")
     print(f"  grid        : {m['image_grid_size']}x{m['image_grid_size']}")
@@ -1989,6 +1986,7 @@ def print_config_summary(model_cfg, train_cfg):
         f"giou={matcher.get('cost_giou', 2.0)}, "
         f"score={matcher.get('cost_score', 1.0)}"
     )
+
     print(
         f"  loss weight : "
         f"dynamic={weight.get('dynamic', True)}, "
@@ -1998,18 +1996,21 @@ def print_config_summary(model_cfg, train_cfg):
         f"score={weight.get('score_start', weight.get('score', 1.0))}"
         f"->{weight.get('score_end', weight.get('score', 1.0))}"
     )
+
     print(
         f"  score sample: "
         f"pos_ratio={score_sampling.get('positive_ratio', 0.05)}, "
         f"max_pos/gt={score_sampling.get('max_positive_per_gt', 2)}, "
         f"neg:pos={score_sampling.get('hard_negative_ratio', 5)}:1"
     )
+
     print(
         f"  quality     : "
         f"iou_thr={quality.get('iou_pos_thr', 0.15)}, "
         f"q=[{quality.get('quality_min', 0.25)}, {quality.get('quality_max', 1.0)}], "
         f"warmup={quality.get('quality_warmup_epoch', 20)}"
     )
+
     print(
         f"  ranking     : "
         f"lambda_max={ranking.get('lambda_rank', 0.10)}, "
@@ -2017,8 +2018,18 @@ def print_config_summary(model_cfg, train_cfg):
         f"warmup={ranking.get('rank_warmup_epoch', 30)}, "
         f"alpha_min={ranking.get('rank_alpha_min', 1e-4)}"
     )
-    print(f"  pos weight  : {pos_weight.get('value', 1.0)}")
-    print(f"  eval        : metric={e['best_metric']}, score_thr={e['score_thr']}, top_k={e['top_k']}")
+
+    print(
+        f"  pos weight  : "
+        f"{pos_weight.get('value', 1.0)}"
+    )
+
+    print(
+        f"  eval        : "
+        f"metric={e['best_metric']}, "
+        f"score_thr={e['score_thr']}, "
+        f"top_k={e['top_k']}"
+    )
     print("")
 
 
@@ -2042,9 +2053,6 @@ class LightDet:
         image_cache_dir=None,
         prebuild_image_cache=None,
         prefetch_factor=None,
-        cache_workers=None,
-        pin_memory=None,
-        query_budget_batching=None,
         project="runs/train",
         name="exp",
         resume=None,
@@ -2058,15 +2066,8 @@ class LightDet:
         top_k=None,
         nms_iou_thr=None,
         use_topk_fallback=None,
-        amp_dtype=None,
-        allow_tf32=None,
-        cudnn_benchmark=None,
-        matmul_precision=None,
-        channels_last=None,
-        compile_model=None,
-        compile_mode=None,
-        profile_steps=None,
-        profile_interval=None,
+
+        # loss sampling / quality / ranking overrides
         hard_negative_ratio=None,
         positive_ratio=None,
         max_positive_per_gt=None,
@@ -2086,105 +2087,115 @@ class LightDet:
 
         if data is not None:
             train_cfg["data"]["dataset_dir"] = data
+
         if epochs is not None:
             train_cfg["train"]["epochs"] = epochs
+
         if imgsz is not None:
             train_cfg["data"]["image_size"] = imgsz
+
         if batch is not None:
             train_cfg["train"]["batch_size"] = batch
+
         if device is not None:
             train_cfg["train"]["device"] = normalize_device(device)
         else:
-            train_cfg["train"]["device"] = normalize_device(train_cfg["train"]["device"])
+            train_cfg["train"]["device"] = normalize_device(
+                train_cfg["train"]["device"]
+            )
+
         if workers is not None:
             train_cfg["train"]["num_workers"] = workers
+
         if seed is not None:
             train_cfg["train"]["seed"] = seed
+
         if deterministic is not None:
             train_cfg["train"]["deterministic"] = deterministic
+
         if cache_images is not None:
             train_cfg["data"]["cache_images"] = bool(cache_images)
+
         if image_cache_dir is not None:
             train_cfg["data"]["image_cache_dir"] = image_cache_dir
+
         if prebuild_image_cache is not None:
             train_cfg["data"]["prebuild_image_cache"] = bool(prebuild_image_cache)
+
         if prefetch_factor is not None:
             train_cfg["data"]["prefetch_factor"] = int(prefetch_factor)
-        if cache_workers is not None:
-            train_cfg["data"]["cache_workers"] = int(cache_workers)
-        if pin_memory is not None:
-            train_cfg["data"]["pin_memory"] = bool(pin_memory)
-        if query_budget_batching is not None:
-            train_cfg["data"]["query_budget_batching"] = bool(query_budget_batching)
+
         if resume is not None:
             train_cfg["log"]["resume_path"] = resume
+
         if project is not None and name is not None:
             train_cfg["log"]["save_dir"] = os.path.join(project, name)
-
-        if amp_dtype is not None:
-            train_cfg["train"]["amp_dtype"] = str(amp_dtype)
-        if allow_tf32 is not None:
-            train_cfg["train"]["allow_tf32"] = bool(allow_tf32)
-        if cudnn_benchmark is not None:
-            train_cfg["train"]["cudnn_benchmark"] = bool(cudnn_benchmark)
-        if matmul_precision is not None:
-            train_cfg["train"]["matmul_precision"] = str(matmul_precision)
-        if channels_last is not None:
-            train_cfg["train"]["channels_last"] = bool(channels_last)
-        if compile_model is not None:
-            train_cfg["train"]["compile_model"] = bool(compile_model)
-        if compile_mode is not None:
-            train_cfg["train"]["compile_mode"] = str(compile_mode)
-        if profile_steps is not None:
-            train_cfg["train"]["profile_steps"] = bool(profile_steps)
-        if profile_interval is not None:
-            train_cfg["train"]["profile_interval"] = int(profile_interval)
 
         if lr is not None:
             train_cfg["optim"]["lr_vision"] = lr
             train_cfg["optim"]["lr_transformer"] = lr
             train_cfg["optim"]["lr_head"] = lr
+
         if lr_vision is not None:
             train_cfg["optim"]["lr_vision"] = lr_vision
+
         if lr_text is not None:
             train_cfg["optim"]["lr_text"] = lr_text
+
         if lr_transformer is not None:
             train_cfg["optim"]["lr_transformer"] = lr_transformer
+
         if lr_head is not None:
             train_cfg["optim"]["lr_head"] = lr_head
+
         if weight_decay is not None:
             train_cfg["optim"]["weight_decay"] = weight_decay
+
         if score_thr is not None:
             train_cfg["eval"]["score_thr"] = score_thr
+
         if top_k is not None:
             train_cfg["eval"]["top_k"] = top_k
+
         if nms_iou_thr is not None:
             train_cfg["eval"]["nms_iou_thr"] = nms_iou_thr
+
         if use_topk_fallback is not None:
             train_cfg["eval"]["use_topk_fallback"] = bool(use_topk_fallback)
 
         if hard_negative_ratio is not None:
             train_cfg["loss"]["score_sampling"]["hard_negative_ratio"] = hard_negative_ratio
+
         if positive_ratio is not None:
             train_cfg["loss"]["score_sampling"]["positive_ratio"] = positive_ratio
+
         if max_positive_per_gt is not None:
             train_cfg["loss"]["score_sampling"]["max_positive_per_gt"] = max_positive_per_gt
+
         if iou_pos_thr is not None:
             train_cfg["loss"]["quality"]["iou_pos_thr"] = iou_pos_thr
+
         if quality_min is not None:
             train_cfg["loss"]["quality"]["quality_min"] = quality_min
+
         if quality_max is not None:
             train_cfg["loss"]["quality"]["quality_max"] = quality_max
+
         if qfl_beta is not None:
             train_cfg["loss"]["quality"]["qfl_beta"] = qfl_beta
+
         if quality_warmup_epoch is not None:
             train_cfg["loss"]["quality"]["quality_warmup_epoch"] = quality_warmup_epoch
+
         if lambda_rank is not None:
             train_cfg["loss"]["ranking"]["lambda_rank"] = lambda_rank
+
         if rank_start_epoch is not None:
             train_cfg["loss"]["ranking"]["rank_start_epoch"] = rank_start_epoch
+
         if rank_warmup_epoch is not None:
             train_cfg["loss"]["ranking"]["rank_warmup_epoch"] = rank_warmup_epoch
+
         if rank_alpha_min is not None:
             train_cfg["loss"]["ranking"]["rank_alpha_min"] = rank_alpha_min
 
@@ -2192,16 +2203,31 @@ class LightDet:
             unknown = ", ".join(kwargs.keys())
             raise TypeError(f"Unsupported train arguments: {unknown}")
 
-        set_deterministic(seed=train_cfg["train"]["seed"], deterministic=train_cfg["train"]["deterministic"])
-        args = cfg_to_args(model_cfg_all=model_cfg, train_cfg_all=train_cfg)
-        print_config_summary(model_cfg=model_cfg, train_cfg=train_cfg)
+        set_deterministic(
+            seed=train_cfg["train"]["seed"],
+            deterministic=train_cfg["train"]["deterministic"],
+        )
+
+        args = cfg_to_args(
+            model_cfg_all=model_cfg,
+            train_cfg_all=train_cfg,
+        )
+
+        print_config_summary(
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+        )
+
         return train(args)
 
 
 def main():
     os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
-    model = LightDet(model="/home/soic/Desktop/LightDet/units/model/cards/config/model.yaml")
+    model = LightDet(
+        model="/home/soic/Desktop/LightDet/units/model/cards/config/model.yaml"
+    )
+
     model.train(
         cfg="/home/soic/Desktop/LightDet/units/model/cards/config/train.yaml",
         data="/home/soic/Desktop/LightDet/datasets",
@@ -2212,15 +2238,6 @@ def main():
         workers=16,
         seed=45,
         deterministic=False,
-        amp_dtype="bf16",
-        allow_tf32=True,
-        cudnn_benchmark=True,
-        matmul_precision="high",
-        channels_last=False,
-        compile_model=False,
-        profile_steps=False,
-        pin_memory=True,
-        query_budget_batching=True,
         project="runs/train",
         name="lightdet_rank_smooth_010",
     )

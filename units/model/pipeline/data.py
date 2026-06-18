@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 from PIL import Image
 
 import torchvision.transforms.functional as TF
@@ -25,7 +25,7 @@ IMAGE_EXTS = [
     ".webp",
 ]
 
-CACHE_VERSION = "lightdet_uint8_image_cache_v2"
+CACHE_VERSION = "lightdet_uint8_image_cache_v3_gpu_decode"
 
 
 class ShipGroundingDataset(Dataset):
@@ -152,6 +152,12 @@ class ShipGroundingDataset(Dataset):
         if self.image_level_batching:
             return len(self.image_level_indices)
         return len(self.samples)
+
+    def get_query_count_for_dataset_index(self, idx: int) -> int:
+        if self.image_level_batching:
+            anno_idx = self.image_level_indices[int(idx)]
+            return len(self.samples_by_anno[anno_idx])
+        return 1
 
     def find_image_path(self, source_name: str) -> Optional[str]:
         if not isinstance(source_name, str) or not source_name.strip():
@@ -462,10 +468,7 @@ class ShipGroundingDataset(Dataset):
         return TF.pil_to_tensor(image).contiguous()
 
     def decode_cached_image(self, image_u8):
-        if image_u8.dtype == torch.uint8:
-            image = image_u8.float().div_(255.0)
-        else:
-            image = image_u8.float()
+        image = image_u8.float().div_(255.0) if image_u8.dtype == torch.uint8 else image_u8.float()
 
         if self.image_mean is not None and self.image_std is not None:
             image = TF.normalize(
@@ -487,12 +490,7 @@ class ShipGroundingDataset(Dataset):
             "image_size": tuple(self.image_size),
         }
 
-        payload_text = json.dumps(
-            payload,
-            sort_keys=True,
-            ensure_ascii=False,
-        )
-
+        payload_text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha1(payload_text.encode("utf-8")).hexdigest()
 
     def get_image_cache_path(self, image_path: str) -> str:
@@ -519,6 +517,11 @@ class ShipGroundingDataset(Dataset):
         return image_u8, int(orig_w), int(orig_h)
 
     def load_image_cached(self, image_path: str, allow_build: bool = False):
+        """
+        Cache path returns uint8 CHW tensor intentionally.
+        The uint8 -> float32 / normalization step is done in train.py after GPU transfer.
+        This keeps CPU memory and H2D transfer smaller.
+        """
         if not self.cache_images:
             return self.load_image_uncached(image_path)
 
@@ -532,12 +535,17 @@ class ShipGroundingDataset(Dataset):
                     obj = torch.load(cache_path, map_location="cpu")
 
                 if "image_u8" in obj:
-                    image_tensor = self.decode_cached_image(obj["image_u8"])
+                    image_tensor = obj["image_u8"].contiguous()
+                elif "image" in obj:
+                    image = obj["image"]
+                    if image.dtype == torch.uint8:
+                        image_tensor = image.contiguous()
+                    else:
+                        image_tensor = image.clamp(0, 1).mul(255).to(torch.uint8).contiguous()
                 else:
-                    image_tensor = obj["image"].float()
+                    raise KeyError(f"Invalid image cache object keys={list(obj.keys())}")
 
                 orig_h, orig_w = obj["orig_size_hw"]
-
                 return image_tensor, int(orig_w), int(orig_h)
 
             except Exception:
@@ -575,9 +583,7 @@ class ShipGroundingDataset(Dataset):
                 except OSError:
                     pass
 
-        image_tensor = self.decode_cached_image(image_u8)
-
-        return image_tensor, int(orig_w), int(orig_h)
+        return image_u8, int(orig_w), int(orig_h)
 
     def build_image_cache_index(self, verify=False):
         if not self.cache_images:
@@ -607,7 +613,6 @@ class ShipGroundingDataset(Dataset):
             return
 
         self.build_image_cache_index(verify=False)
-
         image_paths = list(dict.fromkeys(self.image_paths))
         total = len(image_paths)
 
@@ -617,12 +622,7 @@ class ShipGroundingDataset(Dataset):
         num_workers = int(num_workers)
 
         if num_workers <= 1:
-            for image_path in tqdm(
-                image_paths,
-                total=total,
-                desc=desc,
-                dynamic_ncols=True,
-            ):
+            for image_path in tqdm(image_paths, total=total, desc=desc, dynamic_ncols=True):
                 _ = self.load_image_cached(image_path, allow_build=True)
             return
 
@@ -633,12 +633,7 @@ class ShipGroundingDataset(Dataset):
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = [executor.submit(worker, image_path) for image_path in image_paths]
 
-            for future in tqdm(
-                as_completed(futures),
-                total=total,
-                desc=desc,
-                dynamic_ncols=True,
-            ):
+            for future in tqdm(as_completed(futures), total=total, desc=desc, dynamic_ncols=True):
                 future.result()
 
     def build_common_image_data(self, anno_idx):
@@ -647,7 +642,6 @@ class ShipGroundingDataset(Dataset):
         anns = self.annos[anno_idx]
 
         image, orig_w, orig_h = self.load_image_cached(image_path)
-
         target_h, target_w = self.image_size
 
         boxes_orig_xyxy, labels = self.load_boxes_and_labels(anns)
@@ -747,10 +741,6 @@ class ShipGroundingDataset(Dataset):
         anno_idx = self.image_level_indices[idx]
         common = self.build_common_image_data(anno_idx)
         sample_infos = self.samples_by_anno[anno_idx]
-
-        if len(sample_infos) > self.queries_per_image:
-            sample_infos = self.rng.sample(sample_infos, k=self.queries_per_image)
-
         queries = [self.build_query_record(common, sample_info) for sample_info in sample_infos]
 
         return {
@@ -766,6 +756,58 @@ class ShipGroundingDataset(Dataset):
         if self.image_level_batching:
             return self.get_image_level_item(idx)
         return self.get_query_item(idx)
+
+
+class QueryBudgetBatchSampler(Sampler):
+    """
+    Image-level sampler that packs image indices until expanded query count approaches query_budget.
+    This avoids the old fixed image-count rule that produced ~42.6 query/step for batch=48.
+    """
+    def __init__(self, dataset, query_budget=48, shuffle=True, drop_last=False, seed=0):
+        self.dataset = dataset
+        self.query_budget = max(1, int(query_budget))
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed or 0)
+        self.epoch = 0
+        self.indices = list(range(len(dataset)))
+        self.query_counts = [
+            max(1, int(dataset.get_query_count_for_dataset_index(i)))
+            for i in self.indices
+        ]
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        order = list(range(len(self.indices)))
+        if self.shuffle:
+            rng = random.Random(self.seed + self.epoch)
+            rng.shuffle(order)
+
+        batch = []
+        qsum = 0
+
+        for pos in order:
+            idx = self.indices[pos]
+            qn = self.query_counts[pos]
+
+            if batch and qsum + qn > self.query_budget:
+                yield batch
+                batch = []
+                qsum = 0
+
+            batch.append(idx)
+            qsum += qn
+
+        if batch and not self.drop_last:
+            yield batch
+
+    def __len__(self):
+        total_queries = sum(self.query_counts)
+        if self.drop_last:
+            return max(1, total_queries // self.query_budget)
+        return max(1, math.ceil(total_queries / self.query_budget))
 
 
 def _collate_query_items(items):
@@ -813,6 +855,9 @@ def _collate_query_items(items):
 
 
 def grounding_collate_fn(batch):
+    if len(batch) > 0 and not batch[0].get("image_level", False):
+        return _collate_query_items(batch)
+
     unique_images = []
     query_texts = []
     image_indices = []
@@ -845,6 +890,8 @@ def grounding_collate_fn(batch):
         "image_paths": image_paths,
         "anno_paths": anno_paths,
         "source_names": source_names,
+        "num_unique_images": len(unique_images),
+        "num_queries": len(query_texts),
     }
 
 
@@ -864,21 +911,35 @@ def build_dataloader(
     pin_memory=True,
     drop_last=False,
     prefetch_factor=4,
+    query_budget_batching=True,
+    random_seed=0,
 ):
     kwargs = {
         "dataset": dataset,
-        "batch_size": batch_size,
-        "shuffle": shuffle,
-        "num_workers": num_workers,
+        "num_workers": int(num_workers),
         "collate_fn": grounding_collate_fn,
-        "pin_memory": pin_memory,
-        "drop_last": drop_last,
+        "pin_memory": bool(pin_memory),
+        "drop_last": False,
     }
 
-    if num_workers > 0:
+    if int(num_workers) > 0:
         kwargs["persistent_workers"] = True
-        kwargs["prefetch_factor"] = prefetch_factor
+        kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
 
+    if getattr(dataset, "image_level_batching", False) and query_budget_batching:
+        batch_sampler = QueryBudgetBatchSampler(
+            dataset=dataset,
+            query_budget=batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            seed=random_seed or 0,
+        )
+        kwargs["batch_sampler"] = batch_sampler
+        return DataLoader(**kwargs)
+
+    kwargs["batch_size"] = int(batch_size)
+    kwargs["shuffle"] = bool(shuffle)
+    kwargs["drop_last"] = bool(drop_last)
     return DataLoader(**kwargs)
 
 
@@ -911,6 +972,7 @@ def build_dataloaders(
     image_cache_dir=None,
     prebuild_image_cache=False,
     cache_workers=8,
+    query_budget_batching=True,
 ):
     train_anno_paths = list_json_files(train_anno_dir)
     val_anno_paths = list_json_files(val_anno_dir)
@@ -954,40 +1016,34 @@ def build_dataloaders(
     )
 
     if prebuild_image_cache:
-        train_dataset.build_image_cache(
-            num_workers=cache_workers,
-            desc="[Image Cache] Train",
-        )
-
-        val_dataset.build_image_cache(
-            num_workers=cache_workers,
-            desc="[Image Cache] Val",
-        )
+        train_dataset.build_image_cache(num_workers=cache_workers, desc="[Image Cache] Train")
+        val_dataset.build_image_cache(num_workers=cache_workers, desc="[Image Cache] Val")
 
     train_dataset.build_image_cache_index(verify=train_dataset.require_cache_ready)
     val_dataset.build_image_cache_index(verify=val_dataset.require_cache_ready)
 
-    train_batch_size = _resolve_loader_batch_size(train_dataset, batch_size)
-    val_batch_size = _resolve_loader_batch_size(val_dataset, batch_size)
-
     train_loader = build_dataloader(
         dataset=train_dataset,
-        batch_size=train_batch_size,
+        batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=True,
         prefetch_factor=prefetch_factor,
+        query_budget_batching=query_budget_batching,
+        random_seed=random_seed or 0,
     )
 
     val_loader = build_dataloader(
         dataset=val_dataset,
-        batch_size=val_batch_size,
+        batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=False,
         prefetch_factor=prefetch_factor,
+        query_budget_batching=query_budget_batching,
+        random_seed=random_seed or 0,
     )
 
     return train_loader, val_loader
@@ -1012,7 +1068,10 @@ if __name__ == "__main__":
     )
 
     batch = next(iter(train_loader))
-
-    print("images:", batch["images"].shape)
-    print("query_texts:", len(batch["query_texts"]))
+    if "unique_images" in batch:
+        print("unique_images:", batch["unique_images"].shape)
+        print("query_texts:", len(batch["query_texts"]))
+    else:
+        print("images:", batch["images"].shape)
+        print("query_texts:", len(batch["query_texts"]))
     print("num targets:", len(batch["targets"]))
