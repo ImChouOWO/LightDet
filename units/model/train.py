@@ -357,8 +357,6 @@ def get_score_logit(outputs):
 
 
 # Train / Val loss
-
-
 def train_one_epoch(
     model,
     ema,
@@ -386,14 +384,12 @@ def train_one_epoch(
 ):
     model.train()
 
-    total_loss_sum = 0.0
-    total_bbox_sum = 0.0
-    total_giou_sum = 0.0
-    total_score_sum = 0.0
-
-    # 這裡累積的是 ranking 真正加進 total loss 的 contribution。
-    total_rank_contrib_sum = 0.0
-    total_rank_raw_sum = 0.0
+    total_loss_sum = torch.zeros((), device=device)
+    total_bbox_sum = torch.zeros((), device=device)
+    total_giou_sum = torch.zeros((), device=device)
+    total_score_sum = torch.zeros((), device=device)
+    total_rank_contrib_sum = torch.zeros((), device=device)
+    total_rank_raw_sum = torch.zeros((), device=device)
 
     amp_enabled = get_amp_enabled(device, use_amp)
 
@@ -402,20 +398,33 @@ def train_one_epoch(
         total=len(train_loader),
         desc=f"Epoch {epoch}/{num_epochs} [Train]",
         dynamic_ncols=True,
-        leave=True
+        leave=True,
     )
 
     for step, batch in pbar:
         global_step = (epoch - 1) * len(train_loader) + step + 1
 
-        images = batch["images"].to(device, non_blocking=True)
+        if "unique_images" in batch:
+            images = batch["unique_images"].to(device, non_blocking=True)
+            image_indices = batch["image_indices"].to(device, non_blocking=True)
+        else:
+            images = batch["images"].to(device, non_blocking=True)
+            image_indices = None
+
         query_texts = batch["query_texts"]
         targets = move_targets_to_device(batch, device)
 
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(device_type=device.type, enabled=amp_enabled):
-            outputs = model(images, query_texts)
+            if image_indices is None:
+                outputs = model(images, query_texts)
+            else:
+                outputs = model(
+                    images,
+                    query_texts,
+                    image_indices=image_indices,
+                )
 
             pred_bbox = outputs["bbox"]
             pred_score_logit = get_score_logit(outputs)
@@ -427,11 +436,7 @@ def train_one_epoch(
                 lambda_bbox=lambda_bbox,
                 lambda_giou=lambda_giou,
                 lambda_score=lambda_score,
-
-                # lambda_rank 是 ranking 上限；實際權重由 loss 內部的
-                # lambda_rank_eff = lambda_rank * rank_alpha 決定。
                 lambda_rank=lambda_rank,
-
                 pos_weight=pos_weight,
                 current_epoch=epoch,
                 quality_warmup_epoch=quality_warmup_epoch,
@@ -464,105 +469,104 @@ def train_one_epoch(
 
         zero = pred_bbox.new_tensor(0.0)
 
-        loss_item = float(loss.item())
-        bbox_item = float(loss_dict["loss_bbox"].item())
-        giou_item = float(loss_dict["loss_giou"].item())
-        score_item = float(loss_dict["loss_score"].item())
+        loss_det = loss.detach()
+        bbox_det = loss_dict["loss_bbox"].detach()
+        giou_det = loss_dict["loss_giou"].detach()
+        score_det = loss_dict["loss_score"].detach()
+        rank_raw_det = loss_dict.get("loss_rank_raw", zero).detach()
+        rank_det = loss_dict.get("loss_rank", zero).detach()
+        rank_contrib_det = loss_dict.get(
+            "loss_rank_contrib",
+            loss_dict.get("loss_rank", zero),
+        ).detach()
 
-        rank_raw_item = float(loss_dict.get("loss_rank_raw", zero).item())
-        rank_item = float(loss_dict.get("loss_rank", zero).item())
-        rank_contrib_item = float(
-            loss_dict.get("loss_rank_contrib", loss_dict.get("loss_rank", zero)).item()
+        total_loss_sum += loss_det
+        total_bbox_sum += bbox_det
+        total_giou_sum += giou_det
+        total_score_sum += score_det
+        total_rank_contrib_sum += rank_contrib_det
+        total_rank_raw_sum += rank_raw_det
+
+        current_lr = scheduler.get_lr()[0]
+        should_log = (
+            (step + 1) % max(1, int(log_interval)) == 0
+            or (step + 1) == len(train_loader)
         )
 
-        rank_alpha_item = float(loss_dict.get("rank_alpha", 0.0))
-        lambda_rank_eff_item = float(loss_dict.get("lambda_rank_eff", 0.0))
-        quality_alpha_item = float(loss_dict.get("quality_alpha", 1.0))
+        if should_log:
+            loss_item = float(loss_det.item())
+            bbox_item = float(bbox_det.item())
+            giou_item = float(giou_det.item())
+            score_item = float(score_det.item())
+            rank_raw_item = float(rank_raw_det.item())
+            rank_item = float(rank_det.item())
+            rank_contrib_item = float(rank_contrib_det.item())
+            avg_loss = float((total_loss_sum / (step + 1)).item())
 
-        score_target_pos_mean = loss_dict.get("score_target_pos_mean", zero)
-        if torch.is_tensor(score_target_pos_mean):
-            score_target_pos_mean = float(score_target_pos_mean.detach().item())
-        else:
-            score_target_pos_mean = float(score_target_pos_mean)
+            rank_alpha_item = float(loss_dict.get("rank_alpha", 0.0))
+            lambda_rank_eff_item = float(loss_dict.get("lambda_rank_eff", 0.0))
+            quality_alpha_item = float(loss_dict.get("quality_alpha", 1.0))
 
-        total_loss_sum += loss_item
-        total_bbox_sum += bbox_item
-        total_giou_sum += giou_item
-        total_score_sum += score_item
-        total_rank_contrib_sum += rank_contrib_item
-        total_rank_raw_sum += rank_raw_item
+            score_target_pos_mean = loss_dict.get("score_target_pos_mean", zero)
+            if torch.is_tensor(score_target_pos_mean):
+                score_target_pos_mean = float(score_target_pos_mean.detach().item())
+            else:
+                score_target_pos_mean = float(score_target_pos_mean)
 
-        avg_loss = total_loss_sum / (step + 1)
-        current_lr = scheduler.get_lr()[0]
-
-        pbar.set_postfix({
-            "lr": f"{current_lr:.2e}",
-            "loss": f"{loss_item:.4f}",
-            "avg": f"{avg_loss:.4f}",
-            "bbox": f"{bbox_item:.4f}",
-            "giou": f"{giou_item:.4f}",
-            "score": f"{score_item:.4f}",
-
-            # ranking 顯示：
-            # rank = 實際加入 total loss 的量
-            # raw  = 原始 pairwise ranking loss
-            # ra   = rank_alpha
-            # lrk  = lambda_rank_eff
-            "rank": f"{rank_contrib_item:.4f}",
-            "raw": f"{rank_raw_item:.4f}",
-            "ra": f"{rank_alpha_item:.4f}",
-            "lrk": f"{lambda_rank_eff_item:.4f}",
-
-            "lb": f"{lambda_bbox:.2f}",
-            "lg": f"{lambda_giou:.2f}",
-            "ls": f"{lambda_score:.2f}",
-            "pw": f"{pos_weight:.2f}",
-        })
-
-        if step_metrics_path is not None and (step + 1) % log_interval == 0:
-            append_jsonl(step_metrics_path, {
-                "type": "step",
-                "time": time.time(),
-                "epoch": epoch,
-                "step": step + 1,
-                "global_step": global_step,
-                "lr": current_lr,
-
-                "train_loss": loss_item,
-                "train_loss_avg": avg_loss,
-
-                "loss_bbox": bbox_item,
-                "loss_giou": giou_item,
-                "loss_score": score_item,
-
-                "loss_rank_raw": rank_raw_item,
-                "loss_rank": rank_item,
-                "loss_rank_contrib": rank_contrib_item,
-
-                "lambda_bbox": lambda_bbox,
-                "lambda_giou": lambda_giou,
-                "lambda_score": lambda_score,
-
-                # lambda_rank 是上限；lambda_rank_eff 才是本 step 實際權重。
-                "lambda_rank_max": float(lambda_rank),
-                "lambda_rank_eff": lambda_rank_eff_item,
-
-                "pos_weight": pos_weight,
-                "quality_alpha": quality_alpha_item,
-                "rank_alpha": rank_alpha_item,
-                "rank_alpha_min": float(rank_alpha_min),
-                "score_target_pos_mean": score_target_pos_mean,
+            pbar.set_postfix({
+                "lr": f"{current_lr:.2e}",
+                "loss": f"{loss_item:.4f}",
+                "avg": f"{avg_loss:.4f}",
+                "bbox": f"{bbox_item:.4f}",
+                "giou": f"{giou_item:.4f}",
+                "score": f"{score_item:.4f}",
+                "rank": f"{rank_contrib_item:.4f}",
+                "raw": f"{rank_raw_item:.4f}",
+                "ra": f"{rank_alpha_item:.4f}",
+                "lrk": f"{lambda_rank_eff_item:.4f}",
+                "lb": f"{lambda_bbox:.2f}",
+                "lg": f"{lambda_giou:.2f}",
+                "ls": f"{lambda_score:.2f}",
+                "pw": f"{pos_weight:.2f}",
             })
+
+            if step_metrics_path is not None:
+                append_jsonl(step_metrics_path, {
+                    "type": "step",
+                    "time": time.time(),
+                    "epoch": epoch,
+                    "step": step + 1,
+                    "global_step": global_step,
+                    "lr": current_lr,
+                    "train_loss": loss_item,
+                    "train_loss_avg": avg_loss,
+                    "loss_bbox": bbox_item,
+                    "loss_giou": giou_item,
+                    "loss_score": score_item,
+                    "loss_rank_raw": rank_raw_item,
+                    "loss_rank": rank_item,
+                    "loss_rank_contrib": rank_contrib_item,
+                    "lambda_bbox": lambda_bbox,
+                    "lambda_giou": lambda_giou,
+                    "lambda_score": lambda_score,
+                    "lambda_rank_max": float(lambda_rank),
+                    "lambda_rank_eff": lambda_rank_eff_item,
+                    "pos_weight": pos_weight,
+                    "quality_alpha": quality_alpha_item,
+                    "rank_alpha": rank_alpha_item,
+                    "rank_alpha_min": float(rank_alpha_min),
+                    "score_target_pos_mean": score_target_pos_mean,
+                })
 
     n = max(1, len(train_loader))
 
     return {
-        "train_loss": total_loss_sum / n,
-        "train_loss_bbox": total_bbox_sum / n,
-        "train_loss_giou": total_giou_sum / n,
-        "train_loss_score": total_score_sum / n,
-        "train_loss_rank_raw": total_rank_raw_sum / n,
-        "train_loss_rank": total_rank_contrib_sum / n,
+        "train_loss": float((total_loss_sum / n).item()),
+        "train_loss_bbox": float((total_bbox_sum / n).item()),
+        "train_loss_giou": float((total_giou_sum / n).item()),
+        "train_loss_score": float((total_score_sum / n).item()),
+        "train_loss_rank_raw": float((total_rank_raw_sum / n).item()),
+        "train_loss_rank": float((total_rank_contrib_sum / n).item()),
     }
 
 
@@ -583,15 +587,16 @@ def validate_loss_one_epoch(
     rank_start_epoch=15,
     rank_warmup_epoch=30,
     rank_alpha_min=1e-4,
+    log_interval=50,
 ):
     model.eval()
 
-    total_loss_sum = 0.0
-    total_bbox_sum = 0.0
-    total_giou_sum = 0.0
-    total_score_sum = 0.0
-    total_rank_contrib_sum = 0.0
-    total_rank_raw_sum = 0.0
+    total_loss_sum = torch.zeros((), device=device)
+    total_bbox_sum = torch.zeros((), device=device)
+    total_giou_sum = torch.zeros((), device=device)
+    total_score_sum = torch.zeros((), device=device)
+    total_rank_contrib_sum = torch.zeros((), device=device)
+    total_rank_raw_sum = torch.zeros((), device=device)
 
     amp_enabled = get_amp_enabled(device, use_amp)
 
@@ -604,12 +609,25 @@ def validate_loss_one_epoch(
     )
 
     for step, batch in pbar:
-        images = batch["images"].to(device, non_blocking=True)
+        if "unique_images" in batch:
+            images = batch["unique_images"].to(device, non_blocking=True)
+            image_indices = batch["image_indices"].to(device, non_blocking=True)
+        else:
+            images = batch["images"].to(device, non_blocking=True)
+            image_indices = None
+
         query_texts = batch["query_texts"]
         targets = move_targets_to_device(batch, device)
 
         with autocast(device_type=device.type, enabled=amp_enabled):
-            outputs = model(images, query_texts)
+            if image_indices is None:
+                outputs = model(images, query_texts)
+            else:
+                outputs = model(
+                    images,
+                    query_texts,
+                    image_indices=image_indices,
+                )
 
             pred_bbox = outputs["bbox"]
             pred_score_logit = get_score_logit(outputs)
@@ -632,48 +650,57 @@ def validate_loss_one_epoch(
 
         zero = pred_bbox.new_tensor(0.0)
 
-        loss_item = float(loss.item())
-        bbox_item = float(loss_dict["loss_bbox"].item())
-        giou_item = float(loss_dict["loss_giou"].item())
-        score_item = float(loss_dict["loss_score"].item())
+        loss_det = loss.detach()
+        bbox_det = loss_dict["loss_bbox"].detach()
+        giou_det = loss_dict["loss_giou"].detach()
+        score_det = loss_dict["loss_score"].detach()
+        rank_raw_det = loss_dict.get("loss_rank_raw", zero).detach()
+        rank_contrib_det = loss_dict.get(
+            "loss_rank_contrib",
+            loss_dict.get("loss_rank", zero),
+        ).detach()
 
-        rank_raw_item = float(loss_dict.get("loss_rank_raw", zero).item())
-        rank_contrib_item = float(
-            loss_dict.get("loss_rank_contrib", loss_dict.get("loss_rank", zero)).item()
-        )
-        rank_alpha_item = float(loss_dict.get("rank_alpha", 0.0))
-        lambda_rank_eff_item = float(loss_dict.get("lambda_rank_eff", 0.0))
+        total_loss_sum += loss_det
+        total_bbox_sum += bbox_det
+        total_giou_sum += giou_det
+        total_score_sum += score_det
+        total_rank_contrib_sum += rank_contrib_det
+        total_rank_raw_sum += rank_raw_det
 
-        total_loss_sum += loss_item
-        total_bbox_sum += bbox_item
-        total_giou_sum += giou_item
-        total_score_sum += score_item
-        total_rank_contrib_sum += rank_contrib_item
-        total_rank_raw_sum += rank_raw_item
+        should_log = (step + 1) % max(1, int(log_interval)) == 0 or (step + 1) == len(val_loader)
 
-        avg_loss = total_loss_sum / (step + 1)
+        if should_log:
+            loss_item = float(loss_det.item())
+            bbox_item = float(bbox_det.item())
+            giou_item = float(giou_det.item())
+            score_item = float(score_det.item())
+            rank_raw_item = float(rank_raw_det.item())
+            rank_contrib_item = float(rank_contrib_det.item())
+            avg_loss = float((total_loss_sum / (step + 1)).item())
+            rank_alpha_item = float(loss_dict.get("rank_alpha", 0.0))
+            lambda_rank_eff_item = float(loss_dict.get("lambda_rank_eff", 0.0))
 
-        pbar.set_postfix({
-            "val_loss": f"{loss_item:.4f}",
-            "avg": f"{avg_loss:.4f}",
-            "bbox": f"{bbox_item:.4f}",
-            "giou": f"{giou_item:.4f}",
-            "score": f"{score_item:.4f}",
-            "rank": f"{rank_contrib_item:.4f}",
-            "raw": f"{rank_raw_item:.4f}",
-            "ra": f"{rank_alpha_item:.4f}",
-            "lrk": f"{lambda_rank_eff_item:.4f}",
-        })
+            pbar.set_postfix({
+                "val_loss": f"{loss_item:.4f}",
+                "avg": f"{avg_loss:.4f}",
+                "bbox": f"{bbox_item:.4f}",
+                "giou": f"{giou_item:.4f}",
+                "score": f"{score_item:.4f}",
+                "rank": f"{rank_contrib_item:.4f}",
+                "raw": f"{rank_raw_item:.4f}",
+                "ra": f"{rank_alpha_item:.4f}",
+                "lrk": f"{lambda_rank_eff_item:.4f}",
+            })
 
     n = max(1, len(val_loader))
 
     return {
-        "val_loss": total_loss_sum / n,
-        "val_loss_bbox": total_bbox_sum / n,
-        "val_loss_giou": total_giou_sum / n,
-        "val_loss_score": total_score_sum / n,
-        "val_loss_rank_raw": total_rank_raw_sum / n,
-        "val_loss_rank": total_rank_contrib_sum / n,
+        "val_loss": float((total_loss_sum / n).item()),
+        "val_loss_bbox": float((total_bbox_sum / n).item()),
+        "val_loss_giou": float((total_giou_sum / n).item()),
+        "val_loss_score": float((total_score_sum / n).item()),
+        "val_loss_rank_raw": float((total_rank_raw_sum / n).item()),
+        "val_loss_rank": float((total_rank_contrib_sum / n).item()),
     }
 
 
@@ -902,12 +929,25 @@ def evaluate_detection_one_epoch(
         if max_val_batches is not None and step >= max_val_batches:
             break
 
-        images = batch["images"].to(device, non_blocking=True)
+        if "unique_images" in batch:
+            images = batch["unique_images"].to(device, non_blocking=True)
+            image_indices = batch["image_indices"].to(device, non_blocking=True)
+        else:
+            images = batch["images"].to(device, non_blocking=True)
+            image_indices = None
+
         query_texts = batch["query_texts"]
         targets = move_targets_to_device(batch, device)
 
         with autocast(device_type=device.type, enabled=amp_enabled):
-            outputs = model(images, query_texts)
+            if image_indices is None:
+                outputs = model(images, query_texts)
+            else:
+                outputs = model(
+                    images,
+                    query_texts,
+                    image_indices=image_indices,
+                )
 
         pred_bbox = outputs["bbox"]
         pred_score_logit = get_score_logit(outputs)
@@ -1265,6 +1305,11 @@ def train(args):
         num_workers=args.num_workers,
         max_text_aug_per_image=args.max_text_aug_per_image,
         random_seed=args.seed,
+        cache_images=args.cache_images,
+        image_cache_dir=args.image_cache_dir,
+        prebuild_image_cache=args.prebuild_image_cache,
+        prefetch_factor=args.prefetch_factor,
+        cache_workers=args.cache_workers,
     )
 
     args.precomputed_bert_path = ensure_precomputed_bert_raw_cache(
@@ -1456,6 +1501,7 @@ def train(args):
                 rank_start_epoch=args.rank_start_epoch,
                 rank_warmup_epoch=args.rank_warmup_epoch,
                 rank_alpha_min=args.rank_alpha_min,
+                log_interval=args.log_interval,
             )
         else:
             val_loss_metrics = {}
@@ -1600,6 +1646,11 @@ DEFAULT_TRAIN_CFG = {
         "dataset_dir": os.path.join(PROJECT_ROOT, "datasets"),
         "image_size": 640,
         "max_text_aug_per_image": 1,
+        "cache_images": False,
+        "image_cache_dir": None,
+        "prebuild_image_cache": False,
+        "prefetch_factor": 4,
+        "cache_workers": 8,
     },
 
     "train": {
@@ -1685,7 +1736,7 @@ DEFAULT_TRAIN_CFG = {
     },
 
     "eval": {
-        "val_loss_interval": 1,
+        "val_loss_interval": 5,
         "eval_interval": 1,
         "max_val_batches": 320,
         "score_thr": 0.25,
@@ -1699,8 +1750,8 @@ DEFAULT_TRAIN_CFG = {
         "save_dir": None,
         "resume_path": None,
         "save_epoch_interval": 50,
-        "emit_step_metrics": True,
-        "log_interval": 10,
+        "emit_step_metrics": False,
+        "log_interval": 50,
     },
 }
 
@@ -1815,6 +1866,11 @@ def cfg_to_args(model_cfg_all, train_cfg_all):
         dir=data_cfg["dataset_dir"],
         image_size=data_cfg["image_size"],
         max_text_aug_per_image=data_cfg["max_text_aug_per_image"],
+        cache_images=data_cfg.get("cache_images", False),
+        image_cache_dir=data_cfg.get("image_cache_dir", None),
+        prebuild_image_cache=data_cfg.get("prebuild_image_cache", False),
+        prefetch_factor=data_cfg.get("prefetch_factor", 4),
+        cache_workers=data_cfg.get("cache_workers", 8),
 
         # train
         epochs=train_cfg["epochs"],
@@ -1939,6 +1995,14 @@ def print_config_summary(model_cfg, train_cfg):
     print("\n[LightDet] Training config")
     print(f"  dataset     : {d['dataset_dir']}")
     print(f"  image_size  : {d['image_size']}")
+    print(
+        f"  image cache : "
+        f"enabled={d.get('cache_images', False)}, "
+        f"prebuild={d.get('prebuild_image_cache', False)}, "
+        f"prefetch={d.get('prefetch_factor', 4)}, "
+        f"cache_workers={d.get('cache_workers', 8)}, "
+        f"dir={d.get('image_cache_dir', None)}"
+    )
     print(f"  epochs      : {t['epochs']}")
     print(f"  batch       : {t['batch_size']}")
     print(f"  workers     : {t['num_workers']}")
@@ -2026,6 +2090,11 @@ class LightDet:
         workers=None,
         seed=None,
         deterministic=None,
+        cache_images=None,
+        image_cache_dir=None,
+        prebuild_image_cache=None,
+        prefetch_factor=None,
+        cache_workers=None,
         project="runs/train",
         name="exp",
         resume=None,
@@ -2085,6 +2154,21 @@ class LightDet:
 
         if deterministic is not None:
             train_cfg["train"]["deterministic"] = deterministic
+
+        if cache_images is not None:
+            train_cfg["data"]["cache_images"] = bool(cache_images)
+
+        if image_cache_dir is not None:
+            train_cfg["data"]["image_cache_dir"] = image_cache_dir
+
+        if prebuild_image_cache is not None:
+            train_cfg["data"]["prebuild_image_cache"] = bool(prebuild_image_cache)
+
+        if prefetch_factor is not None:
+            train_cfg["data"]["prefetch_factor"] = int(prefetch_factor)
+
+        if cache_workers is not None:
+            train_cfg["data"]["cache_workers"] = int(cache_workers)
 
         if resume is not None:
             train_cfg["log"]["resume_path"] = resume
@@ -2194,9 +2278,9 @@ def main():
         data="/home/soic/Desktop/LightDet/datasets",
         epochs=300,
         imgsz=512,
-        batch=24,
+        batch=48,
         device=1,
-        workers=12,
+        workers=16,
         seed=45,
         deterministic=False,
         project="runs/train",

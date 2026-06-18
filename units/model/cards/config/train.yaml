@@ -7,6 +7,12 @@ data:
   image_size: 512
   max_text_aug_per_image: 1
 
+  cache_images: true
+  image_cache_dir: /home/soic/Desktop/LightDet/datasets/.cache/images_512_uint8
+  prebuild_image_cache: true
+  prefetch_factor: 4
+  cache_workers: 8
+
 train:
   epochs: 300
   batch_size: 24

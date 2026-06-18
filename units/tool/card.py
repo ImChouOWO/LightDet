@@ -746,11 +746,16 @@ class VisionTextModel(nn.Module):
 
         self.num_image = target_size[0] * target_size[1]
         self.num_text = text_max_length
-        self.bottle_net = BottleNet(in_channels=3, out_channels=img_in_channels)
+
+        self.bottle_net = BottleNet(
+            in_channels=3,
+            out_channels=img_in_channels,
+        )
+
         self.img_model = BackBone(
             in_channels=img_in_channels,
             out_channels=hidden_dim,
-            target_size=target_size
+            target_size=target_size,
         )
 
         self.text_model = Bert(
@@ -766,19 +771,35 @@ class VisionTextModel(nn.Module):
             num_heads=num_heads,
             num_layers=num_layers,
             mlp_ratio=mlp_ratio,
-            dropout=dropout
+            dropout=dropout,
         )
 
         self.head = DenseHead(
             hidden_dim=hidden_dim,
             num_fusion=fusion_token_num,
             num_image=self.num_image,
-            num_text=self.num_text
+            num_text=self.num_text,
         )
 
-    def forward(self, img, texts):
+    def forward(self, img, texts, image_indices=None):
         img = self.bottle_net(img)
         img_token = self.img_model(img)
+
+        if image_indices is not None:
+            if not torch.is_tensor(image_indices):
+                image_indices = torch.tensor(
+                    image_indices,
+                    dtype=torch.long,
+                    device=img_token.device,
+                )
+            else:
+                image_indices = image_indices.to(
+                    device=img_token.device,
+                    dtype=torch.long,
+                    non_blocking=True,
+                )
+
+            img_token = img_token.index_select(0, image_indices)
 
         text_out = self.text_model(texts)
         text_token = text_out["text_tokens"]
@@ -787,7 +808,7 @@ class VisionTextModel(nn.Module):
         transformer_out = self.transformer(
             img_token,
             text_token,
-            text_mask
+            text_mask,
         )
 
         bbox, score_logit = self.head(transformer_out)
@@ -798,7 +819,7 @@ class VisionTextModel(nn.Module):
             "transformer_out": transformer_out,
             "img_token": img_token,
             "text_token": text_token,
-            "text_mask": text_mask
+            "text_mask": text_mask,
         }
     
 if __name__ == "__main__":

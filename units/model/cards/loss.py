@@ -13,15 +13,10 @@ def smoothstep(x):
     """
     平滑 warmup 曲線。
 
-    特性：
-        x = 0 -> 0
-        x = 1 -> 1
-        前期成長慢
-        中期平滑上升
-        後期趨緩
+    x = 0 -> 0
+    x = 1 -> 1
 
-    比線性 warmup 更適合 ranking loss，
-    因為 ranking 不應該太早強烈干擾 bbox / score 主目標。
+    用於 ranking loss，避免 ranking 太早強烈干擾 bbox / score 主目標。
     """
     x = clamp01(x)
     return x * x * (3.0 - 2.0 * x)
@@ -59,6 +54,11 @@ def box_iou(boxes1, boxes2):
 
 
 def generalized_box_iou(boxes1, boxes2):
+    """
+    boxes1: [N, 4]
+    boxes2: [M, 4]
+    return: [N, M]
+    """
     if boxes1.numel() == 0 or boxes2.numel() == 0:
         return boxes1.new_zeros((boxes1.shape[0], boxes2.shape[0]))
 
@@ -98,7 +98,7 @@ def bounded_iou_quality(
         target = 0.0
 
     IoU >= iou_pos_thr:
-        target 會落在 [quality_min, quality_max]
+        target 落在 [quality_min, quality_max]
     """
     quality = torch.zeros_like(iou)
 
@@ -130,6 +130,16 @@ class GreedyMatcher:
 
     @torch.no_grad()
     def greedy_match(self, cost):
+        """
+        GPU greedy matching。
+
+        原本版本：
+            torch.argsort(...).detach().cpu().tolist()
+
+        會造成 GPU -> CPU 同步，batch 大時會讓 GPU utilization 掉到很低。
+
+        這版保留 greedy matching 行為，但全程維持在 cost.device。
+        """
         num_pred, num_gt = cost.shape
         device = cost.device
 
@@ -139,34 +149,25 @@ class GreedyMatcher:
                 torch.empty(0, dtype=torch.long, device=device),
             )
 
-        flat_order = torch.argsort(cost.reshape(-1)).detach().cpu().tolist()
+        max_match = min(num_pred, num_gt)
 
-        used_pred = set()
-        used_gt = set()
+        cost_work = cost.float().clone()
+        inf = torch.finfo(cost_work.dtype).max
 
         pred_indices = []
         gt_indices = []
 
-        max_match = min(num_pred, num_gt)
+        for _ in range(max_match):
+            flat_idx = torch.argmin(cost_work.reshape(-1))
 
-        for flat_idx in flat_order:
-            pred_idx = flat_idx // num_gt
+            pred_idx = torch.div(flat_idx, num_gt, rounding_mode="floor")
             gt_idx = flat_idx % num_gt
-
-            if pred_idx in used_pred:
-                continue
-
-            if gt_idx in used_gt:
-                continue
-
-            used_pred.add(pred_idx)
-            used_gt.add(gt_idx)
 
             pred_indices.append(pred_idx)
             gt_indices.append(gt_idx)
 
-            if len(pred_indices) >= max_match:
-                break
+            cost_work[pred_idx, :] = inf
+            cost_work[:, gt_idx] = inf
 
         if len(pred_indices) == 0:
             return (
@@ -175,8 +176,8 @@ class GreedyMatcher:
             )
 
         return (
-            torch.tensor(pred_indices, dtype=torch.long, device=device),
-            torch.tensor(gt_indices, dtype=torch.long, device=device),
+            torch.stack(pred_indices).long(),
+            torch.stack(gt_indices).long(),
         )
 
     @torch.no_grad()
@@ -195,6 +196,7 @@ class GreedyMatcher:
             tgt_bbox = targets[b]["boxes"].to(
                 device=pred_bbox.device,
                 dtype=pred_bbox.dtype,
+                non_blocking=True,
             )
 
             if tgt_bbox.numel() == 0:
@@ -228,9 +230,7 @@ class GreedyMatcher:
                 cost_score = -out_score[:, None]
                 cost = cost + self.cost_score * cost_score
 
-            cost = cost.float()
-
-            pred_idx, gt_idx = self.greedy_match(cost)
+            pred_idx, gt_idx = self.greedy_match(cost.float())
 
             indices.append((
                 pred_idx,
@@ -302,24 +302,18 @@ class GroundingLoss(nn.Module):
         rank_alpha_min=1e-4,
     ):
         """
-        控制兩件事：
+        quality_alpha:
+            score target 從 objectness target 緩慢轉成 IoU quality target。
 
-        1. quality_alpha:
-           score target 從 objectness target 緩慢轉成 IoU quality target。
-
-        2. rank_alpha:
-           ranking loss 從 0 緩慢成長到 1。
+        rank_alpha:
+            ranking loss 從 0 緩慢成長到 1。
 
         注意：
             lambda_rank 是上限。
-            實際 ranking 權重為：
+            實際 ranking 權重是：
 
                 lambda_rank_eff = lambda_rank * rank_alpha
         """
-
-        # quality_alpha 仍使用線性 warmup。
-        # 原因：score target 從 objectness -> quality 本身是主 score 目標的一部分，
-        # 不需要像 ranking 那麼慢。
         if quality_alpha is None:
             if current_epoch is None:
                 quality_alpha = 1.0
@@ -332,7 +326,6 @@ class GroundingLoss(nn.Module):
                     ),
                 )
 
-        # rank_alpha 使用 smoothstep。
         if rank_alpha is None:
             if current_epoch is None:
                 rank_alpha = 1.0
@@ -346,8 +339,6 @@ class GroundingLoss(nn.Module):
 
                     curve = smoothstep(t)
 
-                    # rank_start_epoch 當下給一個極小值，
-                    # 避免從完全 0 突然切到非 0。
                     rank_alpha = (
                         float(rank_alpha_min)
                         +
@@ -372,13 +363,13 @@ class GroundingLoss(nn.Module):
             1,
             int(round(N * self.positive_ratio)),
         )
-
         positive_budget = min(positive_budget, N)
 
         for b in range(B):
             tgt_bbox = targets[b]["boxes"].to(
                 device=pred_bbox.device,
                 dtype=pred_bbox.dtype,
+                non_blocking=True,
             )
 
             num_gt = int(tgt_bbox.shape[0])
@@ -386,6 +377,8 @@ class GroundingLoss(nn.Module):
             if num_gt == 0:
                 continue
 
+            # 這裡仍有 .item()，但相較原 matcher 的 .cpu().tolist() 成本小很多。
+            # 若後續仍瓶頸，再把這段完全向量化。
             current_pos = int((score_target[b, :, 0] > 0.0).sum().item())
             remaining_budget = positive_budget - current_pos
 
@@ -661,15 +654,13 @@ class GroundingLoss(nn.Module):
         quality_alpha=None,
         rank_alpha=None,
 
-        # 建議比原本更慢
         quality_warmup_epoch=20,
         rank_start_epoch=15,
         rank_warmup_epoch=30,
         rank_alpha_min=1e-4,
 
-        # 注意：
-        # 這裡的 lambda_rank 是 ranking 上限。
-        # 實際權重是 lambda_rank * rank_alpha。
+        # lambda_rank 是 ranking 上限。
+        # 實際 ranking 權重是 lambda_rank * rank_alpha。
         lambda_rank=0.15,
     ):
         quality_alpha, rank_alpha = self.resolve_epoch_alpha(
@@ -701,6 +692,7 @@ class GroundingLoss(nn.Module):
             tgt_bbox = targets[b]["boxes"].to(
                 device=pred_bbox.device,
                 dtype=pred_bbox.dtype,
+                non_blocking=True,
             )
 
             matched_pred = pred_bbox[b, pred_idx]
@@ -769,22 +761,22 @@ class GroundingLoss(nn.Module):
             qfl_beta=self.qfl_beta,
         )
 
-        loss_rank_raw = self.pairwise_quality_rank_loss(
-            pred_score_logit=pred_score_logit,
-            score_target=score_target,
-            margin=self.rank_margin,
-            min_quality_gap=self.rank_min_quality_gap,
-        )
-
-        # ranking 實際影響力：
-        # lambda_rank_eff = lambda_rank * rank_alpha
         lambda_rank_eff = float(lambda_rank) * float(rank_alpha)
 
-        # loss_rank_raw      : ranking 原始值
-        # loss_rank          : rank_alpha 加權後，但尚未乘 lambda_rank
-        # loss_rank_contrib  : 實際加入 total loss 的 ranking contribution
-        loss_rank = float(rank_alpha) * loss_rank_raw
-        loss_rank_contrib = float(lambda_rank) * loss_rank
+        if lambda_rank_eff <= 0.0:
+            loss_rank_raw = pred_score_logit.new_tensor(0.0)
+            loss_rank = pred_score_logit.new_tensor(0.0)
+            loss_rank_contrib = pred_score_logit.new_tensor(0.0)
+        else:
+            loss_rank_raw = self.pairwise_quality_rank_loss(
+                pred_score_logit=pred_score_logit,
+                score_target=score_target,
+                margin=self.rank_margin,
+                min_quality_gap=self.rank_min_quality_gap,
+            )
+
+            loss_rank = float(rank_alpha) * loss_rank_raw
+            loss_rank_contrib = float(lambda_rank) * loss_rank
 
         loss_main = (
             float(lambda_bbox) * loss_bbox
