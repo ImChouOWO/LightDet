@@ -113,7 +113,7 @@ eval:
   eval_interval: 1
   max_val_batches: null
   score_thr: 0.001
-  top_k: 100
+  top_k: 20
   nms_iou_thr: 0.5
   best_metric: map50_95
   use_topk_fallback: false
