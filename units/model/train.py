@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# LightDet optimized train.py v3: uint8 GPU decode + image-level batching
+# LightDet optimized train.py v4: compact IPC + stable high-throughput loaders
 
 from collections import defaultdict
 from types import SimpleNamespace
@@ -13,6 +13,7 @@ import json
 import math
 import os
 import random
+import resource
 import sys
 import time
 
@@ -22,6 +23,7 @@ import torch.multiprocessing as mp
 import yaml
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
+from torch.utils.data import DataLoader
 from torchvision.ops import batched_nms
 from tqdm import tqdm
 
@@ -35,20 +37,44 @@ for path in [PROJECT_ROOT, UNITS_DIR, CURRENT_DIR]:
         sys.path.insert(0, path)
 
 from units.tool.card import VisionTextModel, Bert
-from units.model.pipeline.data import build_dataloaders
+from units.model.pipeline.data import (
+    QueryBudgetBatchSampler,
+    build_dataloaders,
+    grounding_collate_fn,
+)
 from units.model.cards.loss import GroundingLoss
 
 
-# file_descriptor 通常比 file_system 有較低 IPC 開銷；若平台不支援再退回。
+# 此資料集的每批資料包含多個 query target。file_descriptor 會為每個
+# shared tensor 消耗檔案描述符，容易在 Train/Val worker pools 並存時觸發
+# Errno 24。file_system 使用共享記憶體名稱傳遞 storage，較適合此 workload。
 try:
-    mp.set_sharing_strategy("file_descriptor")
-except (RuntimeError, ValueError):
     mp.set_sharing_strategy("file_system")
+except (RuntimeError, ValueError):
+    pass
 
 
 # -----------------------------------------------------------------------------
 # Basic utilities
 # -----------------------------------------------------------------------------
+
+
+def configure_process_file_limit(target_soft_limit: int = 65536) -> Tuple[int, int]:
+    """Raise RLIMIT_NOFILE when the host allows it and return effective limits."""
+    try:
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = max(int(soft_limit), int(target_soft_limit))
+
+        if hard_limit != resource.RLIM_INFINITY:
+            target = min(target, int(hard_limit))
+
+        if target > soft_limit:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard_limit))
+
+        effective_soft, effective_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        return int(effective_soft), int(effective_hard)
+    except (OSError, ValueError, AttributeError):
+        return -1, -1
 
 
 def set_seed(seed: Optional[int]) -> None:
@@ -396,14 +422,23 @@ def run_startup_smoke_test(
     """
     print("[Startup Check] Running one real-batch forward/loss smoke test...")
 
-    iterator = iter(train_loader)
+    # Build one batch synchronously from dataset indices. This avoids spawning
+    # the persistent Train worker pool before the real epoch begins.
     try:
-        batch = next(iterator)
+        first_indices = next(iter(train_loader.batch_sampler))
     except StopIteration as error:
         raise RuntimeError("Training DataLoader is empty") from error
-    finally:
-        # 不保留 iterator，正式 epoch 會建立新的 iterator。
-        iterator = None
+
+    if isinstance(first_indices, torch.Tensor):
+        first_indices = first_indices.tolist()
+    elif isinstance(first_indices, int):
+        first_indices = [first_indices]
+    else:
+        first_indices = list(first_indices)
+
+    items = [train_loader.dataset[int(index)] for index in first_indices]
+    collate_fn = train_loader.collate_fn or compact_grounding_collate_fn
+    batch = collate_fn(items)
 
     images, query_texts, image_indices = prepare_model_batch(
         batch=batch,
@@ -801,7 +836,80 @@ def box_iou_xyxy(
     return intersection / union.clamp(min=eps)
 
 
+def compact_grounding_collate_fn(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Collate through the project implementation, then pack all GT boxes into one
+    contiguous tensor. GroundingLoss and evaluation only consume target["boxes"].
+
+    This changes IPC from dozens/hundreds of small target storages per batch to:
+      - one image tensor
+      - one image_indices tensor
+      - one flat GT box tensor
+      - one offsets tensor
+    """
+    batch = grounding_collate_fn(items)
+    targets = batch.pop("targets", [])
+
+    box_tensors: List[torch.Tensor] = []
+    offsets = [0]
+
+    for target in targets:
+        boxes = target.get("boxes")
+        if boxes is None:
+            raise KeyError("Each target must contain 'boxes'")
+        if not torch.is_tensor(boxes):
+            boxes = torch.as_tensor(boxes, dtype=torch.float32)
+        boxes = boxes.to(dtype=torch.float32).reshape(-1, 4).contiguous()
+        box_tensors.append(boxes)
+        offsets.append(offsets[-1] + int(boxes.shape[0]))
+
+    if box_tensors and offsets[-1] > 0:
+        flat_boxes = torch.cat(box_tensors, dim=0).contiguous()
+    else:
+        flat_boxes = torch.empty((0, 4), dtype=torch.float32)
+
+    batch["target_boxes_flat"] = flat_boxes
+    batch["target_offsets"] = torch.tensor(offsets, dtype=torch.int64)
+    batch["num_targets"] = len(targets)
+
+    # Query-level collate contains several duplicate tensor lists. They are not
+    # consumed by train.py and substantially increase shared-memory objects.
+    for key in (
+        "boxes_per_image",
+        "boxes_pixel_per_image",
+        "labels_per_image",
+        "target_boxes_per_image",
+        "target_boxes_pixel_per_image",
+        "target_labels_per_image",
+        "image_sizes",
+        "orig_sizes",
+        "obj_indices",
+    ):
+        batch.pop(key, None)
+
+    return batch
+
+
+def seed_dataloader_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 def get_raw_targets(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if "target_boxes_flat" in batch and "target_offsets" in batch:
+        flat_boxes = batch["target_boxes_flat"]
+        offsets_tensor = batch["target_offsets"]
+
+        if not torch.is_tensor(flat_boxes) or not torch.is_tensor(offsets_tensor):
+            raise TypeError("Compact target tensors are invalid")
+
+        offsets = offsets_tensor.tolist()
+        return [
+            {"boxes": flat_boxes[offsets[index]:offsets[index + 1]]}
+            for index in range(len(offsets) - 1)
+        ]
+
     if "targets" in batch:
         return batch["targets"]
 
@@ -809,7 +917,8 @@ def get_raw_targets(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     if boxes_list is None:
         raise KeyError(
-            "Batch must contain 'targets' or 'target_boxes_per_image'."
+            "Batch must contain compact targets, 'targets', or "
+            "'target_boxes_per_image'."
         )
 
     labels_list = batch.get("target_labels_per_image")
@@ -817,56 +926,63 @@ def get_raw_targets(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     for index, boxes in enumerate(boxes_list):
         target: Dict[str, Any] = {"boxes": boxes}
-
         if labels_list is not None:
             target["labels"] = labels_list[index]
-
         targets.append(target)
 
     return targets
-
 
 def move_targets_to_device(
     batch: Dict[str, Any],
     device: torch.device,
 ) -> List[Dict[str, Any]]:
-    targets = []
+    if "target_boxes_flat" in batch and "target_offsets" in batch:
+        flat_boxes = batch["target_boxes_flat"].to(
+            device=device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        offsets = batch["target_offsets"].tolist()
+        return [
+            {"boxes": flat_boxes[offsets[index]:offsets[index + 1]]}
+            for index in range(len(offsets) - 1)
+        ]
 
+    targets = []
     for target in get_raw_targets(batch):
         moved: Dict[str, Any] = {}
-
         for key, value in target.items():
             if torch.is_tensor(value):
                 moved[key] = value.to(device, non_blocking=True)
             else:
                 moved[key] = value
-
         if "boxes" not in moved:
             raise KeyError("target must contain key: boxes")
-
         targets.append(moved)
-
     return targets
 
-
 def get_target_boxes_cpu(batch: Dict[str, Any]) -> List[torch.Tensor]:
-    boxes_list = []
+    if "target_boxes_flat" in batch and "target_offsets" in batch:
+        flat_boxes = batch["target_boxes_flat"]
+        if flat_boxes.device.type != "cpu":
+            flat_boxes = flat_boxes.cpu()
+        flat_boxes = flat_boxes.to(dtype=torch.float32)
+        offsets = batch["target_offsets"].tolist()
+        return [
+            flat_boxes[offsets[index]:offsets[index + 1]].reshape(-1, 4)
+            for index in range(len(offsets) - 1)
+        ]
 
+    boxes_list = []
     for target in get_raw_targets(batch):
         boxes = target["boxes"]
-
         if not torch.is_tensor(boxes):
             boxes = torch.as_tensor(boxes)
-
         boxes = boxes.detach()
-
         if boxes.device.type != "cpu":
             boxes = boxes.cpu()
-
         boxes_list.append(boxes.to(dtype=torch.float32).reshape(-1, 4))
-
     return boxes_list
-
 
 def get_score_logit(outputs: Dict[str, torch.Tensor]) -> torch.Tensor:
     if "score_logit" in outputs:
@@ -1996,47 +2112,150 @@ def ensure_precomputed_bert_raw_cache(
 # -----------------------------------------------------------------------------
 
 
+def _make_runtime_dataloader(
+    dataset: Any,
+    *,
+    batch_size: int,
+    num_workers: int,
+    prefetch_factor: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+    query_budget: bool,
+    shuffle: bool,
+    drop_last: bool,
+    seed: int,
+) -> DataLoader:
+    num_workers = max(0, int(num_workers))
+    prefetch_factor = max(1, int(prefetch_factor))
+
+    kwargs: Dict[str, Any] = {
+        "dataset": dataset,
+        "num_workers": num_workers,
+        "collate_fn": compact_grounding_collate_fn,
+        "pin_memory": bool(pin_memory),
+        "worker_init_fn": seed_dataloader_worker,
+    }
+
+    if num_workers > 0:
+        kwargs["persistent_workers"] = bool(persistent_workers)
+        kwargs["prefetch_factor"] = prefetch_factor
+
+    if getattr(dataset, "image_level_batching", False) and query_budget:
+        kwargs["batch_sampler"] = QueryBudgetBatchSampler(
+            dataset=dataset,
+            query_budget=int(batch_size),
+            shuffle=bool(shuffle),
+            drop_last=bool(drop_last),
+            seed=int(seed),
+        )
+    else:
+        generator = torch.Generator()
+        generator.manual_seed(int(seed))
+        kwargs.update({
+            "batch_size": int(batch_size),
+            "shuffle": bool(shuffle),
+            "drop_last": bool(drop_last),
+            "generator": generator,
+        })
+
+    return DataLoader(**kwargs)
+
+
 def build_dataloaders_with_supported_options(args: SimpleNamespace, **paths: str):
     """
-    只把 build_dataloaders 目前版本實際支援的效能參數傳入，避免不同分支簽名不相容。
-    """
+    Build datasets/cache through the project data module, then replace its
+    DataLoaders with compact IPC loaders.
 
-    candidate_kwargs = {
+    The project collate returns many small target tensors. With 16 workers and
+    prefetch=4 this can create thousands of shared storages. The compact loader
+    packs all GT boxes into one tensor and uses separate Train/Val worker plans.
+    """
+    base_kwargs = {
         **paths,
         "batch_size": args.batch_size,
         "image_size": (args.image_size, args.image_size),
-        "num_workers": args.num_workers,
+        # Dataset/cache construction does not require multiprocessing. Runtime
+        # loaders are created below with explicit safe settings.
+        "num_workers": 0,
         "max_text_aug_per_image": args.max_text_aug_per_image,
         "random_seed": args.seed,
         "cache_images": args.cache_images,
         "image_cache_dir": args.image_cache_dir,
         "prebuild_image_cache": args.prebuild_image_cache,
-        "prefetch_factor": args.prefetch_factor,
-        "pin_memory": args.pin_memory,
-        "persistent_workers": args.persistent_workers,
-        "query_budget": args.query_budget,
+        "prefetch_factor": 1,
+        "pin_memory": False,
         "cache_workers": args.cache_workers,
+        "query_budget_batching": args.query_budget,
     }
 
-    if args.num_workers <= 0:
-        candidate_kwargs["persistent_workers"] = False
-
     signature = inspect.signature(build_dataloaders)
-    accepts_var_kwargs = any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD
-        for parameter in signature.parameters.values()
+    supported = {
+        key: value
+        for key, value in base_kwargs.items()
+        if key in signature.parameters
+    }
+
+    base_train_loader, base_val_loader = build_dataloaders(**supported)
+
+    requested_workers = max(0, int(args.num_workers))
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    requested_workers = min(requested_workers, cpu_count)
+
+    soft_fd, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+
+    # Keep the requested Train workers when the process limit is healthy.
+    # Validation uses a smaller non-persistent pool because Train persistent
+    # workers remain alive during evaluation.
+    train_workers = requested_workers
+    val_workers = 0 if requested_workers == 0 else min(4, max(1, requested_workers // 4))
+
+    if soft_fd != resource.RLIM_INFINITY and soft_fd < 4096:
+        train_workers = min(train_workers, 8)
+        val_workers = min(val_workers, 2)
+
+    # prefetch_factor is per worker. 16 x 4 means 64 queued batches and is not
+    # useful for cached 512x512 uint8 images. Two queued batches per Train worker
+    # normally saturate H2D while keeping shared memory bounded.
+    train_prefetch = min(max(1, int(args.prefetch_factor)), 2)
+    val_prefetch = 1
+
+    train_persistent = bool(args.persistent_workers and train_workers > 0)
+    val_persistent = False
+
+    train_loader = _make_runtime_dataloader(
+        base_train_loader.dataset,
+        batch_size=args.batch_size,
+        num_workers=train_workers,
+        prefetch_factor=train_prefetch,
+        pin_memory=args.pin_memory,
+        persistent_workers=train_persistent,
+        query_budget=args.query_budget,
+        shuffle=True,
+        drop_last=True,
+        seed=args.seed,
     )
 
-    if accepts_var_kwargs:
-        supported = candidate_kwargs
-    else:
-        supported = {
-            key: value
-            for key, value in candidate_kwargs.items()
-            if key in signature.parameters
-        }
+    val_loader = _make_runtime_dataloader(
+        base_val_loader.dataset,
+        batch_size=args.batch_size,
+        num_workers=val_workers,
+        prefetch_factor=val_prefetch,
+        pin_memory=args.pin_memory,
+        persistent_workers=val_persistent,
+        query_budget=args.query_budget,
+        shuffle=False,
+        drop_last=False,
+        seed=args.seed,
+    )
 
-    return build_dataloaders(**supported)
+    args.effective_train_workers = train_workers
+    args.effective_val_workers = val_workers
+    args.effective_train_prefetch = train_prefetch
+    args.effective_val_prefetch = val_prefetch
+    args.effective_train_persistent = train_persistent
+    args.effective_val_persistent = val_persistent
+
+    return train_loader, val_loader
 
 
 # -----------------------------------------------------------------------------
@@ -2046,6 +2265,7 @@ def build_dataloaders_with_supported_options(args: SimpleNamespace, **paths: str
 
 def train(args: SimpleNamespace) -> None:
     set_seed(args.seed)
+    fd_soft_limit, fd_hard_limit = configure_process_file_limit()
     configure_torch_runtime(args)
 
     if args.device is None:
@@ -2231,12 +2451,24 @@ def train(args: SimpleNamespace) -> None:
         f"query_budget={args.query_budget}"
     )
     print(
-        f"[Info] DataLoader actual: "
-        f"pin_memory={getattr(train_loader, 'pin_memory', 'builder-managed')}, "
-        f"workers={getattr(train_loader, 'num_workers', 'builder-managed')}, "
-        f"prefetch={getattr(train_loader, 'prefetch_factor', 'builder-managed')}, "
-        f"persistent_workers="
-        f"{getattr(train_loader, 'persistent_workers', 'builder-managed')}"
+        f"[Info] IPC: sharing_strategy={mp.get_sharing_strategy()}, "
+        f"RLIMIT_NOFILE=({fd_soft_limit}, {fd_hard_limit})"
+    )
+    print(
+        f"[Info] DataLoader actual Train: "
+        f"pin_memory={train_loader.pin_memory}, "
+        f"workers={train_loader.num_workers}, "
+        f"prefetch={train_loader.prefetch_factor}, "
+        f"persistent_workers={train_loader.persistent_workers}, "
+        f"compact_targets=True"
+    )
+    print(
+        f"[Info] DataLoader actual Val: "
+        f"pin_memory={val_loader.pin_memory}, "
+        f"workers={val_loader.num_workers}, "
+        f"prefetch={val_loader.prefetch_factor}, "
+        f"persistent_workers={val_loader.persistent_workers}, "
+        f"compact_targets=True"
     )
     print(
         f"[Info] Optimizer groups={len(optimizer.param_groups)}, "
