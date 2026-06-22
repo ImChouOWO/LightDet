@@ -204,6 +204,98 @@ def move_images_to_device(
     return images
 
 
+def prepare_model_batch(
+    batch: Dict[str, Any],
+    device: torch.device,
+    channels_last: bool,
+) -> Tuple[torch.Tensor, List[str], Optional[torch.Tensor]]:
+    """
+    同時支援兩種 DataLoader schema：
+
+    1. query-level batching
+       images:        [Q, C, H, W]
+       query_texts:   Q 個文字
+       image_indices: None
+
+    2. image-level batching
+       unique_images: [U, C, H, W]
+       query_texts:   Q 個文字
+       image_indices: [Q]，將 U 張影像特徵展開到 Q 個 query
+
+    image-level batching 可避免同一張影像因不同文字 query 重複跑 vision backbone。
+    """
+    query_texts = batch.get("query_texts")
+
+    if query_texts is None:
+        raise KeyError(
+            f"Batch missing 'query_texts'. Available keys: {sorted(batch.keys())}"
+        )
+
+    if "unique_images" in batch:
+        images = move_images_to_device(
+            batch["unique_images"],
+            device,
+            channels_last=channels_last,
+        )
+
+        image_indices = batch.get("image_indices")
+        if image_indices is None:
+            raise KeyError(
+                "Image-level batch contains 'unique_images' but is missing "
+                "'image_indices'."
+            )
+
+        image_indices = image_indices.to(
+            device=device,
+            dtype=torch.long,
+            non_blocking=True,
+        )
+
+        if image_indices.numel() != len(query_texts):
+            raise ValueError(
+                "image_indices/query_texts size mismatch: "
+                f"{image_indices.numel()} != {len(query_texts)}"
+            )
+
+        return images, query_texts, image_indices
+
+    if "images" in batch:
+        images = move_images_to_device(
+            batch["images"],
+            device,
+            channels_last=channels_last,
+        )
+
+        if images.shape[0] != len(query_texts):
+            raise ValueError(
+                "images/query_texts batch size mismatch: "
+                f"{images.shape[0]} != {len(query_texts)}"
+            )
+
+        return images, query_texts, None
+
+    raise KeyError(
+        "Batch must contain either 'unique_images' or 'images'. "
+        f"Available keys: {sorted(batch.keys())}"
+    )
+
+
+def forward_model_batch(
+    model: torch.nn.Module,
+    images: torch.Tensor,
+    query_texts: List[str],
+    image_indices: Optional[torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    if image_indices is None:
+        return model(images, query_texts)
+
+    return model(
+        images,
+        query_texts,
+        image_indices=image_indices,
+    )
+
+
 # -----------------------------------------------------------------------------
 # EMA
 # -----------------------------------------------------------------------------
@@ -633,6 +725,10 @@ def train_one_epoch(
 ) -> Dict[str, float]:
     model.train()
 
+    batch_sampler = getattr(train_loader, "batch_sampler", None)
+    if batch_sampler is not None and hasattr(batch_sampler, "set_epoch"):
+        batch_sampler.set_epoch(epoch)
+
     total_loss_sum = torch.zeros((), device=device)
     total_bbox_sum = torch.zeros((), device=device)
     total_giou_sum = torch.zeros((), device=device)
@@ -653,12 +749,25 @@ def train_one_epoch(
     for step, batch in pbar:
         global_step = (epoch - 1) * len(train_loader) + step + 1
 
-        images = move_images_to_device(
-            batch["images"],
-            device,
+        if epoch == 1 and step == 0:
+            if "unique_images" in batch:
+                tqdm.write(
+                    "[Info] Batch schema: image-level "
+                    f"unique_images={tuple(batch['unique_images'].shape)}, "
+                    f"queries={len(batch['query_texts'])}"
+                )
+            else:
+                tqdm.write(
+                    "[Info] Batch schema: query-level "
+                    f"images={tuple(batch['images'].shape)}, "
+                    f"queries={len(batch['query_texts'])}"
+                )
+
+        images, query_texts, image_indices = prepare_model_batch(
+            batch=batch,
+            device=device,
             channels_last=channels_last,
         )
-        query_texts = batch["query_texts"]
         targets = move_targets_to_device(batch, device)
 
         optimizer.zero_grad(set_to_none=True)
@@ -668,7 +777,12 @@ def train_one_epoch(
             enabled=amp_enabled,
             dtype=amp_dtype if amp_enabled else None,
         ):
-            outputs = model(images, query_texts)
+            outputs = forward_model_batch(
+                model=model,
+                images=images,
+                query_texts=query_texts,
+                image_indices=image_indices,
+            )
 
             pred_bbox = outputs["bbox"]
             pred_score_logit = get_score_logit(outputs)
@@ -1200,12 +1314,11 @@ def validate_one_epoch(
 
         processed_batches += 1
 
-        images = move_images_to_device(
-            batch["images"],
-            device,
+        images, query_texts, image_indices = prepare_model_batch(
+            batch=batch,
+            device=device,
             channels_last=channels_last,
         )
-        query_texts = batch["query_texts"]
 
         targets_device = (
             move_targets_to_device(batch, device)
@@ -1224,7 +1337,12 @@ def validate_one_epoch(
             enabled=amp_enabled,
             dtype=amp_dtype if amp_enabled else None,
         ):
-            outputs = model(images, query_texts)
+            outputs = forward_model_batch(
+                model=model,
+                images=images,
+                query_texts=query_texts,
+                image_indices=image_indices,
+            )
 
             pred_bbox = outputs["bbox"]
             pred_score_logit = get_score_logit(outputs)
