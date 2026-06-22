@@ -1,5 +1,7 @@
 # ============================================================
-# LightDet train.yaml - quality-aware confidence + smooth ranking
+# LightDet train.yaml
+# Aligned one-to-many bbox / GIoU / IoU-aware QFL supervision
+# YAML is the single source of training parameters.
 # ============================================================
 
 data:
@@ -12,16 +14,29 @@ data:
   prebuild_image_cache: true
   prefetch_factor: 4
   cache_workers: 8
+  pin_memory: true
+  query_budget_batching: true
 
 train:
   epochs: 300
-  batch_size: 24
+  batch_size: 48
   warmup_epochs: 5
-  num_workers: 8
+  num_workers: 16
   device: cuda:1
-  seed: 44
+  seed: 45
   deterministic: false
+
   use_amp: true
+  amp_dtype: bf16
+  allow_tf32: true
+  cudnn_benchmark: true
+  matmul_precision: high
+  channels_last: false
+  compile_model: false
+  compile_mode: reduce-overhead
+  profile_steps: false
+  profile_interval: 50
+
   use_ema: true
   ema_decay: 0.999
   grad_clip_norm: 1.0
@@ -42,22 +57,32 @@ loss:
     cost_score: 0.0
 
   score_sampling:
+    # QFL 使用所有 unmatched predictions；此參數只保留給 optional ranking loss。
     hard_negative_ratio: 3
-    positive_ratio: 0.08
-    max_positive_per_gt: 3
+
+    # 每個 GT 最多取得 2 個同步訓練 bbox/GIoU/QFL 的 positives。
+    positive_ratio: 1.0
+    max_positive_per_gt: 2
+
+    # 為相容目前 GroundingLoss 建構介面而保留；aligned loss 不使用。
     aux_positive_label: 0.7
     expand_cost_bbox: 5.0
     expand_cost_giou: 2.0
 
   quality:
-    iou_pos_thr: 0.15
-    quality_min: 0.25
+    # 額外 one-to-many positive 的最低 IoU gate；初期設 0 保留密集監督。
+    iou_pos_thr: 0.0
+
+    # 為相容建構介面而保留；score target 直接使用 matched IoU。
+    quality_min: 0.0
     quality_max: 1.0
+
     qfl_beta: 2.0
-    quality_warmup_epoch: 20
+    quality_warmup_epoch: 10
 
   ranking:
-    lambda_rank: 0.1
+    # 先建立純 aligned baseline。
+    lambda_rank: 0.0
     rank_margin: 0.1
     rank_min_quality_gap: 0.1
     rank_max_pairs: 512
@@ -66,19 +91,19 @@ loss:
     rank_alpha_min: 0.0001
 
   weight:
-    dynamic: true
+    dynamic: false
 
     bbox: 5.0
     bbox_start: 5.0
-    bbox_end: 3.0
-    bbox_decay_until: 0.5
+    bbox_end: 5.0
+    bbox_decay_until: 1.0
 
     giou: 2.0
 
     score: 2.0
     score_start: 2.0
-    score_end: 4.0
-    score_warm_until: 0.4
+    score_end: 2.0
+    score_warm_until: 1.0
 
   pos_weight:
     value: 1.0
@@ -86,16 +111,23 @@ loss:
 eval:
   val_loss_interval: 5
   eval_interval: 1
-  max_val_batches: 320
-  score_thr: 0.25
-  top_k: 20
+  max_val_batches: null
+  score_thr: 0.001
+  top_k: 100
   nms_iou_thr: 0.5
-  best_metric: map50
+  best_metric: map50_95
   use_topk_fallback: false
 
 log:
-  save_dir: null
+  save_dir: runs/train/lightdet_aligned_qfl
   resume_path: null
   save_epoch_interval: 50
   emit_step_metrics: false
   log_interval: 50
+
+  # tqdm 僅顯示一行必要資訊，避免終端寬度不足造成換行或破版。
+  progress_dynamic_ncols: true
+  progress_leave: false
+  progress_mininterval: 0.5
+  progress_smoothing: 0.1
+  progress_bar_width: 20
