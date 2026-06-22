@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# LightDet optimized train.py v3: uint8 GPU decode + image-level batching
+
 from collections import defaultdict
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -169,6 +171,29 @@ def get_amp_enabled(device: torch.device, use_amp: bool = True) -> bool:
     return bool(use_amp and device.type == "cuda")
 
 
+def resolve_amp_dtype_for_device(
+    device: torch.device,
+    requested_dtype: torch.dtype,
+) -> torch.dtype:
+    """依 GPU 能力解析 AMP dtype；Ada 正常使用 BF16。"""
+    if device.type != "cuda":
+        return torch.float32
+
+    if requested_dtype == torch.bfloat16:
+        is_supported = True
+        if hasattr(torch.cuda, "is_bf16_supported"):
+            is_supported = bool(torch.cuda.is_bf16_supported())
+
+        if not is_supported:
+            print(
+                "[Warning] CUDA device does not report BF16 support; "
+                "fallback to FP16 AMP."
+            )
+            return torch.float16
+
+    return requested_dtype
+
+
 def build_scaler(
     device: torch.device,
     use_amp: bool,
@@ -196,10 +221,49 @@ def move_images_to_device(
     device: torch.device,
     channels_last: bool,
 ) -> torch.Tensor:
-    images = images.to(device, non_blocking=True)
+    """
+    將 DataLoader 影像搬到運算裝置並統一為 float32。
 
-    if channels_last and images.ndim == 4:
+    LightDet 的 uint8 image cache 刻意保留 CHW uint8，以降低 CPU RAM 與
+    Host-to-Device 傳輸量；因此必須在 GPU transfer 後才轉為 [0, 1] float32。
+    非 cache 路徑本來就是 float tensor，則保留其數值尺度，只統一 dtype。
+    """
+    if not torch.is_tensor(images):
+        raise TypeError(f"images must be a Tensor, got {type(images)}")
+
+    if images.ndim != 4:
+        raise ValueError(
+            f"images must be BCHW [B, C, H, W], got shape={tuple(images.shape)}"
+        )
+
+    if images.shape[1] not in (1, 3, 4):
+        raise ValueError(
+            f"unexpected image channel count: C={images.shape[1]}, "
+            f"shape={tuple(images.shape)}"
+        )
+
+    source_dtype = images.dtype
+
+    # 先以 uint8 搬到 GPU，維持最小 H2D transfer；再由 GPU 轉 float32。
+    images = images.to(device=device, non_blocking=True)
+
+    if source_dtype == torch.uint8:
+        images = images.to(dtype=torch.float32).mul_(1.0 / 255.0)
+    elif source_dtype.is_floating_point:
+        # autocast 會在卷積/矩陣運算時轉為 BF16/FP16；模型輸入維持 FP32
+        # 可避免非 autocast op 出現 dtype 不一致。
+        if images.dtype != torch.float32:
+            images = images.float()
+    else:
+        raise TypeError(
+            "Unsupported image dtype. Expected uint8 or floating point, "
+            f"got {source_dtype}."
+        )
+
+    if channels_last:
         images = images.contiguous(memory_format=torch.channels_last)
+    elif not images.is_contiguous():
+        images = images.contiguous()
 
     return images
 
@@ -245,17 +309,36 @@ def prepare_model_batch(
                 "'image_indices'."
             )
 
-        image_indices = image_indices.to(
-            device=device,
-            dtype=torch.long,
-            non_blocking=True,
-        )
+        if not torch.is_tensor(image_indices):
+            image_indices = torch.as_tensor(image_indices, dtype=torch.long)
+        else:
+            image_indices = image_indices.to(dtype=torch.long)
+
+        if image_indices.ndim != 1:
+            raise ValueError(
+                f"image_indices must be 1-D, got shape={tuple(image_indices.shape)}"
+            )
 
         if image_indices.numel() != len(query_texts):
             raise ValueError(
                 "image_indices/query_texts size mismatch: "
                 f"{image_indices.numel()} != {len(query_texts)}"
             )
+
+        if image_indices.numel() > 0:
+            min_index = int(image_indices.min().item())
+            max_index = int(image_indices.max().item())
+            if min_index < 0 or max_index >= images.shape[0]:
+                raise IndexError(
+                    "image_indices out of range: "
+                    f"min={min_index}, max={max_index}, "
+                    f"num_unique_images={images.shape[0]}"
+                )
+
+        image_indices = image_indices.to(
+            device=device,
+            non_blocking=True,
+        )
 
         return images, query_texts, image_indices
 
@@ -294,6 +377,131 @@ def forward_model_batch(
         query_texts,
         image_indices=image_indices,
     )
+
+
+def run_startup_smoke_test(
+    model: torch.nn.Module,
+    criterion: Any,
+    train_loader: Any,
+    device: torch.device,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    channels_last: bool,
+    total_epochs: int,
+    args: SimpleNamespace,
+) -> None:
+    """
+    使用真實 DataLoader batch 驗證 cache dtype、image-level mapping、model forward
+    與 loss contract。只執行一次，不更新權重或 BatchNorm running statistics。
+    """
+    print("[Startup Check] Running one real-batch forward/loss smoke test...")
+
+    iterator = iter(train_loader)
+    try:
+        batch = next(iterator)
+    except StopIteration as error:
+        raise RuntimeError("Training DataLoader is empty") from error
+    finally:
+        # 不保留 iterator，正式 epoch 會建立新的 iterator。
+        iterator = None
+
+    images, query_texts, image_indices = prepare_model_batch(
+        batch=batch,
+        device=device,
+        channels_last=channels_last,
+    )
+    targets = move_targets_to_device(batch, device)
+
+    if len(query_texts) == 0:
+        raise RuntimeError("Startup batch contains no query_texts")
+    if len(targets) != len(query_texts):
+        raise RuntimeError(
+            "Startup targets/query_texts mismatch: "
+            f"{len(targets)} != {len(query_texts)}"
+        )
+    if not images.dtype.is_floating_point:
+        raise RuntimeError(
+            f"Prepared images must be floating point, got {images.dtype}"
+        )
+
+    lambda_bbox, lambda_giou, lambda_score = get_loss_weights(
+        epoch=1,
+        total_epochs=total_epochs,
+        args=args,
+    )
+
+    was_training = model.training
+    model.eval()
+    amp_enabled = get_amp_enabled(device, use_amp)
+
+    try:
+        with torch.no_grad():
+            with autocast(
+                device_type=device.type,
+                enabled=amp_enabled,
+                dtype=amp_dtype if amp_enabled else None,
+            ):
+                outputs = forward_model_batch(
+                    model=model,
+                    images=images,
+                    query_texts=query_texts,
+                    image_indices=image_indices,
+                )
+
+                pred_bbox = outputs["bbox"]
+                pred_score_logit = get_score_logit(outputs)
+
+                loss, _ = criterion(
+                    pred_bbox=pred_bbox,
+                    pred_score_logit=pred_score_logit,
+                    targets=targets,
+                    lambda_bbox=lambda_bbox,
+                    lambda_giou=lambda_giou,
+                    lambda_score=lambda_score,
+                    lambda_rank=args.lambda_rank,
+                    pos_weight=float(args.pos_weight),
+                    current_epoch=1,
+                    quality_warmup_epoch=args.quality_warmup_epoch,
+                    rank_start_epoch=args.rank_start_epoch,
+                    rank_warmup_epoch=args.rank_warmup_epoch,
+                    rank_alpha_min=args.rank_alpha_min,
+                )
+
+        expected_queries = len(query_texts)
+        if pred_bbox.shape[0] != expected_queries:
+            raise RuntimeError(
+                "Model bbox batch does not match query count: "
+                f"{pred_bbox.shape[0]} != {expected_queries}"
+            )
+        if pred_score_logit.shape[0] != expected_queries:
+            raise RuntimeError(
+                "Model score batch does not match query count: "
+                f"{pred_score_logit.shape[0]} != {expected_queries}"
+            )
+        if not bool(torch.isfinite(pred_bbox).all().item()):
+            raise FloatingPointError("Startup bbox output contains NaN/Inf")
+        if not bool(torch.isfinite(pred_score_logit).all().item()):
+            raise FloatingPointError("Startup score output contains NaN/Inf")
+        if not bool(torch.isfinite(loss).item()):
+            raise FloatingPointError("Startup loss is NaN/Inf")
+
+        image_min, image_max = torch.aminmax(images)
+        print(
+            "[Startup Check] PASS: "
+            f"images={tuple(images.shape)} {images.dtype} "
+            f"range=[{image_min.item():.6f}, {image_max.item():.6f}], "
+            f"queries={expected_queries}, "
+            f"bbox={tuple(pred_bbox.shape)}, "
+            f"score={tuple(pred_score_logit.shape)}, "
+            f"loss={loss.item():.6f}"
+        )
+    finally:
+        model.train(was_training)
+        del batch, images, query_texts, targets
+        if image_indices is not None:
+            del image_indices
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
 
 # -----------------------------------------------------------------------------
@@ -749,19 +957,21 @@ def train_one_epoch(
     for step, batch in pbar:
         global_step = (epoch - 1) * len(train_loader) + step + 1
 
-        if epoch == 1 and step == 0:
-            if "unique_images" in batch:
-                tqdm.write(
-                    "[Info] Batch schema: image-level "
-                    f"unique_images={tuple(batch['unique_images'].shape)}, "
-                    f"queries={len(batch['query_texts'])}"
-                )
-            else:
-                tqdm.write(
-                    "[Info] Batch schema: query-level "
-                    f"images={tuple(batch['images'].shape)}, "
-                    f"queries={len(batch['query_texts'])}"
-                )
+        first_batch = epoch == 1 and step == 0
+
+        if first_batch:
+            raw_images = (
+                batch["unique_images"]
+                if "unique_images" in batch
+                else batch["images"]
+            )
+            schema = "image-level" if "unique_images" in batch else "query-level"
+            tqdm.write(
+                f"[Info] Batch schema: {schema} "
+                f"raw_shape={tuple(raw_images.shape)}, "
+                f"raw_dtype={raw_images.dtype}, "
+                f"queries={len(batch['query_texts'])}"
+            )
 
         images, query_texts, image_indices = prepare_model_batch(
             batch=batch,
@@ -769,6 +979,24 @@ def train_one_epoch(
             channels_last=channels_last,
         )
         targets = move_targets_to_device(batch, device)
+
+        if len(targets) != len(query_texts):
+            raise ValueError(
+                "targets/query_texts size mismatch: "
+                f"{len(targets)} != {len(query_texts)}"
+            )
+
+        if first_batch:
+            image_min, image_max = torch.aminmax(images.detach())
+            tqdm.write(
+                "[Info] Prepared images: "
+                f"shape={tuple(images.shape)}, dtype={images.dtype}, "
+                f"device={images.device}, "
+                f"range=[{float(image_min.item()):.6f}, "
+                f"{float(image_max.item()):.6f}], "
+                f"image_indices="
+                f"{None if image_indices is None else tuple(image_indices.shape)}"
+            )
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -1825,10 +2053,18 @@ def train(args: SimpleNamespace) -> None:
     else:
         device = torch.device(args.device)
 
-    amp_dtype = parse_amp_dtype(args.amp_dtype)
+    amp_dtype = resolve_amp_dtype_for_device(
+        device=device,
+        requested_dtype=parse_amp_dtype(args.amp_dtype),
+    )
 
     if amp_dtype == torch.float32:
         args.use_amp = False
+        args.amp_dtype = "fp32"
+    elif amp_dtype == torch.float16:
+        args.amp_dtype = "fp16"
+    elif amp_dtype == torch.bfloat16:
+        args.amp_dtype = "bf16"
 
     dataset_dir = args.dir
 
@@ -1902,6 +2138,19 @@ def train(args: SimpleNamespace) -> None:
         rank_max_pairs=args.rank_max_pairs,
     )
 
+    if args.startup_smoke_test:
+        run_startup_smoke_test(
+            model=model,
+            criterion=criterion,
+            train_loader=train_loader,
+            device=device,
+            use_amp=args.use_amp,
+            amp_dtype=amp_dtype,
+            channels_last=args.channels_last,
+            total_epochs=args.epochs,
+            args=args,
+        )
+
     optimizer = build_optimizer(
         model=model,
         lr_vision=args.lr_vision,
@@ -1955,6 +2204,18 @@ def train(args: SimpleNamespace) -> None:
     total_params, trainable_params = count_parameters(model)
 
     print(f"[Info] Device: {device}")
+    if device.type == "cuda":
+        capability = torch.cuda.get_device_capability(device)
+        bf16_supported = (
+            torch.cuda.is_bf16_supported()
+            if hasattr(torch.cuda, "is_bf16_supported")
+            else "unknown"
+        )
+        print(
+            f"[Info] GPU: {torch.cuda.get_device_name(device)}, "
+            f"compute_capability={capability[0]}.{capability[1]}, "
+            f"bf16_supported={bf16_supported}"
+        )
     print(
         f"[Info] AMP: enabled={get_amp_enabled(device, args.use_amp)}, "
         f"dtype={args.amp_dtype}, scaler={scaler.is_enabled()}"
@@ -2308,6 +2569,7 @@ DEFAULT_TRAIN_CFG = {
         "channels_last": False,
         "compile": False,
         "compile_mode": "reduce-overhead",
+        "startup_smoke_test": True,
     },
     "optim": {
         "lr_vision": 1e-4,
@@ -2514,6 +2776,7 @@ def cfg_to_args(
         channels_last=train_cfg.get("channels_last", False),
         compile_model=train_cfg.get("compile", False),
         compile_mode=train_cfg.get("compile_mode", "reduce-overhead"),
+        startup_smoke_test=train_cfg.get("startup_smoke_test", True),
 
         # model
         img_in_channels=model_cfg["img_in_channels"],
@@ -2755,6 +3018,7 @@ class LightDet:
         amp_dtype: Optional[str] = None,
         compile_model: Optional[bool] = None,
         channels_last: Optional[bool] = None,
+        startup_smoke_test: Optional[bool] = None,
         hard_negative_ratio: Optional[int] = None,
         positive_ratio: Optional[float] = None,
         max_positive_per_gt: Optional[int] = None,
@@ -2849,6 +3113,9 @@ class LightDet:
             train_cfg["train"]["compile"] = bool(compile_model)
         if channels_last is not None:
             train_cfg["train"]["channels_last"] = bool(channels_last)
+
+        if startup_smoke_test is not None:
+            train_cfg["train"]["startup_smoke_test"] = bool(startup_smoke_test)
 
         if hard_negative_ratio is not None:
             train_cfg["loss"]["score_sampling"][
