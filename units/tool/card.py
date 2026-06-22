@@ -29,6 +29,19 @@ disable_progress_bars()
 
 CARD_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
 print("Card Root :",CARD_ROOT)
+
+def make_group_norm(channels: int, max_groups: int = 32) -> nn.GroupNorm:
+    num_groups = min(max_groups, channels)
+
+    while channels % num_groups != 0:
+        num_groups -= 1
+
+    return nn.GroupNorm(
+        num_groups=num_groups,
+        num_channels=channels,
+    )
+
+
 class FusionBlock(nn.Module):
     def __init__(
         self,
@@ -381,7 +394,7 @@ class ResNet50Extractor(nn.Module):
         fc = outputs["logits"]
         return feat_layer2, feat_layer4, fc
 
-class ConvBNAct(nn.Module):
+class ConvGNAct(nn.Module):
     def __init__(
         self,
         in_channels,
@@ -394,6 +407,7 @@ class ConvBNAct(nn.Module):
         super().__init__()
 
         padding = kernel_size // 2
+        
 
         layers = [
             nn.Conv2d(
@@ -405,7 +419,7 @@ class ConvBNAct(nn.Module):
                 groups=groups,
                 bias=False
             ),
-            nn.BatchNorm2d(out_channels)
+            make_group_norm(out_channels)
         ]
 
         if act:
@@ -413,6 +427,7 @@ class ConvBNAct(nn.Module):
 
         self.block = nn.Sequential(*layers)
 
+    
     def forward(self, x):
         return self.block(x)
 
@@ -451,7 +466,7 @@ class MobileNetV4ConvBlock(nn.Module):
         )
 
         self.start_dw = (
-            ConvBNAct(
+            ConvGNAct(
                 in_channels=in_channels,
                 out_channels=in_channels,
                 kernel_size=kernel_size,
@@ -463,7 +478,7 @@ class MobileNetV4ConvBlock(nn.Module):
             else nn.Identity()
         )
 
-        self.expand = ConvBNAct(
+        self.expand = ConvGNAct(
             in_channels=in_channels,
             out_channels=hidden_channels,
             kernel_size=1,
@@ -473,7 +488,7 @@ class MobileNetV4ConvBlock(nn.Module):
         )
 
         self.middle_dw = (
-            ConvBNAct(
+            ConvGNAct(
                 in_channels=hidden_channels,
                 out_channels=hidden_channels,
                 kernel_size=kernel_size,
@@ -485,7 +500,7 @@ class MobileNetV4ConvBlock(nn.Module):
             else nn.Identity()
         )
 
-        self.project = ConvBNAct(
+        self.project = ConvGNAct(
             in_channels=hidden_channels,
             out_channels=out_channels,
             kernel_size=1,
@@ -551,7 +566,7 @@ class ImgProjector(nn.Module):
                 padding=0,
                 bias=False
             ),
-            nn.BatchNorm2d(out_channels),
+            make_group_norm(out_channels),
             nn.SiLU(inplace=True)
         )
 
@@ -654,11 +669,11 @@ class BottleNet(nn.Module):
         super().__init__()
 
         self.stem = nn.Sequential(
-            ConvBNAct(in_channels, 64, kernel_size=3, stride=2),
-            ConvBNAct(64, 128, kernel_size=3, stride=2),
-            ConvBNAct(128, 256, kernel_size=3, stride=2),
-            ConvBNAct(256, 512, kernel_size=3, stride=2),
-            ConvBNAct(512, out_channels, kernel_size=1, stride=1),
+            ConvGNAct(in_channels, 64, kernel_size=3, stride=2),
+            ConvGNAct(64, 128, kernel_size=3, stride=2),
+            ConvGNAct(128, 256, kernel_size=3, stride=2),
+            ConvGNAct(256, 512, kernel_size=3, stride=2),
+            ConvGNAct(512, out_channels, kernel_size=1, stride=1),
         )
 
     def forward(self, x):
