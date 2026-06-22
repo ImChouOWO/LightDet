@@ -127,7 +127,7 @@ log:
 
   # tqdm 僅顯示一行必要資訊，避免終端寬度不足造成換行或破版。
   progress_dynamic_ncols: true
-  progress_leave: false
+  progress_leave: true
   progress_mininterval: 0.5
   progress_smoothing: 0.1
   progress_bar_width: 20

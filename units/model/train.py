@@ -1044,7 +1044,7 @@ def train_one_epoch(
     rank_alpha_min: float = 1e-4,
     log_interval: int = 10,
     step_metrics_path: Optional[str] = None,
-    progress_leave: bool = False,
+    progress_leave: bool = True,
     progress_mininterval: float = 0.5,
 ) -> Dict[str, float]:
     model.train()
@@ -1269,6 +1269,8 @@ def train_one_epoch(
                     "rank_alpha_min": float(rank_alpha_min),
                     "score_target_pos_mean": score_target_pos_mean,
                 })
+    pbar.refresh()
+    pbar.close()
 
     num_batches = max(1, len(train_loader))
 
@@ -1603,7 +1605,7 @@ def validate_one_epoch(
     iou_thresholds: Optional[Sequence[float]] = None,
     max_val_batches: Optional[int] = None,
     log_interval: int = 50,
-    progress_leave: bool = False,
+    progress_leave: bool = True,
     progress_mininterval: float = 0.5,
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
     if not compute_loss and not compute_metrics:
@@ -1779,7 +1781,9 @@ def validate_one_epoch(
                 })
 
             pbar.set_postfix(postfix)
-
+            
+    pbar.refresh()
+    pbar.close()
     validation_loop_time = time.perf_counter() - validation_start
 
     val_loss_metrics: Dict[str, float] = {}
@@ -2878,7 +2882,7 @@ DEFAULT_TRAIN_CFG = {
         "save_epoch_interval": 50,
         "emit_step_metrics": False,
         "log_interval": 50,
-        "progress_leave": False,
+        "progress_leave": True,
         "progress_mininterval": 0.5,
     },
 }
