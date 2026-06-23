@@ -4,253 +4,395 @@
 import os
 import sys
 from pathlib import Path
+from typing import Dict, Any, Tuple
 
+import cv2
+import numpy as np
 import torch
-from torch.amp import autocast
+from PIL import Image
+from torchvision import transforms
 from torchvision.ops import nms
-from PIL import Image, ImageDraw, ImageFont
-import torchvision.transforms.functional as TF
-
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-UNITS_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
-sys.path.insert(0, UNITS_DIR)
-
-from model.cards.main import Model
 
 
-def cxcywh_to_xyxy(box):
-    cx, cy, w, h = box.unbind(-1)
+CURRENT_DIR = Path(__file__).resolve().parent
+UNITS_DIR = CURRENT_DIR.parent
 
-    x1 = cx - w / 2
-    y1 = cy - h / 2
-    x2 = cx + w / 2
-    y2 = cy + h / 2
-
-    return torch.stack([x1, y1, x2, y2], dim=-1)
+if str(UNITS_DIR) not in sys.path:
+    sys.path.insert(0, str(UNITS_DIR))
 
 
-def load_model(
-    checkpoint_path,
-    device,
-    use_ema=True
-):
-    model = Model(num_classes=1).to(device)
+def build_model():
+    from units.tool.card import VisionTextModel
 
-    ckpt = torch.load(
-        checkpoint_path,
-        map_location=device
+    model = VisionTextModel(
+        img_in_channels=1024,
+        hidden_dim=384,
+        target_size=(10, 10),
+        text_max_length=32,
+        fusion_token_num=16,
+        num_layers=2,
+        num_heads=8,
+        mlp_ratio=3.5,
+        dropout=0.1,
+        freeze_bert=True,
     )
 
-    if use_ema and "ema" in ckpt:
-        state_dict = ckpt["ema"]
-    elif "model" in ckpt:
-        state_dict = ckpt["model"]
-    else:
-        state_dict = ckpt
+    return model
 
-    model.load_state_dict(state_dict, strict=False)
+
+def load_checkpoint(
+    model: torch.nn.Module,
+    ckpt_path: str | Path,
+    device: torch.device,
+) -> torch.nn.Module:
+    ckpt_path = Path(ckpt_path)
+
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"找不到 checkpoint: {ckpt_path}")
+
+    try:
+        checkpoint = torch.load(
+            ckpt_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+    except TypeError:
+        checkpoint = torch.load(
+            ckpt_path,
+            map_location="cpu",
+        )
+
+    if "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    elif "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    else:
+        state_dict = checkpoint
+
+    cleaned_state_dict = {}
+
+    for key, value in state_dict.items():
+        if key.startswith("module."):
+            key = key[len("module."):]
+        cleaned_state_dict[key] = value
+
+    load_result = model.load_state_dict(
+        cleaned_state_dict,
+        strict=False,
+    )
+
+    if load_result.missing_keys:
+        print("\n[WARNING] Missing keys:")
+        for key in load_result.missing_keys:
+            print(f"  - {key}")
+
+    if load_result.unexpected_keys:
+        print("\n[WARNING] Unexpected keys:")
+        for key in load_result.unexpected_keys:
+            print(f"  - {key}")
+
+    model = model.to(device)
     model.eval()
 
     return model
 
 
 def preprocess_image(
-    image_path,
-    image_size=(640, 640),
-    device="cuda"
-):
+    image_path: str | Path,
+    image_size: int = 512,
+) -> Tuple[torch.Tensor, int, int]:
+    image_path = Path(image_path)
+
+    if not image_path.exists():
+        raise FileNotFoundError(f"找不到輸入影像: {image_path}")
+
     image = Image.open(image_path).convert("RGB")
     orig_w, orig_h = image.size
 
-    target_h, target_w = image_size
+    transform = transforms.Compose([
+        transforms.Resize(
+            (image_size, image_size),
+            interpolation=transforms.InterpolationMode.BILINEAR,
+        ),
+        transforms.ToTensor(),
+    ])
 
-    resized = TF.resize(image, [target_h, target_w])
-    tensor = TF.to_tensor(resized).unsqueeze(0).to(device)
+    image_tensor = transform(image).unsqueeze(0)
 
-    return image, tensor, (orig_h, orig_w), (target_h, target_w)
+    return image_tensor, orig_w, orig_h
 
 
-def scale_boxes_to_original(
-    boxes_xyxy,
-    orig_size,
-    resized_size
-):
-    orig_h, orig_w = orig_size
-    resized_h, resized_w = resized_size
+def sanitize_xyxy_boxes(boxes: torch.Tensor) -> torch.Tensor:
+    boxes = boxes.clamp(0.0, 1.0)
 
-    boxes = boxes_xyxy.clone()
+    x1 = torch.minimum(boxes[:, 0], boxes[:, 2])
+    y1 = torch.minimum(boxes[:, 1], boxes[:, 3])
+    x2 = torch.maximum(boxes[:, 0], boxes[:, 2])
+    y2 = torch.maximum(boxes[:, 1], boxes[:, 3])
 
-    boxes[:, [0, 2]] = boxes[:, [0, 2]] * (orig_w / resized_w)
-    boxes[:, [1, 3]] = boxes[:, [1, 3]] * (orig_h / resized_h)
+    return torch.stack([x1, y1, x2, y2], dim=-1)
+
+
+def xyxy_norm_to_pixel(
+    boxes: torch.Tensor,
+    width: int,
+    height: int,
+) -> torch.Tensor:
+    boxes = sanitize_xyxy_boxes(boxes)
+
+    scale = boxes.new_tensor([
+        width,
+        height,
+        width,
+        height,
+    ])
+
+    boxes = boxes * scale
+
+    boxes[:, 0].clamp_(0, max(width - 1, 0))
+    boxes[:, 1].clamp_(0, max(height - 1, 0))
+    boxes[:, 2].clamp_(0, max(width - 1, 0))
+    boxes[:, 3].clamp_(0, max(height - 1, 0))
 
     return boxes
 
 
-@torch.no_grad()
-def infer_single_image(
-    model,
-    image_path,
-    query_text,
-    device,
-    image_size=(640, 640),
-    score_thr=0.25,
-    top_k=20,
-    nms_iou_thr=0.5,
-    use_amp=True
-):
-    orig_image, image_tensor, orig_size, resized_size = preprocess_image(
-        image_path=image_path,
-        image_size=image_size,
-        device=device
-    )
+def draw_boxes(
+    image_path: str | Path,
+    boxes: np.ndarray,
+    scores: np.ndarray,
+    text_query: str,
+    save_path: str | Path,
+) -> int:
+    image_path = Path(image_path)
+    save_path = Path(save_path)
 
-    empty_boxes = torch.empty(
-        0,
-        4,
-        device=device,
-        dtype=torch.float32
-    )
+    image = cv2.imread(str(image_path))
 
-    boxes_per_image = [empty_boxes]
-    query_texts = [query_text]
+    if image is None:
+        raise RuntimeError(f"OpenCV 無法讀取影像: {image_path}")
 
-    amp_enabled = use_amp and device.type == "cuda"
+    save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with autocast(device_type=device.type, enabled=amp_enabled):
-        outputs = model(
-            images=image_tensor,
-            boxes_per_image=boxes_per_image,
-            texts=query_texts,
-            image_size=image_size
+    draw_count = 0
+
+    for box, score in zip(boxes, scores):
+        x1, y1, x2, y2 = box.astype(np.int32).tolist()
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        draw_count += 1
+
+        cv2.rectangle(
+            image,
+            (x1, y1),
+            (x2, y2),
+            (0, 255, 0),
+            2,
         )
 
-    pred_bbox = outputs["bbox"][0]       # [N, 4], normalized cxcywh
-    score_logits = outputs["score"][0]   # [N, 1]
+        label = f"{text_query}: {float(score):.3f}"
 
-    scores = torch.sigmoid(score_logits).squeeze(-1)
-
-    keep = scores >= score_thr
-
-    if keep.sum() > 0:
-        selected_boxes = pred_bbox[keep]
-        selected_scores = scores[keep]
-    else:
-        k = min(top_k, pred_bbox.shape[0])
-        selected_scores, top_idx = scores.topk(k=k)
-        selected_boxes = pred_bbox[top_idx]
-
-    if selected_scores.numel() > top_k:
-        selected_scores, top_idx = selected_scores.topk(k=top_k)
-        selected_boxes = selected_boxes[top_idx]
-
-    boxes_xyxy_norm = cxcywh_to_xyxy(selected_boxes)
-
-    boxes_xyxy_resized = boxes_xyxy_norm.clone()
-    boxes_xyxy_resized[:, [0, 2]] *= image_size[1]
-    boxes_xyxy_resized[:, [1, 3]] *= image_size[0]
-
-    boxes_xyxy_resized[:, [0, 2]] = boxes_xyxy_resized[:, [0, 2]].clamp(0, image_size[1] - 1)
-    boxes_xyxy_resized[:, [1, 3]] = boxes_xyxy_resized[:, [1, 3]].clamp(0, image_size[0] - 1)
-
-    keep_idx = nms(
-        boxes_xyxy_resized.float(),
-        selected_scores.float(),
-        iou_threshold=nms_iou_thr
-    )
-
-    boxes_xyxy_resized = boxes_xyxy_resized[keep_idx]
-    selected_scores = selected_scores[keep_idx]
-
-    boxes_xyxy_orig = scale_boxes_to_original(
-        boxes_xyxy=boxes_xyxy_resized,
-        orig_size=orig_size,
-        resized_size=image_size
-    )
-
-    results = []
-
-    for box, score in zip(boxes_xyxy_orig, selected_scores):
-        results.append({
-            "bbox_xyxy": box.detach().cpu().tolist(),
-            "score": float(score.detach().cpu())
-        })
-
-    return orig_image, results
-
-
-def draw_results(
-    image,
-    results,
-    query_text,
-    output_path
-):
-    draw = ImageDraw.Draw(image)
-
-    for item in results:
-        x1, y1, x2, y2 = item["bbox_xyxy"]
-        score = item["score"]
-
-        draw.rectangle(
-            [x1, y1, x2, y2],
-            outline="red",
-            width=3
-        )
-
-        label = f"{query_text} {score:.3f}"
-
-        draw.text(
-            (x1, max(0, y1 - 20)),
+        cv2.putText(
+            image,
             label,
-            fill="red"
+            (x1, max(y1 - 8, 20)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
         )
 
-    image.save(output_path)
+    success = cv2.imwrite(str(save_path), image)
+
+    if not success:
+        raise RuntimeError(f"結果影像儲存失敗: {save_path}")
+
+    return draw_count
 
 
-def main():
-    checkpoint_path = "/home/soic/Desktop/LightDet/units/model/checkpoints/results_2026-05-14_07-52-47/best_iou.pt"
-    image_path = "/home/soic/Desktop/LightDet/datasets/images/val/2021_10_20_13_28_41_00000.jpg"
-    output_path = "/home/soic/Desktop/LightDet/output/test_result.jpg"
+def resolve_device(device_name: str) -> torch.device:
+    if device_name.startswith("cuda"):
+        if not torch.cuda.is_available():
+            print("[WARNING] CUDA 不可用，改用 CPU")
+            return torch.device("cpu")
 
-    query_text = "白色的船"
+        if ":" in device_name:
+            device_index = int(device_name.split(":")[1])
 
-    image_size = (640, 640)
+            if device_index >= torch.cuda.device_count():
+                raise ValueError(
+                    f"指定 {device_name}，"
+                    f"但目前只有 {torch.cuda.device_count()} 張 CUDA GPU"
+                )
 
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+        return torch.device(device_name)
 
-    model = load_model(
-        checkpoint_path=checkpoint_path,
-        device=device,
-        use_ema=True
-    )
+    return torch.device("cpu")
 
-    image, results = infer_single_image(
+
+@torch.inference_mode()
+def infer(
+    ckpt_path: str | Path,
+    image_path: str | Path,
+    text_query: str,
+    save_path: str | Path = "result.jpg",
+    image_size: int = 512,
+    score_thr: float = 0.20,
+    iou_thr: float = 0.50,
+    top_k: int = 20,
+    device: str = "cuda:0",
+) -> Dict[str, Any]:
+    if not text_query.strip():
+        raise ValueError("text_query 不可為空字串")
+
+    if top_k <= 0:
+        raise ValueError("top_k 必須大於 0")
+
+    if not 0.0 <= score_thr <= 1.0:
+        raise ValueError("score_thr 必須位於 [0, 1]")
+
+    if not 0.0 <= iou_thr <= 1.0:
+        raise ValueError("iou_thr 必須位於 [0, 1]")
+
+    device_obj = resolve_device(device)
+
+    print(f"[INFO] Device    : {device_obj}")
+    print(f"[INFO] Query     : {text_query}")
+    print(f"[INFO] Score thr : {score_thr}")
+    print(f"[INFO] IoU thr   : {iou_thr}")
+
+    model = build_model()
+
+    model = load_checkpoint(
         model=model,
-        image_path=image_path,
-        query_text=query_text,
-        device=device,
-        image_size=image_size,
-        score_thr=0.25,
-        top_k=20,
-        nms_iou_thr=0.5,
-        use_amp=True
+        ckpt_path=ckpt_path,
+        device=device_obj,
     )
 
-    for i, item in enumerate(results):
-        print(
-            f"[{i}] score={item['score']:.4f}, "
-            f"bbox={item['bbox_xyxy']}"
+    image_tensor, orig_w, orig_h = preprocess_image(
+        image_path=image_path,
+        image_size=image_size,
+    )
+
+    image_tensor = image_tensor.to(
+        device_obj,
+        non_blocking=True,
+    )
+
+    outputs = model(
+        img=image_tensor,
+        texts=[text_query],
+    )
+
+    pred_boxes = outputs["bbox"][0]
+
+    pred_scores = (
+        outputs["score_logit"][0]
+        .squeeze(-1)
+        .sigmoid()
+    )
+
+    num_predictions = pred_scores.numel()
+
+    score_mask = pred_scores >= score_thr
+
+    filtered_boxes = pred_boxes[score_mask]
+    filtered_scores = pred_scores[score_mask]
+
+    if filtered_scores.numel() == 0:
+        boxes_np = np.empty((0, 4), dtype=np.float32)
+        scores_np = np.empty((0,), dtype=np.float32)
+        keep_count = 0
+    else:
+        filtered_pixel_boxes = xyxy_norm_to_pixel(
+            boxes=filtered_boxes,
+            width=orig_w,
+            height=orig_h,
         )
 
-    draw_results(
-        image=image,
-        results=results,
-        query_text=query_text,
-        output_path=output_path
+        keep_indices = nms(
+            boxes=filtered_pixel_boxes,
+            scores=filtered_scores,
+            iou_threshold=iou_thr,
+        )
+
+        keep_indices = keep_indices[:top_k]
+
+        final_boxes = filtered_pixel_boxes[keep_indices]
+        final_scores = filtered_scores[keep_indices]
+
+        boxes_np = final_boxes.detach().cpu().numpy()
+        scores_np = final_scores.detach().cpu().numpy()
+        keep_count = len(keep_indices)
+
+    draw_count = draw_boxes(
+        image_path=image_path,
+        boxes=boxes_np,
+        scores=scores_np,
+        text_query=text_query,
+        save_path=save_path,
     )
 
-    print(f"Saved result to: {output_path}")
+    print("\n[INFO] Model output shapes")
+    for key, value in outputs.items():
+        if torch.is_tensor(value):
+            print(
+                f"  {key:16s}: "
+                f"shape={tuple(value.shape)}, "
+                f"dtype={value.dtype}, "
+                f"device={value.device}"
+            )
+
+    print("\n[INFO] Detection results")
+
+    for rank, (box, score) in enumerate(
+        zip(boxes_np, scores_np),
+        start=1,
+    ):
+        print(
+            f"  rank={rank:02d}, "
+            f"query={text_query!r}, "
+            f"score={float(score):.4f}, "
+            f"box={box.astype(int).tolist()}"
+        )
+
+    print(f"\n[INFO] Total candidates       : {num_predictions}")
+    print(f"[INFO] After score threshold : {filtered_scores.numel()}")
+    print(f"[INFO] After NMS             : {keep_count}")
+    print(f"[INFO] Drawn boxes           : {draw_count}")
+    print(f"[INFO] Saved result          : {save_path}")
+
+    return {
+        "boxes": boxes_np,
+        "scores": scores_np,
+        "num_predictions": num_predictions,
+        "after_score_threshold": int(filtered_scores.numel()),
+        "after_nms": int(keep_count),
+        "draw_count": draw_count,
+        "raw_outputs": outputs,
+    }
 
 
 if __name__ == "__main__":
-    main()
+    result = infer(
+        ckpt_path=(
+            "/home/soic/Desktop/LightDet/units/model/"
+            "runs/train/lightdet_rank_smooth_010/"
+            "best_map50.pt"
+        ),
+        image_path=(
+            "/home/soic/Desktop/Hualien_1080p/images/val/20260407__cam05__cam05_20260407_060013_4_001424_9c29aa8ed6.jpg"
+        ),
+        text_query="ship",
+        save_path="/home/soic/Desktop/LightDet/datasets/pre/result.jpg",
+        image_size=512,
+        score_thr=0.388,
+        iou_thr=0.1,
+        top_k=10,
+        device="cuda:0",
+    )
