@@ -1,49 +1,9 @@
 # LightDet
 
-LightDet 是一個以 **影像 + 中文文字 Query** 為輸入的文字條件式物件偵測模型。
+LightDet 是一個 `Vision-Text to BBox model`，透過文字與圖像輸入定位畫面中的目標物件。
 
-本專案目前以「船舶」為主要偵測目標。模型會根據文字描述，例如：
-
-```text
-紅色的船
-白色船隻
-船體是藍色的船
-```
-
-在影像中預測對應的 bounding boxes 與 confidence。
-
-專案同時支援負文字 Query，例如：
-
-```text
-紅色浮標
-白色汽車
-畫面中的人
-```
-
-負文字 Query 不提供 GT bbox，模型需將其所有 prediction confidence 壓低，以強化文字與影像之間的語意對齊。
-
----
-
-## 主要功能
-
-* 影像與中文文字 Query 多模態融合
-* Query-conditioned bounding box prediction
-* One-to-Many Matcher
-* L1 Bounding Box Loss
-* Generalized IoU Loss
-* Quality Focal Loss
-* 文字負樣本加權 QFL
-* Ranking Loss
-* EMA 模型權重
-* BF16 / FP16 AMP
-* TF32
-* Query Budget Batch Sampler
-* Image Cache
-* BERT Raw Feature Cache
-* Weights-only warm start
-* 完整 checkpoint resume
-* mAP50 / mAP50-95 / Precision / Recall 評估
-* JSONL / CSV 訓練紀錄
+`多模態` `Transformer` `Token Fusion` <br>
+`Decoder Only` `DETR Like`
 
 ---
 
@@ -87,12 +47,108 @@ LightDet/
 
 ---
 
-## 模型輸入與輸出
+## 建置與運行
 
-每一筆 Query-level 樣本包含：
+LightDet 的基本流程如下：
 
 ```text
-影像 + 文字 Query + 該文字對應的 GT bbox
+下載專案
+→ 建立 Python 環境
+→ 安裝相依套件
+→ 準備資料集與標記
+→ 設定 model.yaml 與 train.yaml
+→ 執行 model.train()
+→ 取得 checkpoint 與驗證指標
+```
+
+---
+
+## 1. 下載專案
+
+```bash
+git clone https://github.com/ImChouOWO/LightDet.git
+cd LightDet
+```
+
+---
+
+## 2. 建立 Python 環境
+
+建議環境：
+
+```text
+Python >= 3.10
+PyTorch >= 2.0
+```
+
+Linux 或 macOS：
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+python3 -m pip install --upgrade pip
+```
+
+Windows：
+
+```powershell
+python -m venv venv
+venv\Scripts\activate
+python -m pip install --upgrade pip
+```
+
+---
+
+## 3. 安裝相依套件
+
+```bash
+pip install torch torchvision
+pip install numpy pyyaml tqdm transformers scipy pillow
+```
+
+---
+
+## 4. 準備資料集
+
+資料集目錄：
+
+```text
+/path/to/LightDet/datasets/
+├── images/
+│   ├── train/
+│   └── val/
+├── labels/
+│   ├── train/
+│   └── val/
+└── .cache/
+```
+
+影像與標記檔名稱需要相互對應：
+
+```text
+images/train/000001.jpg
+labels/train/000001.json
+
+images/val/000101.jpg
+labels/val/000101.json
+```
+
+支援的影像格式：
+
+```text
+.jpg
+.jpeg
+.png
+.bmp
+.tif
+.tiff
+.webp
+```
+
+每一張影像可以包含多個物件。資料載入器會根據物件屬性與增強文字建立 Query-level 樣本：
+
+```text
+影像 + 文字 Query + Query 對應的 GT bbox
 ```
 
 例如：
@@ -103,73 +159,152 @@ Query：紅色的船
 GT：紅色船的 bbox
 ```
 
-模型輸出：
+<details>
+<summary><strong>標記檔格式</strong></summary>
 
-```python
-{
-    "bbox": Tensor[Q, N, 4],
-    "score_logit": Tensor[Q, N, 1]
-}
+每張影像對應一個 JSON 標記檔，最外層必須是陣列：
+
+```json
+[
+  {
+    "source_name": "000001.jpg",
+    "class_id": 0,
+    "bbox_xyxy": [120, 80, 420, 300],
+    "attributes": {
+      "main_colors": [
+        "紅色"
+      ]
+    },
+    "query_texts_aug": [
+      "紅色的船",
+      "含紅色的船",
+      "船體是紅色的船"
+    ]
+  },
+  {
+    "source_name": "000001.jpg",
+    "class_id": 0,
+    "bbox_xyxy": [500, 100, 760, 340],
+    "attributes": {
+      "main_colors": [
+        "白色"
+      ]
+    },
+    "query_texts_aug": [
+      "白色的船",
+      "畫面中的白色船隻"
+    ]
+  }
+]
 ```
 
-其中：
+欄位說明：
 
-* `Q`：batch 內文字 Query 數量
-* `N`：每個 Query 的 prediction 數量
-* bbox 格式：normalized `xyxy`
-* score：尚未經 sigmoid 的 logit
+| 欄位 | 必要 | 說明 |
+|---|---:|---|
+| `source_name` | 是 | 對應的影像檔名。相同 JSON 內通常使用相同檔名 |
+| `bbox_xyxy` | 是 | 原始影像像素座標，格式為 `[x1, y1, x2, y2]` |
+| `class_id` | 否 | 類別編號，未設定時預設為 `0` |
+| `attributes.main_colors` | 建議 | 物件主要顏色，用於建立顏色文字 Query |
+| `query_texts_aug` | 建議 | 額外的文字 Query 描述 |
+
+座標條件：
+
+```text
+x1 < x2
+y1 < y2
+```
+
+資料載入器會依序執行：
+
+```text
+原始像素 xyxy
+→ 依 image_size 縮放
+→ 裁切至影像邊界
+→ 正規化至 0～1
+```
+
+因此標記檔中的 `bbox_xyxy` 應保存原始影像的像素座標，不需要預先正規化。
+
+</details>
+
+### Query Budget Batch
+
+當設定：
+
+```yaml
+data:
+  query_budget: true
+
+train:
+  batch_size: 48
+```
+
+`batch_size=48` 代表每個 batch 的 Query 預算，而不是固定載入 48 張影像。
+
+例如：
+
+```text
+影像 A：9 個 Query
+影像 B：13 個 Query
+影像 C：10 個 Query
+影像 D：14 個 Query
+
+總 Query：46
+```
+
+這四張影像可以組成同一個 batch。
 
 ---
 
-## 文字樣本設計
+## 5. 準備 BERT 與文字快取
 
-### 正文字 Query
-
-正文字 Query 由標記檔中的船舶屬性與增強描述產生，例如：
+LightDet 預設使用：
 
 ```text
-紅色的船
-含紅色的船
-紅色船隻
-船體是紅色的船
+hfl/chinese-macbert-base
 ```
 
-每一條正文字 Query 都會對應該文字條件下的 GT bbox。
-
-### 負文字 Query
-
-負文字 Query 從 JSON pool 中抽樣，例如：
+本地模型目錄：
 
 ```text
-紅色浮標
-大型海上平台
-白色汽車
-穿紅色衣服的人
+/path/to/LightDet/units/model/bert/models--hfl--chinese-macbert-base/
 ```
 
-負文字 Query 的 GT 為空集合：
+文字特徵快取：
 
-```python
-targets["boxes"] = []
+```text
+/path/to/LightDet/units/model/cards/cache/bert_raw_cache.pt
 ```
 
-因此：
+當新增文字 Query 時，訓練程式會：
 
-* 不計算 BBox Loss
-* 不計算 GIoU Loss
-* 所有 prediction 的 QFL target 都為 0
+```text
+讀取現有 cache
+→ 檢查缺少的文字
+→ 建立缺少的 BERT 特徵
+→ 更新 bert_raw_cache.pt
+```
+
+模型設定：
+
+```yaml
+model:
+  freeze_bert: true
+  precomputed_bert_path: /path/to/LightDet/units/model/cards/cache/bert_raw_cache.pt
+```
 
 ---
 
-## 負文字 Query Pool
+## 6. 設定負文字 Query Pool
 
-預設路徑：
+預設位置：
 
 ```text
-units/model/cards/cache/negative_query_pool.json
+/path/to/LightDet/units/model/cards/cache/negative_query_pool.json
 ```
 
-格式範例：
+格式：
 
 ```json
 {
@@ -198,11 +333,11 @@ units/model/cards/cache/negative_query_pool.json
 }
 ```
 
-參數說明：
-
-* `sampling_weight`：控制該類別被抽中的機率
-* `loss_weight`：控制該 Query 在 QFL 中的加權倍率
-* `queries`：候選負文字描述
+| 參數 | 說明 |
+|---|---|
+| `sampling_weight` | 控制該分類被抽中的相對機率 |
+| `loss_weight` | 控制該負文字 Query 在 QFL 中的權重 |
+| `queries` | 可抽樣的負文字描述 |
 
 建議初始設定：
 
@@ -212,165 +347,31 @@ severe loss_weight = 4.0
 negative ratio     = 0.05
 ```
 
----
+負文字 Query 沒有對應 GT：
 
-## Loss 結構
+```python
+targets["boxes"] = []
+```
 
-總 Loss：
-
-[
-L_{total}
-=========
-
-\lambda_{bbox}L_{bbox}
-+
-\lambda_{giou}L_{GIoU}
-+
-\lambda_{score}L_{QFL}
-+
-\lambda_{rank}\alpha_{rank}L_{Ranking}
-]
-
-### BBox Loss
-
-只對 Matcher 配對成功的 prediction 計算：
-
-[
-L_{bbox}
-========
-
-\frac{1}{N_{pos}}
-\sum
-\left|
-B_{pred}-B_{gt}
-\right|
-]
-
-### GIoU Loss
-
-[
-L_{GIoU}
-========
-
-\frac{1}{N_{pos}}
-\sum
-\left(
-1-GIoU(B_{pred},B_{gt})
-\right)
-]
-
-### Quality Focal Loss
-
-[
-L_{QFL}
-=======
-
-BCE(z,y)\cdot|y-\sigma(z)|^\beta
-]
-
-目前：
+因此：
 
 ```text
-beta = 2.0
+不計算 BBox Loss
+不計算 GIoU Loss
+所有 prediction 的 score target 為 0
 ```
-
-正樣本 target 由 1 漸進轉為 IoU：
-
-[
-y_{pos}
-=======
-
-(1-\alpha_q)+\alpha_q\cdot IoU
-]
-
-一般負 prediction：
-
-[
-y=0
-]
-
-負文字 Query：
-
-[
-y=0
-]
-
-並乘上 query loss weight：
-
-[
-L_{text-neg}
-============
-
-w_q\cdot QFL(z,0)
-]
-
-`loss_text_negative` 已包含在整體 QFL 中，只作為監控指標，不會再次加入總 Loss。
-
-### Ranking Loss
-
-Ranking Loss 用於：
-
-1. 讓高 IoU 正樣本 score 高於低 IoU 正樣本
-2. 讓正樣本 score 高於高分負樣本
-
-[
-L_{rank}
-========
-
-\max(0,m-(s_{positive}-s_{negative}))
-]
-
-Ranking 透過 warmup 排程逐步啟用。
 
 ---
 
-## Matcher
+## 7. 設定模型結構
 
-目前 Matcher 主要依據：
-
-[
-C_{ij}
-======
-
-## \lambda_{bbox}C_{L1}
-
-\lambda_{giou}GIoU
-]
-
-建議設定：
-
-```yaml
-loss:
-  matcher:
-    cost_bbox: 5.0
-    cost_giou: 2.0
-    cost_score: 0.0
-```
-
-`cost_score: 0.0` 表示 assignment 不直接依賴 confidence，避免訓練前期 score 不穩定造成錯誤配對。
-
----
-
-## 安裝環境
-
-建議：
+設定檔：
 
 ```text
-Python >= 3.10
-PyTorch >= 2.0
-CUDA GPU
+/path/to/LightDet/units/model/cards/config/model.yaml
 ```
 
-安裝基本套件：
-
-```bash
-pip install torch torchvision
-pip install numpy pyyaml tqdm transformers scipy pillow
-```
-
----
-
-## model.yaml
+範例：
 
 ```yaml
 model:
@@ -384,10 +385,10 @@ model:
   fusion_token_num: 16
   dropout: 0.1
   freeze_bert: true
-  precomputed_bert_path: units/model/cards/cache/bert_raw_cache.pt
+  precomputed_bert_path: /path/to/LightDet/units/model/cards/cache/bert_raw_cache.pt
 ```
 
-使用既有 checkpoint 時，以下結構必須一致：
+使用既有 checkpoint 時，下列結構必須與 checkpoint 一致：
 
 ```text
 hidden_dim
@@ -397,26 +398,43 @@ image_grid_size
 fusion_token_num
 ```
 
-例如舊 checkpoint 使用 `num_layers: 2`，目前模型也必須保持 2 層，否則 `strict=True` 載入會出現 missing keys。
+例如舊 checkpoint 使用：
+
+```yaml
+num_layers: 2
+```
+
+目前模型也必須保持兩層，否則使用 `strict=True` 載入時會出現 missing keys。
 
 ---
 
-## train.yaml
+## 8. 設定訓練參數
+
+設定檔：
+
+```text
+/path/to/LightDet/units/model/cards/config/train.yaml
+```
+
+主要設定：
 
 ```yaml
 data:
-  dataset_dir: /home/soic/Desktop/LightDet/datasets
+  dataset_dir: /path/to/LightDet/datasets
   image_size: 512
   max_text_aug_per_image: 1
+
   cache_images: true
-  image_cache_dir: /home/soic/Desktop/LightDet/datasets/.cache/images_512_uint8
+  image_cache_dir: /path/to/LightDet/datasets/.cache/images_512_uint8
   prebuild_image_cache: true
+  cache_workers: 8
+
   prefetch_factor: 4
   pin_memory: true
   persistent_workers: true
   query_budget: true
-  cache_workers: 8
-  negative_query_path: /home/soic/Desktop/LightDet/units/model/cards/cache/negative_query_pool.json
+
+  negative_query_path: /path/to/LightDet/units/model/cards/cache/negative_query_pool.json
   negative_sample_ratio: 0.05
   use_negative_queries_in_val: false
 
@@ -425,14 +443,17 @@ train:
   batch_size: 48
   warmup_epochs: 5
   num_workers: 16
-  device: cuda:1
+  device: cuda:0
   seed: 47
   deterministic: false
+
   use_amp: true
   amp_dtype: bf16
+
   use_ema: true
   ema_decay: 0.999
   grad_clip_norm: 1.0
+
   allow_tf32: true
   matmul_precision: high
   channels_last: false
@@ -449,54 +470,6 @@ optim:
   max_warmup_steps: 3000
   fused: true
 
-loss:
-  matcher:
-    cost_bbox: 5.0
-    cost_giou: 2.0
-    cost_score: 0.0
-
-  score_sampling:
-    hard_negative_ratio: 5
-    positive_ratio: 0.05
-    max_positive_per_gt: 2
-    aux_positive_label: 0.7
-    expand_cost_bbox: 5.0
-    expand_cost_giou: 2.0
-
-  quality:
-    iou_pos_thr: 0.15
-    quality_min: 0.25
-    quality_max: 1.0
-    qfl_beta: 2.0
-    quality_warmup_epoch: 20
-
-  ranking:
-    lambda_rank: 0.10
-    rank_margin: 0.1
-    rank_min_quality_gap: 0.1
-    rank_max_pairs: 512
-    rank_start_epoch: 15
-    rank_warmup_epoch: 30
-    rank_alpha_min: 0.0
-
-  text_negative:
-    max_query_loss_weight: 10.0
-
-  weight:
-    dynamic: true
-    bbox: 5.0
-    giou: 2.0
-    score: 2.0
-    bbox_start: 5.0
-    bbox_end: 3.0
-    bbox_decay_until: 0.5
-    score_start: 2.0
-    score_end: 4.0
-    score_warm_until: 0.4
-
-  pos_weight:
-    value: 1.0
-
 eval:
   val_loss_interval: 5
   eval_interval: 1
@@ -509,121 +482,113 @@ eval:
   use_topk_fallback: false
 
 log:
-  save_dir: runs/train/lightdet_neg_pool
+  save_dir: runs/train/lightdet_exp
   resume_path: null
   save_latest_interval: 1
   save_epoch_interval: 50
   emit_step_metrics: false
   log_interval: 50
-  progress_leave: true
-  progress_mininterval: 0.5
 ```
+
+`model.train()` 中明確指定的參數會覆蓋 `train.yaml` 中的對應設定。
 
 ---
 
-## 啟動訓練
+## 9. 啟動訓練
 
-```bash
-cd /home/soic/Desktop/LightDet/units/model
-python3 train.py
-```
-
----
-
-## 從頭訓練
+在執行檔中建立模型：
 
 ```python
+from train import LightDet
+
+model = LightDet(
+    model="/path/to/LightDet/units/model/cards/config/model.yaml"
+)
+
 model.train(
-    cfg="/home/soic/Desktop/LightDet/units/model/cards/config/train.yaml",
-    data="/home/soic/Desktop/LightDet/datasets",
+    cfg="/path/to/LightDet/units/model/cards/config/train.yaml",
+    data="/path/to/LightDet/datasets",
 
     weights=None,
-    resume=None,
-
-    epochs=300,
-    imgsz=512,
-    batch=48,
-    device=1,
-    workers=16,
-
-    project="runs/train",
-    name="lightdet_scratch",
-)
-```
-
----
-
-## Weights-only Warm Start
-
-適合：
-
-* 修改 Loss
-* 修改負文字 Query
-* 修改 Ranking 排程
-* 修改資料分布
-* 希望沿用舊模型能力，但重置 optimizer 與 scheduler
-
-```python
-model.train(
-    cfg="/home/soic/Desktop/LightDet/units/model/cards/config/train.yaml",
-    data="/home/soic/Desktop/LightDet/datasets",
-
-    weights=(
-        "/home/soic/Desktop/LightDet/units/model/runs/train/"
-        "lightdet_rank_smooth_010/best_map50_95.pt"
-    ),
     resume=None,
     prefer_ema=True,
 
     epochs=300,
     imgsz=512,
     batch=48,
-    device=1,
+    device=0,
     workers=16,
+    seed=47,
+    deterministic=False,
 
-    project="runs/train",
-    name="lightdet_neg_pool",
+    project="/path/to/LightDet/units/model/runs/train",
+    name="lightdet_exp",
 )
 ```
 
-此模式只恢復模型或 EMA 權重。
+執行：
 
-以下項目會重置：
-
-```text
-optimizer
-scheduler
-GradScaler
-epoch
-best metric
-RNG state
+```bash
+cd /path/to/LightDet/units/model
+python3 train.py
 ```
 
----
+### 訓練模式
 
-## 完整 Resume
+三種訓練模式統一由 `weights` 與 `resume` 控制：
 
-適用於同一實驗中斷後繼續訓練。
+| 模式 | `weights` | `resume` | 用途 |
+|---|---|---|---|
+| 從頭訓練 | `None` | `None` | 不載入舊 checkpoint，重新建立完整訓練狀態 |
+| Weights-only warm start | checkpoint 路徑 | `None` | 載入模型或 EMA 權重，但重置 optimizer、scheduler、epoch 與最佳指標 |
+| 完整續訓 | `None` | checkpoint 路徑或 `True` | 恢復模型、EMA、optimizer、scheduler、GradScaler、epoch、最佳指標與 RNG state |
+
+注意：
+
+```text
+weights 與 resume 不可同時使用
+```
+
+Weights-only warm start：
 
 ```python
 model.train(
-    cfg="/home/soic/Desktop/LightDet/units/model/cards/config/train.yaml",
-    data="/home/soic/Desktop/LightDet/datasets",
+    cfg="/path/to/LightDet/units/model/cards/config/train.yaml",
+    data="/path/to/LightDet/datasets",
 
-    weights=None,
-    resume=(
-        "/home/soic/Desktop/LightDet/units/model/runs/train/"
-        "lightdet_neg_pool/latest.pt"
-    ),
+    weights="/path/to/checkpoints/best_map50_95.pt",
+    resume=None,
+    prefer_ema=True,
 
     epochs=300,
     imgsz=512,
     batch=48,
-    device=1,
+    device=0,
     workers=16,
 
-    project="runs/train",
-    name="lightdet_neg_pool",
+    project="/path/to/LightDet/units/model/runs/train",
+    name="lightdet_warm_start",
+)
+```
+
+完整續訓：
+
+```python
+model.train(
+    cfg="/path/to/LightDet/units/model/cards/config/train.yaml",
+    data="/path/to/LightDet/datasets",
+
+    weights=None,
+    resume="/path/to/LightDet/units/model/runs/train/lightdet_exp/latest.pt",
+
+    epochs=300,
+    imgsz=512,
+    batch=48,
+    device=0,
+    workers=16,
+
+    project="/path/to/LightDet/units/model/runs/train",
+    name="lightdet_exp",
 )
 ```
 
@@ -633,37 +598,113 @@ model.train(
 resume=True
 ```
 
-此時自動尋找：
+此時會尋找：
 
 ```text
-runs/train/<name>/latest.pt
-```
-
-完整 resume 會恢復：
-
-```text
-model
-EMA
-optimizer
-scheduler
-GradScaler
-epoch
-best metric
-RNG state
+<project>/<name>/latest.pt
 ```
 
 ---
 
-## Checkpoint 檢查
+## 10. `model.train()` 參數
 
-```python
-model.inspect_checkpoint(
-    "/home/soic/Desktop/LightDet/units/model/runs/train/"
-    "lightdet_neg_pool/latest.pt"
-)
+### 基本與 checkpoint 參數
+
+| 參數 | 型別 | 用途 |
+|---|---|---|
+| `cfg` | `str` | `train.yaml` 路徑 |
+| `data` | `str \| None` | 資料集根目錄，覆蓋 `data.dataset_dir` |
+| `epochs` | `int \| None` | 訓練總 epoch |
+| `imgsz` | `int \| None` | 輸入影像尺寸 |
+| `batch` | `int \| None` | Batch 或 Query Budget 上限 |
+| `device` | `int \| str \| None` | 運算裝置，例如 `0`、`1`、`"cuda:0"` 或 `"cpu"` |
+| `workers` | `int \| None` | DataLoader worker 數量 |
+| `seed` | `int \| None` | 隨機種子 |
+| `deterministic` | `bool \| None` | 是否啟用 deterministic 訓練 |
+| `project` | `str` | 實驗輸出根目錄 |
+| `name` | `str` | 實驗名稱 |
+| `weights` | `str \| None` | Weights-only warm start checkpoint |
+| `resume` | `str \| bool \| None` | 完整續訓 checkpoint；`True` 代表尋找 `<project>/<name>/latest.pt` |
+| `prefer_ema` | `bool` | Warm start 時優先載入 EMA 權重 |
+
+### 資料載入參數
+
+| 參數 | 型別 | 用途 |
+|---|---|---|
+| `cache_images` | `bool \| None` | 是否使用影像快取 |
+| `image_cache_dir` | `str \| None` | 影像快取輸出目錄 |
+| `prebuild_image_cache` | `bool \| None` | 是否在訓練前預先建立快取 |
+| `prefetch_factor` | `int \| None` | 每個 worker 預先載入的 batch 數 |
+| `pin_memory` | `bool \| None` | 是否啟用 pinned memory |
+| `persistent_workers` | `bool \| None` | epoch 之間是否保留 DataLoader workers |
+| `negative_query_path` | `str \| None` | 負文字 Query Pool 路徑 |
+| `negative_sample_ratio` | `float \| None` | 負文字 Query 取樣比例，範圍為 `0～1` |
+| `use_negative_queries_in_val` | `bool \| None` | 驗證階段是否加入負文字 Query |
+
+### Optimizer 與執行參數
+
+| 參數 | 型別 | 用途 |
+|---|---|---|
+| `lr` | `float \| None` | 同時設定 vision、transformer 與 head learning rate |
+| `lr_vision` | `float \| None` | Vision backbone learning rate |
+| `lr_text` | `float \| None` | Text encoder learning rate |
+| `lr_transformer` | `float \| None` | Transformer learning rate |
+| `lr_head` | `float \| None` | BBox 與 score head learning rate |
+| `weight_decay` | `float \| None` | Optimizer weight decay |
+| `amp_dtype` | `str \| None` | AMP dtype，例如 `"bf16"` 或 `"fp16"` |
+| `compile_model` | `bool \| None` | 是否使用 `torch.compile` |
+| `channels_last` | `bool \| None` | 是否使用 channels-last memory format |
+| `startup_smoke_test` | `bool \| None` | 正式訓練前是否執行啟動測試 |
+| `use_ema` | `bool \| None` | 是否啟用 EMA |
+| `ema_decay` | `float \| None` | EMA decay，範圍為 `[0,1)` |
+
+### 驗證與後處理參數
+
+| 參數 | 型別 | 用途 |
+|---|---|---|
+| `score_thr` | `float \| None` | 驗證時的最低 confidence threshold |
+| `top_k` | `int \| None` | 每個 Query 保留的最高分 prediction 數量 |
+| `nms_iou_thr` | `float \| None` | NMS IoU threshold |
+| `use_nms` | `bool \| None` | 是否在驗證階段使用 NMS |
+| `use_topk_fallback` | `bool \| None` | 無 prediction 通過 threshold 時是否保留 top-k fallback |
+
+### QFL、Ranking 與負樣本參數
+
+| 參數 | 型別 | 用途 |
+|---|---|---|
+| `hard_negative_ratio` | `int \| None` | Score loss 中 hard negative 與 positive 的比例 |
+| `positive_ratio` | `float \| None` | 額外正樣本的候選比例 |
+| `max_positive_per_gt` | `int \| None` | 每個 GT 最多使用的正 prediction 數量 |
+| `iou_pos_thr` | `float \| None` | 判定 quality positive 的最低 IoU |
+| `quality_min` | `float \| None` | Quality target 下限 |
+| `quality_max` | `float \| None` | Quality target 上限 |
+| `qfl_beta` | `float \| None` | Quality Focal Loss 的 beta |
+| `quality_warmup_epoch` | `int \| None` | Quality target 從常數轉為 IoU 的 warmup epoch |
+| `lambda_rank` | `float \| None` | Ranking Loss 最大權重 |
+| `rank_start_epoch` | `int \| None` | Ranking Loss 開始啟用的 epoch |
+| `rank_warmup_epoch` | `int \| None` | Ranking Loss warmup 結束 epoch |
+| `rank_alpha_min` | `float \| None` | Ranking warmup 的最小 alpha |
+| `max_query_loss_weight` | `float \| None` | 負文字 Query loss weight 上限 |
+
+未支援的參數會觸發：
+
+```text
+TypeError: Unsupported train arguments
 ```
 
-會顯示：
+---
+
+## 11. Checkpoint 檢查
+
+```python
+checkpoint_info = model.inspect_checkpoint(
+    "/path/to/checkpoints/latest.pt"
+)
+
+print(checkpoint_info)
+```
+
+檢查內容包含：
 
 ```text
 model
@@ -677,66 +718,20 @@ weights_only
 full_resume
 ```
 
----
+判斷方式：
 
-## BERT Cache
-
-模型使用凍結的中文 MacBERT：
-
-```text
-hfl/chinese-macbert-base
-```
-
-BERT cache 預設路徑：
-
-```text
-units/model/cards/cache/bert_raw_cache.pt
-```
-
-負文字池加入新文字時，訓練程式會：
-
-```text
-讀取現有 cache
-→ 檢查缺少的文字
-→ 只補建 missing texts
-→ 更新 bert_raw_cache.pt
-```
+| Checkpoint 狀態 | 建議載入方式 |
+|---|---|
+| 只有模型或 EMA 權重 | 使用 `weights=...` |
+| 包含 optimizer、scheduler 與 epoch | 可使用 `resume=...` |
+| 模型結構已修改 | 不建議完整 resume |
+| Loss 或資料策略已修改 | 建議使用 weights-only warm start |
 
 ---
 
-## Query Budget Batch
+## 12. 訓練輸出
 
-當：
-
-```yaml
-query_budget: true
-batch_size: 48
-```
-
-`batch_size=48` 代表每個 batch 的 Query 預算，不是固定 48 張影像。
-
-例如：
-
-```text
-影像 A：9 個 Query
-影像 B：13 個 Query
-影像 C：10 個 Query
-影像 D：14 個 Query
-```
-
-總 Query：
-
-```text
-9 + 13 + 10 + 14 = 46
-```
-
-這 4 張影像可以組成一個 batch。
-
----
-
-## 訓練輸出
-
-範例：
+訓練過程範例：
 
 ```text
 Epoch 8/300 [Train]:
@@ -749,38 +744,26 @@ txtneg=0.0001
 nq=3
 ```
 
-欄位說明：
-
-* `loss`：總 Loss
-* `bbox`：BBox L1 Loss
-* `giou`：GIoU Loss
-* `score`：整體 QFL
-* `rank`：加入總 Loss 的 Ranking 貢獻
-* `raw`：未乘權重的 Ranking Loss
-* `ra`：Ranking alpha
-* `lrk`：有效 Ranking 權重
-* `txtneg`：文字負樣本 QFL 統計值
-* `nq`：目前 batch 中負文字 Query 數量
-
-例如：
+| 欄位 | 說明 |
+|---|---|
+| `loss` | 加權後的總 Loss |
+| `bbox` | BBox L1 Loss |
+| `giou` | GIoU Loss |
+| `score` | 整體 Quality Focal Loss |
+| `rank` | 加入總 Loss 的 Ranking Loss 貢獻 |
+| `raw` | 尚未乘上權重的 Ranking Loss |
+| `ra` | Ranking warmup alpha |
+| `lrk` | 目前實際生效的 Ranking 權重 |
+| `txtneg` | 負文字 Query 的 QFL 監控值 |
+| `nq` | 當前 batch 中的負文字 Query 數量 |
 
 ```text
-nq=3
+nq=0
 ```
 
-代表目前 batch 中有 3 條負文字 Query。
+只代表目前 batch 沒有抽到負文字 Query，不代表整個訓練未使用負文字資料。
 
----
-
-## 驗證
-
-驗證階段同樣輸入：
-
-```text
-影像 + 文字 Query
-```
-
-目前輸出：
+驗證輸出包含：
 
 ```text
 mAP50
@@ -793,29 +776,21 @@ GT
 Pred
 ```
 
-當：
+當設定：
 
 ```yaml
-use_negative_queries_in_val: false
+eval:
+  best_metric: map50_95
 ```
 
-一般驗證集不加入負文字 Query，主要評估正文字 Query 下的定位能力。
-
-後續可額外加入：
-
-```text
-negative_score_mean
-negative_score_max
-negative_fp_rate@0.1
-negative_fp_rate@0.25
-```
+最佳 checkpoint 會依照 `mAP50-95` 選擇。
 
 ---
 
-## 訓練輸出檔案
+## 13. 輸出檔案
 
 ```text
-runs/train/<experiment>/
+/path/to/LightDet/units/model/runs/train/<experiment>/
 ├── latest.pt
 ├── best_map50_95.pt
 ├── epoch_050.pt
@@ -825,35 +800,36 @@ runs/train/<experiment>/
 └── latest_metrics.json
 ```
 
-* `latest.pt`：最新 checkpoint
-* `best_map50_95.pt`：最佳 mAP50-95 checkpoint
-* `epoch_XXX.pt`：固定週期 checkpoint
-* `metrics_epoch.jsonl`：epoch-level 指標
-* `metrics_step.jsonl`：step-level 指標
-* `metrics_epoch.csv`：CSV 格式指標
-* `latest_metrics.json`：最新指標
+| 檔案 | 說明 |
+|---|---|
+| `latest.pt` | 最新 epoch 的完整 checkpoint |
+| `best_map50_95.pt` | 驗證集 mAP50-95 最佳 checkpoint |
+| `epoch_XXX.pt` | 固定週期保存的 checkpoint |
+| `metrics_epoch.jsonl` | Epoch-level 指標 |
+| `metrics_step.jsonl` | Step-level 指標 |
+| `metrics_epoch.csv` | CSV 格式訓練指標 |
+| `latest_metrics.json` | 最新一次訓練與驗證結果 |
 
 ---
 
-## EMA
+## 14. EMA
 
 設定：
 
 ```yaml
-use_ema: true
-ema_decay: 0.999
+train:
+  use_ema: true
+  ema_decay: 0.999
 ```
 
-訓練更新原始模型，驗證預設使用 EMA 模型。
-
-Checkpoint 同時保存：
+Checkpoint 會同時保存：
 
 ```text
 model
 ema
 ```
 
-weights-only warm start 時：
+Weights-only warm start 時：
 
 ```python
 prefer_ema=True
@@ -863,7 +839,85 @@ prefer_ema=True
 
 ---
 
-## 常見問題
+## 20. 常見問題
+
+### CUDA 無法使用
+
+檢查：
+
+```bash
+python3 -c "import torch; print(torch.cuda.is_available())"
+```
+
+如果輸出：
+
+```text
+False
+```
+
+請確認目前 Python 環境安裝的 PyTorch 是否支援所使用的運算裝置。
+
+---
+
+### GPU 編號錯誤
+
+```python
+device=1
+```
+
+代表使用第 2 張 GPU。
+
+只有一張 GPU 時應使用：
+
+```python
+device=0
+```
+
+或：
+
+```python
+device="cuda:0"
+```
+
+---
+
+### BERT Cache 缺少文字
+
+加入新的文字 Query 後，訓練程式會自動補建缺少的文字特徵。
+
+若快取格式已改變，可以刪除：
+
+```text
+/path/to/LightDet/units/model/cards/cache/bert_raw_cache.pt
+```
+
+再重新啟動訓練。
+
+刪除後會重新建立全部文字特徵。
+
+---
+
+### Transformer Missing Keys
+
+錯誤：
+
+```text
+Missing key(s):
+transformer.transformer.layers.2.*
+```
+
+通常代表目前模型層數與 checkpoint 不一致。
+
+檢查：
+
+```yaml
+model:
+  num_layers: 2
+```
+
+模型結構必須與 checkpoint 建立時的設定一致。
+
+---
 
 ### `enable_nested_tensor` 警告
 
@@ -872,28 +926,50 @@ enable_nested_tensor is True, but self.use_nested_tensor is False
 because encoder_layer.norm_first was True
 ```
 
-這是 PyTorch Transformer 的效能提示，不會中斷訓練。
+這是 PyTorch Transformer 的效能提示，不會中斷訓練，也不代表模型結構錯誤。
 
-### Missing Transformer Layer Keys
+---
+
+### `weights` 與 `resume` 同時設定
+
+以下寫法不支援：
+
+```python
+model.train(
+    weights="/path/to/best.pt",
+    resume="/path/to/latest.pt",
+)
+```
+
+請根據目的選擇其中一種：
 
 ```text
-Missing key(s):
-transformer.transformer.layers.2.*
+weights：只載入模型權重並開始新實驗
+resume：恢復完整訓練狀態
 ```
 
-表示目前模型使用 3 層 Transformer，但 checkpoint 只有 2 層。
+---
 
-修正：
+### `resume=True` 找不到 checkpoint
 
-```yaml
-num_layers: 2
+`resume=True` 會尋找：
+
+```text
+<project>/<name>/latest.pt
 ```
 
-### `nq=0`
+需要確認：
 
-代表目前 batch 沒有排入負文字 Query，不表示整體訓練未使用負文字。
+```python
+project="/path/to/LightDet/units/model/runs/train"
+name="lightdet_exp"
+```
 
-### `txtneg` 很低
+與原實驗輸出目錄一致。
+
+---
+
+### `txtneg` 數值很低
 
 例如：
 
@@ -901,31 +977,39 @@ num_layers: 2
 txtneg=0.0001
 ```
 
-通常代表模型已將該 batch 的負文字 Query confidence 壓低。
+通常代表模型已將負文字 Query 的 confidence 壓低。
 
----
-
-## 建議實驗流程
+仍需搭配下列指標判斷：
 
 ```text
-1. 使用舊最佳 EMA checkpoint warm start
-2. hard/severe 權重先設為 2/4
-3. negative_sample_ratio 設為 0.05
-4. 觀察 Recall 是否下降
-5. 觀察 txtneg、score 與 nq
-6. Ranking 經 warmup 後逐步啟用
-7. 若負文字 confidence 仍偏高，再調整為 3/6
-8. 使用 mAP50-95 選擇最佳 checkpoint
+Recall
+Precision
+FP
+mAP50
+mAP50-95
 ```
+
+避免負樣本抑制過強導致正樣本 Recall 下降。
 
 ---
 
-## 目前研究方向
+## 快速啟動
 
-* 文字條件式船舶偵測
-* 中文文字與海事影像對齊
-* 負文字 Query 抑制
-* Confidence 與定位品質一致性
-* 輕量化多模態偵測
-* Edge AI 推論部署
-* 船舶監控與航行影像應用
+```bash
+cd /path/to/LightDet
+
+python3 -m venv venv
+source venv/bin/activate
+
+pip install torch torchvision
+pip install numpy pyyaml tqdm transformers scipy pillow
+
+cd units/model
+python3 train.py
+```
+
+訓練結果會輸出至：
+
+```text
+/path/to/LightDet/units/model/runs/train/<experiment>/
+```
