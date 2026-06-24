@@ -4,7 +4,7 @@
   "description": "船舶目標的中文負樣本查詢池，包含海事場景近似物與嚴重語意偏離物件。",
   "categories": {
     "hard": {
-      "sampling_weight": 1.0,
+      "sampling_weight": 0.1,
       "loss_weight": 4.0,
       "queries": [
         "浮標",
