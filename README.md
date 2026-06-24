@@ -526,8 +526,8 @@ python3 train.py
 | 模式 | `weights` | `resume` | 用途 |
 |---|---|---|---|
 | 從頭訓練 | `None` | `None` | 不載入舊 checkpoint，重新建立完整訓練狀態 |
-| Weights-only warm start | `checkpoint` 路徑 | `None` | 載入模型或 EMA 權重，但重置 optimizer、scheduler、epoch 與最佳指標 |
-| 接續訓練 | `None` | `checkpoint` 路徑 | 恢復模型、EMA、optimizer、scheduler、GradScaler、epoch、最佳指標與 RNG state |
+| Weights-only warm start | `checkpoint path` | `None` | 載入模型或 EMA 權重，但重置 optimizer、scheduler、epoch 與最佳指標 |
+| 接續訓練 | `None` | `checkpoint path` | 恢復模型先前模型訓練狀態 |
 
 >[!NOTE]
 >weights 與 resume 不可同時使用
