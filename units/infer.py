@@ -388,10 +388,10 @@ if __name__ == "__main__":
         image_path=(
             "/home/soic/Desktop/Hualien_1080p/images/val/20260407__cam05__cam05_20260407_060013_4_001424_9c29aa8ed6.jpg"
         ),
-        text_query="ship",
+        text_query="船",
         save_path="/home/soic/Desktop/LightDet/datasets/pre/result.jpg",
         image_size=512,
-        score_thr=0.388,
+        score_thr=0.39,
         iou_thr=0.1,
         top_k=10,
         device="cuda:0",
