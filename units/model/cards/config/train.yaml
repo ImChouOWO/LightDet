@@ -57,32 +57,23 @@ loss:
     cost_score: 0.0
 
   score_sampling:
-    # QFL 使用所有 unmatched predictions；此參數只保留給 optional ranking loss。
-    hard_negative_ratio: 3
 
-    # 每個 GT 最多取得 2 個同步訓練 bbox/GIoU/QFL 的 positives。
+    hard_negative_ratio: 3
     positive_ratio: 1.0
     max_positive_per_gt: 2
-
-    # 為相容目前 GroundingLoss 建構介面而保留；aligned loss 不使用。
     aux_positive_label: 0.7
     expand_cost_bbox: 5.0
     expand_cost_giou: 2.0
 
   quality:
-    # 額外 one-to-many positive 的最低 IoU gate；初期設 0 保留密集監督。
     iou_pos_thr: 0.0
-
-    # 為相容建構介面而保留；score target 直接使用 matched IoU。
     quality_min: 0.0
     quality_max: 1.0
-
     qfl_beta: 2.0
     quality_warmup_epoch: 10
 
   ranking:
-    # 先建立純 aligned baseline。
-    lambda_rank: 0.0
+    lambda_rank: 0.3
     rank_margin: 0.1
     rank_min_quality_gap: 0.1
     rank_max_pairs: 512
