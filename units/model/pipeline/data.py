@@ -3,7 +3,8 @@ import json
 import random
 import hashlib
 import math
-from typing import List, Optional, Tuple
+import bisect
+from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
@@ -26,6 +27,138 @@ IMAGE_EXTS = [
 ]
 
 CACHE_VERSION = "lightdet_uint8_image_cache_v3_gpu_decode"
+DEFAULT_NEGATIVE_QUERY_POOL_FILENAME = "negative_query_pool.json"
+DEFAULT_NEGATIVE_QUERY_POOL_PATH = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "cards",
+        "cache",
+        DEFAULT_NEGATIVE_QUERY_POOL_FILENAME,
+    )
+)
+DEFAULT_NEGATIVE_QUERY_POOL_CONTENT = {
+    "version": 1,
+    "categories": {
+        "hard": {
+            "sampling_weight": 1.0,
+            "loss_weight": 3.0,
+            "queries": [],
+        },
+        "severe": {
+            "sampling_weight": 1.0,
+            "loss_weight": 8.0,
+            "queries": [],
+        },
+    },
+}
+
+
+def ensure_negative_query_pool_file(path: Optional[str]) -> Optional[str]:
+    """Create an empty JSON query-pool template when the file does not exist."""
+    if path is None:
+        return None
+
+    path = os.path.abspath(str(path))
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    if not os.path.exists(path):
+        temporary_path = path + ".tmp"
+        with open(temporary_path, "w", encoding="utf-8") as file:
+            json.dump(
+                DEFAULT_NEGATIVE_QUERY_POOL_CONTENT,
+                file,
+                ensure_ascii=False,
+                indent=2,
+            )
+            file.write("\n")
+        os.replace(temporary_path, path)
+
+    return path
+
+
+def load_negative_query_pool(path: Optional[str]) -> List[Dict[str, Any]]:
+    """
+    Load the JSON pool once during Dataset initialization.
+
+    Preferred schema:
+    {
+      "version": 1,
+      "categories": {
+        "hard": {
+          "sampling_weight": 1.0,
+          "loss_weight": 3.0,
+          "queries": []
+        },
+        "severe": {
+          "sampling_weight": 1.0,
+          "loss_weight": 8.0,
+          "queries": []
+        }
+      }
+    }
+    """
+    path = ensure_negative_query_pool_file(path)
+    if path is None:
+        return []
+
+    with open(path, "r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            "negative query pool must be a JSON object containing 'categories'"
+        )
+
+    categories = data.get("categories", data)
+    if not isinstance(categories, dict):
+        raise ValueError("negative query pool 'categories' must be a JSON object")
+
+    entries: List[Dict[str, Any]] = []
+    seen = set()
+
+    for category, config in categories.items():
+        if isinstance(config, list):
+            queries = config
+            sampling_weight = 1.0
+            loss_weight = 1.0
+        elif isinstance(config, dict):
+            queries = config.get("queries", [])
+            sampling_weight = config.get("sampling_weight", 1.0)
+            loss_weight = config.get("loss_weight", 1.0)
+        else:
+            raise ValueError(
+                f"negative category '{category}' must be an object or list"
+            )
+
+        if not isinstance(queries, list):
+            raise ValueError(
+                f"negative category '{category}'.queries must be a list"
+            )
+
+        sampling_weight = max(0.0, float(sampling_weight))
+        loss_weight = max(1.0, float(loss_weight))
+
+        for query in queries:
+            query = str(query).strip()
+            if not query:
+                continue
+
+            dedup_key = (str(category), query)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+
+            entries.append({
+                "query_text": query,
+                "negative_type": str(category),
+                "sampling_weight": sampling_weight,
+                "loss_weight": loss_weight,
+            })
+
+    return entries
 
 
 class ShipGroundingDataset(Dataset):
@@ -47,6 +180,8 @@ class ShipGroundingDataset(Dataset):
         cache_images: bool = False,
         image_cache_dir: Optional[str] = None,
         prebuild_image_cache: bool = False,
+        negative_query_path: Optional[str] = None,
+        negative_sample_ratio: float = 0.05,
     ):
         self.image_dir = image_dir
         self.anno_paths = anno_paths
@@ -72,6 +207,26 @@ class ShipGroundingDataset(Dataset):
         self.require_cache_ready = bool(self.cache_images and self.prebuild_image_cache)
         self.image_level_batching = bool(self.cache_images and self.prebuild_image_cache)
         self.image_cache_map = {}
+
+        self.negative_query_path = ensure_negative_query_pool_file(
+            negative_query_path
+        )
+        self.negative_sample_ratio = min(
+            max(0.0, float(negative_sample_ratio)),
+            1.0,
+        )
+        self.negative_query_pool = load_negative_query_pool(
+            self.negative_query_path
+        )
+        self.negative_rng = random.Random(
+            None if random_seed is None else int(random_seed) + 1000003
+        )
+        self._negative_sampling_cumulative = []
+        cumulative_weight = 0.0
+        for entry in self.negative_query_pool:
+            cumulative_weight += float(entry["sampling_weight"])
+            self._negative_sampling_cumulative.append(cumulative_weight)
+        self._negative_sampling_total = cumulative_weight
 
         if self.cache_images:
             if self.image_cache_dir is None:
@@ -138,6 +293,8 @@ class ShipGroundingDataset(Dataset):
         for sample in self.samples:
             self.samples_by_anno[sample["anno_idx"]].append(sample)
 
+        self.add_negative_query_samples()
+
         self.image_level_indices = [
             idx for idx, samples in enumerate(self.samples_by_anno)
             if len(samples) > 0
@@ -147,6 +304,94 @@ class ShipGroundingDataset(Dataset):
             1,
             int(math.ceil(len(self.samples) / max(1, len(self.image_level_indices))))
         )
+
+    def sample_negative_query_entry(
+        self,
+        true_queries: set,
+    ) -> Optional[Dict[str, Any]]:
+        if not self.negative_query_pool or self._negative_sampling_total <= 0:
+            return None
+
+        # Most severe negatives never overlap with the positive query set. A few
+        # bounded retries keep selection O(log N) without rebuilding candidates.
+        for _ in range(16):
+            value = self.negative_rng.random() * self._negative_sampling_total
+            index = bisect.bisect_left(
+                self._negative_sampling_cumulative,
+                value,
+            )
+            index = min(index, len(self.negative_query_pool) - 1)
+            entry = self.negative_query_pool[index]
+            if entry["query_text"] not in true_queries:
+                return entry
+
+        # Rare fallback when the pool heavily overlaps the current image.
+        for entry in self.negative_query_pool:
+            if (
+                float(entry["sampling_weight"]) > 0
+                and entry["query_text"] not in true_queries
+            ):
+                return entry
+        return None
+
+    def add_negative_query_samples(self) -> None:
+        """
+        Add exactly about negative_sample_ratio of the current positive queries.
+
+        Negative samples are generated once during Dataset initialization. They
+        therefore add no JSON parsing, candidate construction or random sampling
+        cost inside __getitem__ or the training loop.
+        """
+        if self.negative_sample_ratio <= 0:
+            return
+        if not self.negative_query_pool or self._negative_sampling_total <= 0:
+            return
+
+        positive_count = len(self.samples)
+        if positive_count == 0:
+            return
+
+        negative_count = int(round(positive_count * self.negative_sample_ratio))
+        if negative_count <= 0:
+            return
+
+        if negative_count <= positive_count:
+            selected_indices = self.negative_rng.sample(
+                range(positive_count),
+                k=negative_count,
+            )
+        else:
+            selected_indices = [
+                self.negative_rng.randrange(positive_count)
+                for _ in range(negative_count)
+            ]
+
+        negative_samples = []
+        for sample_index in selected_indices:
+            source_sample = self.samples[sample_index]
+            anno_idx = int(source_sample["anno_idx"])
+            true_queries = {
+                str(sample.get("query_text", "")).strip()
+                for sample in self.samples_by_anno[anno_idx]
+                if str(sample.get("query_text", "")).strip()
+            }
+            entry = self.sample_negative_query_entry(true_queries)
+            if entry is None:
+                continue
+
+            negative_sample = {
+                "anno_idx": anno_idx,
+                "query_text": entry["query_text"],
+                "obj_indices": [],
+                "group_source": "negative_text",
+                "negative_type": entry["negative_type"],
+                "query_loss_weight": float(entry["loss_weight"]),
+                "is_text_negative": True,
+            }
+            negative_samples.append(negative_sample)
+            self.samples_by_anno[anno_idx].append(negative_sample)
+
+        self.samples.extend(negative_samples)
 
     def __len__(self):
         if self.image_level_batching:
@@ -722,6 +967,9 @@ class ShipGroundingDataset(Dataset):
             "target": target,
             "query_text": sample_info["query_text"],
             "group_source": sample_info["group_source"],
+            "negative_type": sample_info.get("negative_type", ""),
+            "query_loss_weight": float(sample_info.get("query_loss_weight", 1.0)),
+            "is_text_negative": bool(sample_info.get("is_text_negative", False)),
             "image_size": (target_h, target_w),
             "orig_size": (orig_h, orig_w),
             "image_path": common["image_path"],
@@ -760,10 +1008,22 @@ class ShipGroundingDataset(Dataset):
 
 class QueryBudgetBatchSampler(Sampler):
     """
-    Image-level sampler that packs image indices until expanded query count approaches query_budget.
-    This avoids the old fixed image-count rule that produced ~42.6 query/step for batch=48.
+    Image-level sampler with a fixed batch layout.
+
+    The layout is constructed once, so __len__ is exact and invariant across
+    epochs. Each epoch only shuffles the batch order and the indices inside each
+    batch. This prevents progress bars, LR schedules and ratio-based parameters
+    from drifting because of a changing number of yielded batches.
     """
-    def __init__(self, dataset, query_budget=48, shuffle=True, drop_last=False, seed=0):
+
+    def __init__(
+        self,
+        dataset,
+        query_budget=48,
+        shuffle=True,
+        drop_last=False,
+        seed=0,
+    ):
         self.dataset = dataset
         self.query_budget = max(1, int(query_budget))
         self.shuffle = bool(shuffle)
@@ -772,42 +1032,62 @@ class QueryBudgetBatchSampler(Sampler):
         self.epoch = 0
         self.indices = list(range(len(dataset)))
         self.query_counts = [
-            max(1, int(dataset.get_query_count_for_dataset_index(i)))
-            for i in self.indices
+            max(1, int(dataset.get_query_count_for_dataset_index(index)))
+            for index in self.indices
         ]
+        self._base_batches = self._build_fixed_batches()
 
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
 
-    def __iter__(self):
+    def _build_fixed_batches(self):
+        # One deterministic initial shuffle avoids annotation-order bias while
+        # preserving the exact same step count for every epoch.
         order = list(range(len(self.indices)))
         if self.shuffle:
-            rng = random.Random(self.seed + self.epoch)
-            rng.shuffle(order)
+            random.Random(self.seed).shuffle(order)
 
+        batches = []
         batch = []
-        qsum = 0
+        query_sum = 0
 
-        for pos in order:
-            idx = self.indices[pos]
-            qn = self.query_counts[pos]
+        for position in order:
+            dataset_index = self.indices[position]
+            query_count = self.query_counts[position]
 
-            if batch and qsum + qn > self.query_budget:
-                yield batch
+            if batch and query_sum + query_count > self.query_budget:
+                batches.append(batch)
                 batch = []
-                qsum = 0
+                query_sum = 0
 
-            batch.append(idx)
-            qsum += qn
+            batch.append(dataset_index)
+            query_sum += query_count
 
-        if batch and not self.drop_last:
+        if batch:
+            if not self.drop_last or query_sum >= self.query_budget:
+                batches.append(batch)
+
+        if not batches and self.indices:
+            # Avoid an empty loader when all data fit in one under-budget batch.
+            batches.append(list(self.indices))
+
+        return tuple(tuple(batch) for batch in batches)
+
+    def __iter__(self):
+        batch_order = list(range(len(self._base_batches)))
+        rng = random.Random(self.seed + self.epoch)
+
+        if self.shuffle:
+            rng.shuffle(batch_order)
+
+        for batch_index in batch_order:
+            batch = list(self._base_batches[batch_index])
+            if self.shuffle and len(batch) > 1:
+                rng.shuffle(batch)
             yield batch
 
     def __len__(self):
-        total_queries = sum(self.query_counts)
-        if self.drop_last:
-            return max(1, total_queries // self.query_budget)
-        return max(1, math.ceil(total_queries / self.query_budget))
+        return len(self._base_batches)
 
 
 def _collate_query_items(items):
@@ -825,6 +1105,15 @@ def _collate_query_items(items):
     target_labels_per_image = [item["target_labels"] for item in items]
 
     group_sources = [item["group_source"] for item in items]
+    negative_query_types = [item.get("negative_type", "") for item in items]
+    query_loss_weights = torch.tensor(
+        [float(item.get("query_loss_weight", 1.0)) for item in items],
+        dtype=torch.float32,
+    )
+    text_negative_mask = torch.tensor(
+        [bool(item.get("is_text_negative", False)) for item in items],
+        dtype=torch.bool,
+    )
 
     image_sizes = [item["image_size"] for item in items]
     orig_sizes = [item["orig_size"] for item in items]
@@ -845,6 +1134,9 @@ def _collate_query_items(items):
         "target_boxes_pixel_per_image": target_boxes_pixel_per_image,
         "target_labels_per_image": target_labels_per_image,
         "group_sources": group_sources,
+        "negative_query_types": negative_query_types,
+        "query_loss_weights": query_loss_weights,
+        "text_negative_mask": text_negative_mask,
         "image_sizes": image_sizes,
         "orig_sizes": orig_sizes,
         "image_paths": image_paths,
@@ -866,6 +1158,10 @@ def grounding_collate_fn(batch):
     image_paths = []
     anno_paths = []
     source_names = []
+    group_sources = []
+    negative_query_types = []
+    query_loss_weights = []
+    text_negative_mask = []
 
     for image_idx, item in enumerate(batch):
         image = item["image"]
@@ -881,6 +1177,10 @@ def grounding_collate_fn(batch):
             image_paths.append(item["image_path"])
             anno_paths.append(item["anno_path"])
             source_names.append(item["source_name"])
+            group_sources.append(q.get("group_source", ""))
+            negative_query_types.append(q.get("negative_type", ""))
+            query_loss_weights.append(float(q.get("query_loss_weight", 1.0)))
+            text_negative_mask.append(bool(q.get("is_text_negative", False)))
 
     return {
         "unique_images": torch.stack(unique_images, dim=0),
@@ -890,6 +1190,10 @@ def grounding_collate_fn(batch):
         "image_paths": image_paths,
         "anno_paths": anno_paths,
         "source_names": source_names,
+        "group_sources": group_sources,
+        "negative_query_types": negative_query_types,
+        "query_loss_weights": torch.tensor(query_loss_weights, dtype=torch.float32),
+        "text_negative_mask": torch.tensor(text_negative_mask, dtype=torch.bool),
         "num_unique_images": len(unique_images),
         "num_queries": len(query_texts),
     }
@@ -973,9 +1277,16 @@ def build_dataloaders(
     prebuild_image_cache=False,
     cache_workers=8,
     query_budget_batching=True,
+    negative_query_path=None,
+    negative_sample_ratio=0.05,
+    use_negative_queries_in_val=False,
 ):
     train_anno_paths = list_json_files(train_anno_dir)
     val_anno_paths = list_json_files(val_anno_dir)
+
+    if negative_query_path is None:
+        negative_query_path = DEFAULT_NEGATIVE_QUERY_POOL_PATH
+    negative_query_path = ensure_negative_query_pool_file(negative_query_path)
 
     train_dataset = ShipGroundingDataset(
         image_dir=train_image_dir,
@@ -994,6 +1305,8 @@ def build_dataloaders(
         cache_images=cache_images,
         image_cache_dir=image_cache_dir,
         prebuild_image_cache=prebuild_image_cache,
+        negative_query_path=negative_query_path,
+        negative_sample_ratio=negative_sample_ratio,
     )
 
     val_dataset = ShipGroundingDataset(
@@ -1013,6 +1326,8 @@ def build_dataloaders(
         cache_images=cache_images,
         image_cache_dir=image_cache_dir,
         prebuild_image_cache=prebuild_image_cache,
+        negative_query_path=negative_query_path,
+        negative_sample_ratio=negative_sample_ratio if use_negative_queries_in_val else 0.0,
     )
 
     if prebuild_image_cache:

@@ -1,7 +1,6 @@
 # ============================================================
 # LightDet train.yaml
-# Aligned one-to-many bbox / GIoU / IoU-aware QFL supervision
-# YAML is the single source of training parameters.
+# 僅保留目前 train.py / data.py / loss.py 實際使用的參數
 # ============================================================
 
 data:
@@ -15,7 +14,12 @@ data:
   prefetch_factor: 4
   cache_workers: 8
   pin_memory: true
-  query_budget_batching: true
+  persistent_workers: true
+  query_budget: true
+
+  negative_query_path: /home/soic/Desktop/LightDet/units/model/cards/cache/negative_query_pool.json
+  negative_sample_ratio: 0.05
+  use_negative_queries_in_val: false
 
 train:
   epochs: 300
@@ -29,16 +33,15 @@ train:
   use_amp: true
   amp_dtype: bf16
   allow_tf32: true
-  cudnn_benchmark: true
   matmul_precision: high
   channels_last: false
-  compile_model: false
-  compile_mode: reduce-overhead
-  profile_steps: false
-  profile_interval: 50
+  compile: false
+  startup_smoke_test: true
 
   use_ema: true
   ema_decay: 0.999
+  ema_update_interval: 1
+  ema_buffer_update_interval: 1
   grad_clip_norm: 1.0
 
 optim:
@@ -49,26 +52,21 @@ optim:
   weight_decay: 0.0001
   min_lr_ratio: 0.05
   max_warmup_steps: 3000
+  fused: true
 
 loss:
   matcher:
-    cost_bbox: 5.0
-    cost_giou: 2.0
     cost_score: 0.0
 
   score_sampling:
-
     hard_negative_ratio: 3
     positive_ratio: 1.0
     max_positive_per_gt: 2
-    aux_positive_label: 0.7
     expand_cost_bbox: 5.0
     expand_cost_giou: 2.0
 
   quality:
     iou_pos_thr: 0.0
-    quality_min: 0.0
-    quality_max: 1.0
     qfl_beta: 2.0
     quality_warmup_epoch: 10
 
@@ -77,24 +75,18 @@ loss:
     rank_margin: 0.1
     rank_min_quality_gap: 0.1
     rank_max_pairs: 512
-    rank_start_epoch: 30
-    rank_warmup_epoch: 60
-    rank_alpha_min: 0.0001
+    rank_start_epoch: 20
+    rank_warmup_epoch: 100
+    rank_alpha_min: 0.0
+
+  text_negative:
+    max_query_loss_weight: 10.0
 
   weight:
     dynamic: false
-
     bbox: 5.0
-    bbox_start: 5.0
-    bbox_end: 5.0
-    bbox_decay_until: 1.0
-
     giou: 2.0
-
     score: 2.0
-    score_start: 2.0
-    score_end: 2.0
-    score_warm_until: 1.0
 
   pos_weight:
     value: 1.0
@@ -106,19 +98,16 @@ eval:
   score_thr: 0.001
   top_k: 20
   nms_iou_thr: 0.5
+  use_nms: true
   best_metric: map50_95
   use_topk_fallback: false
 
 log:
   save_dir: runs/train/lightdet_aligned_qfl
   resume_path: null
+  save_latest_interval: 1
   save_epoch_interval: 50
   emit_step_metrics: false
   log_interval: 50
-
-  # tqdm 僅顯示一行必要資訊，避免終端寬度不足造成換行或破版。
-  progress_dynamic_ncols: true
   progress_leave: true
   progress_mininterval: 0.5
-  progress_smoothing: 0.1
-  progress_bar_width: 20

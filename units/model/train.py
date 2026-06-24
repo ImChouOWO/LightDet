@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# LightDet optimized train.py v4: compact IPC + stable high-throughput loaders
+# LightDet optimized train.py v5: EMA + QFL + scheduled ranking + JSON text negatives
 
 from collections import defaultdict
 from types import SimpleNamespace
@@ -500,6 +500,8 @@ def run_startup_smoke_test(
                     rank_start_epoch=args.rank_start_epoch,
                     rank_warmup_epoch=args.rank_warmup_epoch,
                     rank_alpha_min=args.rank_alpha_min,
+                    query_loss_weights=batch.get("query_loss_weights"),
+                    text_negative_mask=batch.get("text_negative_mask"),
                 )
 
         expected_queries = len(query_texts)
@@ -1059,6 +1061,8 @@ def train_one_epoch(
     total_score_sum = torch.zeros((), device=device)
     total_rank_contrib_sum = torch.zeros((), device=device)
     total_rank_raw_sum = torch.zeros((), device=device)
+    total_text_negative_sum = torch.zeros((), device=device)
+    total_text_negative_queries = 0
 
     amp_enabled = get_amp_enabled(device, use_amp)
 
@@ -1145,6 +1149,8 @@ def train_one_epoch(
                 rank_start_epoch=rank_start_epoch,
                 rank_warmup_epoch=rank_warmup_epoch,
                 rank_alpha_min=rank_alpha_min,
+                query_loss_weights=batch.get("query_loss_weights"),
+                text_negative_mask=batch.get("text_negative_mask"),
             )
 
         if scaler.is_enabled():
@@ -1187,6 +1193,16 @@ def train_one_epoch(
             "loss_rank_contrib",
             loss_dict.get("loss_rank", zero),
         ).detach()
+        text_negative_det = loss_dict.get(
+            "loss_text_negative",
+            zero,
+        ).detach()
+        text_negative_queries = int(
+            batch.get(
+                "text_negative_mask",
+                torch.zeros(0, dtype=torch.bool),
+            ).sum().item()
+        )
 
         total_loss_sum.add_(loss_det)
         total_bbox_sum.add_(bbox_det)
@@ -1194,6 +1210,8 @@ def train_one_epoch(
         total_score_sum.add_(score_det)
         total_rank_contrib_sum.add_(rank_contrib_det)
         total_rank_raw_sum.add_(rank_raw_det)
+        total_text_negative_sum.add_(text_negative_det)
+        total_text_negative_queries += text_negative_queries
 
         should_log = (
             (step + 1) % max(1, int(log_interval)) == 0
@@ -1209,6 +1227,7 @@ def train_one_epoch(
             rank_raw_item = float(rank_raw_det.item())
             rank_item = float(rank_det.item())
             rank_contrib_item = float(rank_contrib_det.item())
+            text_negative_item = float(text_negative_det.item())
             avg_loss = float((total_loss_sum / (step + 1)).item())
 
             rank_alpha_item = float(loss_dict.get("rank_alpha", 0.0))
@@ -1240,6 +1259,8 @@ def train_one_epoch(
                 "raw": f"{rank_raw_item:.4f}",
                 "ra": f"{rank_alpha_item:.4f}",
                 "lrk": f"{lambda_rank_eff_item:.4f}",
+                "txtneg": f"{text_negative_item:.4f}",
+                "nq": text_negative_queries,
             })
 
             if step_metrics_path is not None:
@@ -1258,6 +1279,8 @@ def train_one_epoch(
                     "loss_rank_raw": rank_raw_item,
                     "loss_rank": rank_item,
                     "loss_rank_contrib": rank_contrib_item,
+                    "loss_text_negative": text_negative_item,
+                    "text_negative_queries": text_negative_queries,
                     "lambda_bbox": lambda_bbox,
                     "lambda_giou": lambda_giou,
                     "lambda_score": lambda_score,
@@ -1281,6 +1304,10 @@ def train_one_epoch(
         "train_loss_score": float((total_score_sum / num_batches).item()),
         "train_loss_rank_raw": float((total_rank_raw_sum / num_batches).item()),
         "train_loss_rank": float((total_rank_contrib_sum / num_batches).item()),
+        "train_loss_text_negative": float(
+            (total_text_negative_sum / num_batches).item()
+        ),
+        "train_text_negative_queries": int(total_text_negative_queries),
     }
 
 
@@ -1620,6 +1647,8 @@ def validate_one_epoch(
     total_score_sum = torch.zeros((), device=device)
     total_rank_contrib_sum = torch.zeros((), device=device)
     total_rank_raw_sum = torch.zeros((), device=device)
+    total_text_negative_sum = torch.zeros((), device=device)
+    total_text_negative_queries = 0
 
     metric = (
         BinaryDetectionAPAccumulator(iou_thresholds=iou_thresholds)
@@ -1708,6 +1737,8 @@ def validate_one_epoch(
                     rank_start_epoch=rank_start_epoch,
                     rank_warmup_epoch=rank_warmup_epoch,
                     rank_alpha_min=rank_alpha_min,
+                    query_loss_weights=batch.get("query_loss_weights"),
+                    text_negative_mask=batch.get("text_negative_mask"),
                 )
 
         if compute_loss:
@@ -1725,6 +1756,15 @@ def validate_one_epoch(
             )
             total_rank_raw_sum.add_(
                 loss_dict.get("loss_rank_raw", zero).detach()
+            )
+            total_text_negative_sum.add_(
+                loss_dict.get("loss_text_negative", zero).detach()
+            )
+            total_text_negative_queries += int(
+                batch.get(
+                    "text_negative_mask",
+                    torch.zeros(0, dtype=torch.bool),
+                ).sum().item()
             )
 
         if compute_metrics and metric is not None and gt_boxes_cpu is not None:
@@ -1800,6 +1840,10 @@ def validate_one_epoch(
             "val_loss_rank": float(
                 (total_rank_contrib_sum / denominator).item()
             ),
+            "val_loss_text_negative": float(
+                (total_text_negative_sum / denominator).item()
+            ),
+            "val_text_negative_queries": int(total_text_negative_queries),
         }
 
     if compute_metrics and metric is not None:
@@ -1951,8 +1995,17 @@ def load_checkpoint(
     else:
         model.load_state_dict(checkpoint, strict=True)
 
-    if ema is not None and checkpoint.get("ema") is not None:
-        ema.ema.load_state_dict(checkpoint["ema"], strict=True)
+    if ema is not None:
+        if checkpoint.get("ema") is not None:
+            ema.ema.load_state_dict(checkpoint["ema"], strict=True)
+        else:
+            # Backward compatibility: older checkpoints may not contain EMA.
+            # Initialize EMA from the just-loaded model instead of leaving the
+            # pre-checkpoint random initialization in the evaluation branch.
+            ema.ema.load_state_dict(model.state_dict(), strict=True)
+            print(
+                "[Checkpoint] EMA state missing; initialized EMA from model."
+            )
 
     if "optimizer" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer"])
@@ -2028,6 +2081,13 @@ def ensure_precomputed_bert_raw_cache(
     batch_size: int = 128,
     enabled: bool = True,
 ) -> Optional[str]:
+    """
+    Build or incrementally extend the frozen-BERT raw cache.
+
+    Negative-query JSON may introduce new texts after a cache already exists.
+    The old implementation skipped every existing cache file, which could leave
+    new negative queries missing and cause a lookup failure during training.
+    """
     if not enabled:
         print("[BERT Precompute] Skip because freeze_bert=False")
         return None
@@ -2037,11 +2097,6 @@ def ensure_precomputed_bert_raw_cache(
         return None
 
     cache_path = os.path.abspath(str(cache_path))
-
-    if os.path.exists(cache_path):
-        print(f"[BERT Precompute] Found existing cache, skip: {cache_path}")
-        return cache_path
-
     texts = collect_query_texts_from_datasets(*datasets)
 
     if not texts:
@@ -2051,8 +2106,48 @@ def ensure_precomputed_bert_raw_cache(
 
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
 
-    print(f"[BERT Precompute] Cache not found. Building: {cache_path}")
-    print(f"[BERT Precompute] Unique query texts: {len(texts)}")
+    cache: Dict[str, Dict[str, torch.Tensor]] = {}
+    cache_metadata: Dict[str, Any] = {}
+
+    if os.path.exists(cache_path):
+        try:
+            try:
+                cached_object = torch.load(
+                    cache_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+            except TypeError:
+                cached_object = torch.load(cache_path, map_location="cpu")
+
+            if isinstance(cached_object, dict):
+                loaded_cache = cached_object.get("cache", {})
+                if isinstance(loaded_cache, dict):
+                    cache = loaded_cache
+                    cache_metadata = cached_object
+        except Exception as error:
+            print(
+                "[BERT Precompute] Existing cache is invalid; rebuild it: "
+                f"{error}"
+            )
+            cache = {}
+            cache_metadata = {}
+
+    missing_texts = [text for text in texts if text not in cache]
+
+    if not missing_texts:
+        print(
+            f"[BERT Precompute] Cache ready: {cache_path}, "
+            f"texts={len(cache)}"
+        )
+        return cache_path
+
+    action = "Extending" if cache else "Building"
+    print(f"[BERT Precompute] {action}: {cache_path}")
+    print(
+        f"[BERT Precompute] required={len(texts)}, "
+        f"cached={len(cache)}, missing={len(missing_texts)}"
+    )
 
     bert = Bert(
         out_dim=hidden_dim,
@@ -2062,23 +2157,22 @@ def ensure_precomputed_bert_raw_cache(
     ).to(device)
     bert.eval()
 
-    cache: Dict[str, Dict[str, torch.Tensor]] = {}
     hidden = None
 
     with torch.inference_mode():
         for index in tqdm(
-            range(0, len(texts), batch_size),
+            range(0, len(missing_texts), batch_size),
             desc="[BERT Precompute]",
             dynamic_ncols=True,
         ):
-            batch_texts = texts[index:index + batch_size]
+            batch_texts = missing_texts[index:index + batch_size]
             encoded = bert.encode_raw(batch_texts, device=device)
 
             hidden = encoded["last_hidden_state"].detach().cpu().half()
             mask = encoded["attention_mask"].detach().cpu()
 
-            for offset, text in enumerate(batch_texts):
-                cache[text] = {
+            for offset, text_value in enumerate(batch_texts):
+                cache[text_value] = {
                     "last_hidden_state": hidden[offset],
                     "attention_mask": mask[offset],
                 }
@@ -2086,28 +2180,33 @@ def ensure_precomputed_bert_raw_cache(
     if hidden is None:
         raise RuntimeError("BERT cache generation produced no output")
 
-    temporary_path = cache_path + ".tmp"
+    hidden_size = int(hidden.shape[-1])
+    if cache_metadata.get("hidden_size") is not None:
+        old_hidden_size = int(cache_metadata["hidden_size"])
+        if old_hidden_size != hidden_size:
+            raise RuntimeError(
+                "BERT cache hidden-size mismatch: "
+                f"existing={old_hidden_size}, generated={hidden_size}"
+            )
 
+    temporary_path = cache_path + ".tmp"
     torch.save(
         {
             "type": "bert_raw_cache",
-            "max_length": max_length,
-            "hidden_size": int(hidden.shape[-1]),
+            "max_length": int(max_length),
+            "hidden_size": hidden_size,
             "num_texts": len(cache),
             "cache": cache,
         },
         temporary_path,
     )
-
     os.replace(temporary_path, cache_path)
 
     del bert
-
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     print(f"[BERT Precompute] Done. Saved {len(cache)} texts to {cache_path}")
-
     return cache_path
 
 
@@ -2190,6 +2289,9 @@ def build_dataloaders_with_supported_options(args: SimpleNamespace, **paths: str
         "pin_memory": False,
         "cache_workers": args.cache_workers,
         "query_budget_batching": args.query_budget,
+        "negative_query_path": args.negative_query_path,
+        "negative_sample_ratio": args.negative_sample_ratio,
+        "use_negative_queries_in_val": args.use_negative_queries_in_val,
     }
 
     signature = inspect.signature(build_dataloaders)
@@ -2360,6 +2462,7 @@ def train(args: SimpleNamespace) -> None:
         rank_margin=args.rank_margin,
         rank_min_quality_gap=args.rank_min_quality_gap,
         rank_max_pairs=args.rank_max_pairs,
+        max_query_loss_weight=args.max_query_loss_weight,
     )
 
     if args.startup_smoke_test:
@@ -2481,6 +2584,16 @@ def train(args: SimpleNamespace) -> None:
     print(f"[Info] Model parameters: total={total_params}, trainable={trainable_params}")
     print(f"[Info] Train batches: {len(train_loader)}")
     print(f"[Info] Val batches: {len(val_loader)}")
+    print(
+        f"[Info] Text negatives: path={args.negative_query_path}, "
+        f"ratio={args.negative_sample_ratio:.4f}, "
+        f"val={args.use_negative_queries_in_val}, "
+        f"max_loss_weight={args.max_query_loss_weight:.2f}"
+    )
+    print(
+        f"[Info] EMA: enabled={args.use_ema}, decay={args.ema_decay}, "
+        f"update_interval={args.ema_update_interval}"
+    )
 
     if args.resume_path is not None:
         save_path = os.path.dirname(os.path.abspath(args.resume_path))
@@ -2633,6 +2746,11 @@ def train(args: SimpleNamespace) -> None:
             "rank_start_epoch": int(args.rank_start_epoch),
             "rank_warmup_epoch": int(args.rank_warmup_epoch),
             "rank_alpha_min": float(args.rank_alpha_min),
+            "negative_sample_ratio": float(args.negative_sample_ratio),
+            "max_query_loss_weight": float(args.max_query_loss_weight),
+            "use_negative_queries_in_val": bool(
+                args.use_negative_queries_in_val
+            ),
         }
 
         epoch_time = time.perf_counter() - epoch_start
@@ -2784,6 +2902,14 @@ DEFAULT_TRAIN_CFG = {
         "persistent_workers": True,
         "query_budget": True,
         "cache_workers": 8,
+        "negative_query_path": os.path.join(
+            CURRENT_DIR,
+            "cards",
+            "cache",
+            "negative_query_pool.json",
+        ),
+        "negative_sample_ratio": 0.05,
+        "use_negative_queries_in_val": False,
     },
     "train": {
         "epochs": 300,
@@ -2845,7 +2971,10 @@ DEFAULT_TRAIN_CFG = {
             "rank_max_pairs": 512,
             "rank_start_epoch": 15,
             "rank_warmup_epoch": 30,
-            "rank_alpha_min": 1e-4,
+            "rank_alpha_min": 0.0,
+        },
+        "text_negative": {
+            "max_query_loss_weight": 10.0,
         },
         "weight": {
             "dynamic": True,
@@ -2974,6 +3103,7 @@ def cfg_to_args(
     score_sampling_cfg = loss_cfg.get("score_sampling", {})
     quality_cfg = loss_cfg.get("quality", {})
     ranking_cfg = loss_cfg.get("ranking", {})
+    text_negative_cfg = loss_cfg.get("text_negative", {})
 
     return SimpleNamespace(
         # data
@@ -2988,6 +3118,13 @@ def cfg_to_args(
         persistent_workers=data_cfg.get("persistent_workers", True),
         query_budget=data_cfg.get("query_budget", True),
         cache_workers=data_cfg.get("cache_workers", 8),
+        negative_query_path=data_cfg.get("negative_query_path"),
+        negative_sample_ratio=float(
+            data_cfg.get("negative_sample_ratio", 0.05)
+        ),
+        use_negative_queries_in_val=bool(
+            data_cfg.get("use_negative_queries_in_val", False)
+        ),
 
         # train
         epochs=train_cfg["epochs"],
@@ -3075,7 +3212,11 @@ def cfg_to_args(
         rank_max_pairs=ranking_cfg.get("rank_max_pairs", 512),
         rank_start_epoch=ranking_cfg.get("rank_start_epoch", 15),
         rank_warmup_epoch=ranking_cfg.get("rank_warmup_epoch", 30),
-        rank_alpha_min=ranking_cfg.get("rank_alpha_min", 1e-4),
+        rank_alpha_min=ranking_cfg.get("rank_alpha_min", 0.0),
+        max_query_loss_weight=text_negative_cfg.get(
+            "max_query_loss_weight",
+            10.0,
+        ),
 
         # eval
         val_loss_interval=eval_cfg["val_loss_interval"],
@@ -3122,6 +3263,7 @@ def print_config_summary(
     quality = loss.get("quality", {})
     ranking = loss.get("ranking", {})
     score_sampling = loss.get("score_sampling", {})
+    text_negative = loss.get("text_negative", {})
 
     print("\n[LightDet] Training config")
     print(f"  dataset      : {data['dataset_dir']}")
@@ -3138,6 +3280,12 @@ def print_config_summary(
         f"persistent={data.get('persistent_workers', True)}, "
         f"query_budget={data.get('query_budget', True)}, "
         f"cache_workers={data.get('cache_workers', 8)}"
+    )
+    print(
+        f"  text negative: path={data.get('negative_query_path')}, "
+        f"ratio={data.get('negative_sample_ratio', 0.05)}, "
+        f"val={data.get('use_negative_queries_in_val', False)}, "
+        f"max_weight={text_negative.get('max_query_loss_weight', 10.0)}"
     )
     print(f"  epochs       : {training['epochs']}")
     print(f"  batch        : {training['batch_size']}")
@@ -3202,7 +3350,7 @@ def print_config_summary(
         f"  ranking      : lambda_max={ranking.get('lambda_rank', 0.10)}, "
         f"start={ranking.get('rank_start_epoch', 15)}, "
         f"warmup={ranking.get('rank_warmup_epoch', 30)}, "
-        f"alpha_min={ranking.get('rank_alpha_min', 1e-4)}"
+        f"alpha_min={ranking.get('rank_alpha_min', 0.0)}"
     )
     print(f"  pos weight   : {pos_weight.get('value', 1.0)}")
     print(
@@ -3237,6 +3385,9 @@ class LightDet:
         prefetch_factor: Optional[int] = None,
         pin_memory: Optional[bool] = None,
         persistent_workers: Optional[bool] = None,
+        negative_query_path: Optional[str] = None,
+        negative_sample_ratio: Optional[float] = None,
+        use_negative_queries_in_val: Optional[bool] = None,
         project: str = "runs/train",
         name: str = "exp",
         resume: Optional[str] = None,
@@ -3255,6 +3406,8 @@ class LightDet:
         compile_model: Optional[bool] = None,
         channels_last: Optional[bool] = None,
         startup_smoke_test: Optional[bool] = None,
+        use_ema: Optional[bool] = None,
+        ema_decay: Optional[float] = None,
         hard_negative_ratio: Optional[int] = None,
         positive_ratio: Optional[float] = None,
         max_positive_per_gt: Optional[int] = None,
@@ -3267,6 +3420,7 @@ class LightDet:
         rank_start_epoch: Optional[int] = None,
         rank_warmup_epoch: Optional[int] = None,
         rank_alpha_min: Optional[float] = None,
+        max_query_loss_weight: Optional[float] = None,
         **kwargs: Any,
     ) -> None:
         model_cfg = deepcopy_cfg(self.model_cfg)
@@ -3310,6 +3464,22 @@ class LightDet:
             train_cfg["data"]["persistent_workers"] = bool(
                 persistent_workers
             )
+        if negative_query_path is not None:
+            train_cfg["data"]["negative_query_path"] = str(
+                negative_query_path
+            )
+        if negative_sample_ratio is not None:
+            ratio = float(negative_sample_ratio)
+            if not 0.0 <= ratio <= 1.0:
+                raise ValueError(
+                    "negative_sample_ratio must be in [0, 1], "
+                    f"got {ratio}"
+                )
+            train_cfg["data"]["negative_sample_ratio"] = ratio
+        if use_negative_queries_in_val is not None:
+            train_cfg["data"]["use_negative_queries_in_val"] = bool(
+                use_negative_queries_in_val
+            )
         if resume is not None:
             train_cfg["log"]["resume_path"] = resume
         if project is not None and name is not None:
@@ -3352,6 +3522,13 @@ class LightDet:
 
         if startup_smoke_test is not None:
             train_cfg["train"]["startup_smoke_test"] = bool(startup_smoke_test)
+        if use_ema is not None:
+            train_cfg["train"]["use_ema"] = bool(use_ema)
+        if ema_decay is not None:
+            decay = float(ema_decay)
+            if not 0.0 <= decay < 1.0:
+                raise ValueError(f"ema_decay must be in [0, 1), got {decay}")
+            train_cfg["train"]["ema_decay"] = decay
 
         if hard_negative_ratio is not None:
             train_cfg["loss"]["score_sampling"][
@@ -3389,6 +3566,10 @@ class LightDet:
             ] = rank_warmup_epoch
         if rank_alpha_min is not None:
             train_cfg["loss"]["ranking"]["rank_alpha_min"] = rank_alpha_min
+        if max_query_loss_weight is not None:
+            train_cfg["loss"]["text_negative"][
+                "max_query_loss_weight"
+            ] = max(1.0, float(max_query_loss_weight))
 
         if kwargs:
             unknown = ", ".join(kwargs.keys())
@@ -3429,6 +3610,19 @@ def main() -> None:
         workers=16,
         seed=45,
         deterministic=False,
+        use_ema=True,
+        ema_decay=0.999,
+        negative_query_path=(
+            "/home/soic/Desktop/LightDet/units/model/cards/cache/"
+            "negative_query_pool.json"
+        ),
+        negative_sample_ratio=0.05,
+        use_negative_queries_in_val=False,
+        max_query_loss_weight=10.0,
+        lambda_rank=0.10,
+        rank_start_epoch=15,
+        rank_warmup_epoch=30,
+        rank_alpha_min=0.0,
         score_thr=0.001,
         top_k=20,
         use_nms=True,
