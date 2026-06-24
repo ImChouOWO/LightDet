@@ -2812,9 +2812,9 @@ def train(args: SimpleNamespace) -> None:
             if should_save_latest:
                 latest_path = os.path.join(save_path, "latest.pt")
                 elapsed = save_checkpoint(checkpoint, latest_path)
-                tqdm.write(
-                    f"[Checkpoint] latest.pt saved in {elapsed:.2f}s"
-                )
+                # tqdm.write(
+                #     f"[Checkpoint] latest.pt saved in {elapsed:.2f}s"
+                # )
 
             if is_best:
                 best_path = os.path.join(
@@ -2822,10 +2822,16 @@ def train(args: SimpleNamespace) -> None:
                     f"best_{best_metric_name}.pt",
                 )
                 elapsed = save_checkpoint(checkpoint, best_path)
+                GREEN_BG = "\033[42m"
+                BLACK_TEXT = "\033[30m"
+                RESET = "\033[0m"
+
                 tqdm.write(
-                    f"Saved best checkpoint: epoch={epoch}, "
+                    f"{GREEN_BG}{BLACK_TEXT}"
+                    f" Saved best checkpoint: epoch={epoch}, "
                     f"{best_metric_name}={best_metric:.4f}, "
-                    f"time={elapsed:.2f}s"
+                    f"time={elapsed:.2f}s "
+                    f"{RESET}"
                 )
 
             if should_save_epoch:
@@ -3608,15 +3614,15 @@ def main() -> None:
         batch=48,
         device=1,
         workers=16,
-        seed=45,
+        seed=47,
         deterministic=False,
 
-        weights=None,
+        weights="/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_rank_smooth_010/best_map50_95.pt",
         resume=None,
         prefer_ema=True,
 
         project="runs/train",
-        name="lightdet_rank_smooth_010",
+        name="lightdet_neg_pool",
     )
 
 

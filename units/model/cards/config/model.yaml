@@ -2,7 +2,7 @@ model:
   img_in_channels: 1024
   hidden_dim: 384
   num_heads: 8
-  num_layers: 2
+  num_layers: 3
   mlp_ratio: 3.5
   image_grid_size: 10
   text_max_length: 32
