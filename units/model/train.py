@@ -3610,23 +3610,11 @@ def main() -> None:
         workers=16,
         seed=45,
         deterministic=False,
-        use_ema=True,
-        ema_decay=0.999,
-        negative_query_path=(
-            "/home/soic/Desktop/LightDet/units/model/cards/cache/"
-            "negative_query_pool.json"
-        ),
-        negative_sample_ratio=0.05,
-        use_negative_queries_in_val=False,
-        max_query_loss_weight=10.0,
-        lambda_rank=0.10,
-        rank_start_epoch=15,
-        rank_warmup_epoch=30,
-        rank_alpha_min=0.0,
-        score_thr=0.001,
-        top_k=20,
-        use_nms=True,
-        use_topk_fallback=False,
+
+        weights=None,
+        resume=None,
+        prefer_ema=True,
+
         project="runs/train",
         name="lightdet_rank_smooth_010",
     )
