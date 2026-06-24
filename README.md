@@ -2,7 +2,7 @@
 
 LightDet 是一個 `Vision-Text to BBox model`，透過文字與圖像輸入定位畫面中的目標物件。
 
-`多模態` `Transformer` `Token Fusion` <br>
+`Multimodal` `Transformer` `Token Fusion` <br>
 `Decoder Only` `DETR Like`
 
 ---
