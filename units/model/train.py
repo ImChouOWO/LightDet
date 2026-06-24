@@ -54,9 +54,9 @@ except (RuntimeError, ValueError):
     pass
 
 
-# -----------------------------------------------------------------------------
+
 # Basic utilities
-# -----------------------------------------------------------------------------
+
 
 
 def configure_process_file_limit(target_soft_limit: int = 65536) -> Tuple[int, int]:
@@ -541,9 +541,9 @@ def run_startup_smoke_test(
             torch.cuda.empty_cache()
 
 
-# -----------------------------------------------------------------------------
+
 # EMA
-# -----------------------------------------------------------------------------
+
 
 
 class ModelEMA:
@@ -641,9 +641,9 @@ class ModelEMA:
                         ema_value.copy_(model_value)
 
 
-# -----------------------------------------------------------------------------
+
 # Optimizer / scheduler
-# -----------------------------------------------------------------------------
+
 
 
 def _parameter_group_name(name: str) -> str:
@@ -757,9 +757,9 @@ class WarmupCosineScheduler:
         return [group["lr"] for group in self.optimizer.param_groups]
 
 
-# -----------------------------------------------------------------------------
+
 # Dynamic training schedule
-# -----------------------------------------------------------------------------
+
 
 
 def get_loss_weights(
@@ -805,9 +805,9 @@ def get_loss_weights(
     return lambda_bbox, lambda_giou, lambda_score
 
 
-# -----------------------------------------------------------------------------
+
 # Box / target helpers
-# -----------------------------------------------------------------------------
+
 
 
 def box_area(box: torch.Tensor) -> torch.Tensor:
@@ -996,9 +996,9 @@ def get_score_logit(outputs: Dict[str, torch.Tensor]) -> torch.Tensor:
     raise KeyError("Model output must contain score_logit or score")
 
 
-# -----------------------------------------------------------------------------
+
 # Training
-# -----------------------------------------------------------------------------
+
 
 
 def make_progress_bar(
@@ -1311,9 +1311,9 @@ def train_one_epoch(
     }
 
 
-# -----------------------------------------------------------------------------
+
 # Fast query-conditioned binary detection metrics
-# -----------------------------------------------------------------------------
+
 
 
 @torch.no_grad()
@@ -1598,9 +1598,9 @@ class BinaryDetectionAPAccumulator:
         }
 
 
-# -----------------------------------------------------------------------------
+
 # Unified validation: one forward pass for val loss + metrics
-# -----------------------------------------------------------------------------
+
 
 
 @torch.inference_mode()
@@ -1886,9 +1886,9 @@ def validate_one_epoch(
     return val_loss_metrics, eval_metrics
 
 
-# -----------------------------------------------------------------------------
+
 # Metrics logging
-# -----------------------------------------------------------------------------
+
 
 
 def append_jsonl(path: str, row: Dict[str, Any]) -> None:
@@ -1922,9 +1922,9 @@ def append_csv(path: str, row: Dict[str, Any]) -> None:
         writer.writerow(row)
 
 
-# -----------------------------------------------------------------------------
+
 # Checkpoint
-# -----------------------------------------------------------------------------
+
 
 
 def build_checkpoint(
@@ -1967,6 +1967,280 @@ def build_checkpoint(
             "base_lrs": scheduler.base_lrs,
         },
         "rng_state": get_rng_state_dict(),
+    }
+
+
+
+def _normalize_state_dict_keys(
+    state_dict: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """
+    Remove wrapper prefixes that may be introduced by torch.compile or
+    DataParallel. Prefixes are removed only when every key uses that prefix.
+    """
+    normalized = dict(state_dict)
+
+    for prefix in ("_orig_mod.", "module."):
+        while normalized and all(
+            str(key).startswith(prefix) for key in normalized.keys()
+        ):
+            normalized = {
+                str(key)[len(prefix):]: value
+                for key, value in normalized.items()
+            }
+
+    return normalized
+
+
+def _select_checkpoint_state_dict(
+    checkpoint: Any,
+    *,
+    prefer_ema: bool,
+) -> Tuple[Dict[str, torch.Tensor], str]:
+    """
+    Select a model state_dict from a LightDet checkpoint or a raw state_dict.
+    """
+    if not isinstance(checkpoint, dict):
+        raise TypeError(
+            "Checkpoint must be a dict or state_dict, "
+            f"got {type(checkpoint)}"
+        )
+
+    ema_state = checkpoint.get("ema")
+    model_state = checkpoint.get("model")
+    generic_state = checkpoint.get("state_dict")
+
+    if prefer_ema and isinstance(ema_state, dict) and ema_state:
+        return _normalize_state_dict_keys(ema_state), "ema"
+
+    if isinstance(model_state, dict) and model_state:
+        return _normalize_state_dict_keys(model_state), "model"
+
+    if isinstance(ema_state, dict) and ema_state:
+        return _normalize_state_dict_keys(ema_state), "ema"
+
+    if isinstance(generic_state, dict) and generic_state:
+        return _normalize_state_dict_keys(generic_state), "state_dict"
+
+    # Raw PyTorch state_dict: every value should be a tensor.
+    if checkpoint and all(
+        torch.is_tensor(value) for value in checkpoint.values()
+    ):
+        return _normalize_state_dict_keys(checkpoint), "raw_state_dict"
+
+    available_keys = sorted(str(key) for key in checkpoint.keys())
+    raise KeyError(
+        "Checkpoint does not contain model, ema, state_dict, "
+        f"or a raw state_dict. Available keys: {available_keys}"
+    )
+
+
+def inspect_checkpoint_file(
+    checkpoint_path: str,
+) -> Dict[str, Any]:
+    """
+    Inspect whether a .pt file supports weights-only loading and full resume.
+    The checkpoint is loaded on CPU and no model is required.
+    """
+    checkpoint_path = os.path.abspath(str(checkpoint_path))
+
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(
+            f"Checkpoint not found: {checkpoint_path}"
+        )
+
+    try:
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+    except TypeError:
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+        )
+
+    is_dict = isinstance(checkpoint, dict)
+    keys = sorted(str(key) for key in checkpoint.keys()) if is_dict else []
+
+    has_model = bool(
+        is_dict
+        and isinstance(checkpoint.get("model"), dict)
+        and checkpoint.get("model")
+    )
+    has_ema = bool(
+        is_dict
+        and isinstance(checkpoint.get("ema"), dict)
+        and checkpoint.get("ema")
+    )
+    has_generic_state = bool(
+        is_dict
+        and isinstance(checkpoint.get("state_dict"), dict)
+        and checkpoint.get("state_dict")
+    )
+    is_raw_state_dict = bool(
+        is_dict
+        and checkpoint
+        and all(torch.is_tensor(value) for value in checkpoint.values())
+    )
+
+    has_optimizer = bool(
+        is_dict and isinstance(checkpoint.get("optimizer"), dict)
+    )
+    has_scaler = bool(
+        is_dict and isinstance(checkpoint.get("scaler"), dict)
+    )
+    has_scheduler = bool(
+        is_dict
+        and (
+            "scheduler_step" in checkpoint
+            or isinstance(checkpoint.get("scheduler_config"), dict)
+        )
+    )
+    has_epoch = bool(is_dict and "epoch" in checkpoint)
+    has_rng = bool(is_dict and "rng_state" in checkpoint)
+
+    supports_weights_only = bool(
+        has_model or has_ema or has_generic_state or is_raw_state_dict
+    )
+    supports_full_resume = bool(
+        has_model
+        and has_optimizer
+        and has_scheduler
+        and has_epoch
+    )
+
+    result = {
+        "path": checkpoint_path,
+        "keys": keys,
+        "epoch": (
+            int(checkpoint.get("epoch", 0))
+            if is_dict
+            else 0
+        ),
+        "best_metric": (
+            float(checkpoint.get("best_metric", -1.0))
+            if is_dict
+            else -1.0
+        ),
+        "has_model": has_model,
+        "has_ema": has_ema,
+        "has_optimizer": has_optimizer,
+        "has_scaler": has_scaler,
+        "has_scheduler": has_scheduler,
+        "has_epoch": has_epoch,
+        "has_rng_state": has_rng,
+        "supports_weights_only": supports_weights_only,
+        "supports_full_resume": supports_full_resume,
+    }
+
+    print("\n[Checkpoint Inspect]")
+    print(f"  path         : {checkpoint_path}")
+    print(f"  epoch        : {result['epoch']}")
+    print(f"  best_metric  : {result['best_metric']:.6f}")
+    print(f"  model        : {has_model}")
+    print(f"  ema          : {has_ema}")
+    print(f"  optimizer    : {has_optimizer}")
+    print(f"  scaler       : {has_scaler}")
+    print(f"  scheduler    : {has_scheduler}")
+    print(f"  rng_state    : {has_rng}")
+    print(f"  weights_only : {supports_weights_only}")
+    print(f"  full_resume  : {supports_full_resume}")
+    print(f"  keys         : {keys}")
+
+    return result
+
+
+def load_weights_only(
+    weights_path: str,
+    model: torch.nn.Module,
+    ema: Optional[ModelEMA],
+    device: torch.device,
+    prefer_ema: bool = True,
+) -> Dict[str, Any]:
+    """
+    Load only network weights.
+
+    This intentionally does not restore:
+      - optimizer
+      - scheduler
+      - GradScaler
+      - epoch
+      - best metric
+      - RNG state
+
+    It is intended for warm-starting a new training experiment after changing
+    the dataset, loss function, ranking schedule, or negative-query policy.
+    """
+    weights_path = os.path.abspath(str(weights_path))
+
+    if not os.path.isfile(weights_path):
+        raise FileNotFoundError(
+            f"Weights checkpoint not found: {weights_path}"
+        )
+
+    try:
+        checkpoint = torch.load(
+            weights_path,
+            map_location=device,
+            weights_only=False,
+        )
+    except TypeError:
+        checkpoint = torch.load(
+            weights_path,
+            map_location=device,
+        )
+
+    state_dict, source_name = _select_checkpoint_state_dict(
+        checkpoint,
+        prefer_ema=bool(prefer_ema),
+    )
+
+    target_model = unwrap_model(model)
+    load_result = target_model.load_state_dict(
+        state_dict,
+        strict=True,
+    )
+
+    # The new EMA must start from the loaded network, not from the random model
+    # snapshot copied before loading the checkpoint.
+    if ema is not None:
+        ema.ema.load_state_dict(
+            target_model.state_dict(),
+            strict=True,
+        )
+        ema.num_updates = 0
+
+    checkpoint_epoch = (
+        int(checkpoint.get("epoch", 0))
+        if isinstance(checkpoint, dict)
+        else 0
+    )
+    checkpoint_best_metric = (
+        float(checkpoint.get("best_metric", -1.0))
+        if isinstance(checkpoint, dict)
+        else -1.0
+    )
+
+    print("\n[Weights] Warm-start checkpoint loaded")
+    print(f"  path         : {weights_path}")
+    print(f"  source       : {source_name}")
+    print(f"  source epoch : {checkpoint_epoch}")
+    print(f"  best metric  : {checkpoint_best_metric:.6f}")
+    print(f"  prefer EMA   : {bool(prefer_ema)}")
+    print(f"  missing keys : {len(load_result.missing_keys)}")
+    print(f"  unexpected   : {len(load_result.unexpected_keys)}")
+    print("  optimizer    : reset")
+    print("  scheduler    : reset")
+    print("  scaler       : reset")
+    print("  start epoch  : 1")
+
+    return {
+        "path": weights_path,
+        "source": source_name,
+        "source_epoch": checkpoint_epoch,
+        "source_best_metric": checkpoint_best_metric,
     }
 
 
@@ -2038,9 +2312,9 @@ def save_checkpoint(
     return time.perf_counter() - start
 
 
-# -----------------------------------------------------------------------------
+
 # BERT cache
-# -----------------------------------------------------------------------------
+
 
 
 def collect_query_texts_from_datasets(*datasets: Any) -> List[str]:
@@ -2210,9 +2484,9 @@ def ensure_precomputed_bert_raw_cache(
     return cache_path
 
 
-# -----------------------------------------------------------------------------
+
 # DataLoader construction
-# -----------------------------------------------------------------------------
+
 
 
 def _make_runtime_dataloader(
@@ -2364,9 +2638,9 @@ def build_dataloaders_with_supported_options(args: SimpleNamespace, **paths: str
     return train_loader, val_loader
 
 
-# -----------------------------------------------------------------------------
+
 # Main training
-# -----------------------------------------------------------------------------
+
 
 
 def train(args: SimpleNamespace) -> None:
@@ -2444,6 +2718,19 @@ def train(args: SimpleNamespace) -> None:
         if args.use_ema
         else None
     )
+
+    weights_info: Optional[Dict[str, Any]] = None
+
+    if getattr(args, "weights_path", None) is not None:
+        weights_info = load_weights_only(
+            weights_path=args.weights_path,
+            model=model,
+            ema=ema,
+            device=device,
+            prefer_ema=bool(
+                getattr(args, "prefer_ema", True)
+            ),
+        )
 
     criterion = GroundingLoss(
         cost_bbox=args.cost_bbox,
@@ -2647,6 +2934,16 @@ def train(args: SimpleNamespace) -> None:
         "val_loader_len": len(val_loader),
         "total_steps": total_steps,
         "warmup_steps": warmup_steps,
+        "checkpoint_mode": (
+            "weights_only"
+            if getattr(args, "weights_path", None) is not None
+            else (
+                "resume"
+                if args.resume_path is not None
+                else "scratch"
+            )
+        ),
+        "weights_info": weights_info,
     })
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -2868,9 +3165,8 @@ def train(args: SimpleNamespace) -> None:
         )
 
 
-# -----------------------------------------------------------------------------
+
 # Configuration
-# -----------------------------------------------------------------------------
 
 
 DEFAULT_MODEL_CFG = {
@@ -3374,6 +3670,12 @@ class LightDet:
         self.model_cfg_path = model
         self.model_cfg = load_model_config(model)
 
+    def inspect_checkpoint(
+        self,
+        checkpoint_path: str,
+    ) -> Dict[str, Any]:
+        return inspect_checkpoint_file(checkpoint_path)
+
     def train(
         self,
         cfg: str = "cards/config/train.yaml",
@@ -3396,7 +3698,13 @@ class LightDet:
         use_negative_queries_in_val: Optional[bool] = None,
         project: str = "runs/train",
         name: str = "exp",
-        resume: Optional[str] = None,
+
+        # Runtime checkpoint controls. These are intentionally not read from
+        # YAML, matching the common YOLO-style model.train(...) interface.
+        weights: Optional[str] = None,
+        resume: Optional[Any] = None,
+        prefer_ema: bool = True,
+
         lr: Optional[float] = None,
         lr_vision: Optional[float] = None,
         lr_text: Optional[float] = None,
@@ -3486,10 +3794,67 @@ class LightDet:
             train_cfg["data"]["use_negative_queries_in_val"] = bool(
                 use_negative_queries_in_val
             )
-        if resume is not None:
-            train_cfg["log"]["resume_path"] = resume
         if project is not None and name is not None:
             train_cfg["log"]["save_dir"] = os.path.join(project, name)
+
+        # --------------------------------------------------------------
+        # Runtime checkpoint mode
+        # --------------------------------------------------------------
+        resolved_weights_path: Optional[str] = None
+        resolved_resume_path: Optional[str] = None
+
+        if weights is not None:
+            if isinstance(weights, bool):
+                if weights:
+                    raise TypeError(
+                        "weights=True is ambiguous. Pass the checkpoint path "
+                        "as a string, or use weights=None."
+                    )
+            else:
+                resolved_weights_path = os.path.abspath(str(weights))
+
+        if isinstance(resume, bool):
+            if resume:
+                if project is None or name is None:
+                    raise ValueError(
+                        "resume=True requires both project and name so "
+                        "latest.pt can be resolved."
+                    )
+                resolved_resume_path = os.path.abspath(
+                    os.path.join(project, name, "latest.pt")
+                )
+        elif resume is not None:
+            resolved_resume_path = os.path.abspath(str(resume))
+
+        if (
+            resolved_weights_path is not None
+            and resolved_resume_path is not None
+        ):
+            raise ValueError(
+                "weights and resume cannot be used together. "
+                "Use weights for a weights-only warm start, or resume for "
+                "restoring the complete training state."
+            )
+
+        if (
+            resolved_weights_path is not None
+            and not os.path.isfile(resolved_weights_path)
+        ):
+            raise FileNotFoundError(
+                f"Weights checkpoint not found: {resolved_weights_path}"
+            )
+
+        if (
+            resolved_resume_path is not None
+            and not os.path.isfile(resolved_resume_path)
+        ):
+            raise FileNotFoundError(
+                f"Resume checkpoint not found: {resolved_resume_path}"
+            )
+
+        # YAML is not allowed to control resume in this interface. The runtime
+        # model.train(...) argument is the single source for checkpoint mode.
+        train_cfg["log"]["resume_path"] = resolved_resume_path
 
         if lr is not None:
             train_cfg["optim"]["lr_vision"] = lr
@@ -3591,7 +3956,26 @@ class LightDet:
             train_cfg_all=train_cfg,
         )
 
+        # Checkpoint mode is controlled only by model.train(...), not YAML.
+        args.weights_path = resolved_weights_path
+        args.resume_path = resolved_resume_path
+        args.prefer_ema = bool(prefer_ema)
+
         print_config_summary(model_cfg=model_cfg, train_cfg=train_cfg)
+
+        if args.weights_path is not None:
+            print("\n[Info] Training mode: weights-only warm start")
+            print(f"  weights      : {args.weights_path}")
+            print(f"  prefer EMA   : {args.prefer_ema}")
+            print("  optimizer    : reset")
+            print("  scheduler    : reset")
+            print("  epoch        : restart from 1")
+        elif args.resume_path is not None:
+            print("\n[Info] Training mode: full resume")
+            print(f"  checkpoint   : {args.resume_path}")
+        else:
+            print("\n[Info] Training mode: train from scratch")
+
         return train(args)
 
 
