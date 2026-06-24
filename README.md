@@ -371,7 +371,7 @@ targets["boxes"] = []
 /path/to/LightDet/units/model/cards/config/model.yaml
 ```
 
-範例：
+`model.yaml`範例：
 
 ```yaml
 model:
@@ -388,23 +388,8 @@ model:
   precomputed_bert_path: /path/to/LightDet/units/model/cards/cache/bert_raw_cache.pt
 ```
 
-使用既有 checkpoint 時，下列結構必須與 checkpoint 一致：
-
-```text
-hidden_dim
-num_heads
-num_layers
-image_grid_size
-fusion_token_num
-```
-
-例如舊 checkpoint 使用：
-
-```yaml
-num_layers: 2
-```
-
-目前模型也必須保持兩層，否則使用 `strict=True` 載入時會出現 missing keys。
+> [!NOTE]
+> model為模型結構參數會影像初始化後的模型
 
 ---
 
@@ -416,7 +401,7 @@ num_layers: 2
 /path/to/LightDet/units/model/cards/config/train.yaml
 ```
 
-主要設定：
+`train.yaml` 範例：
 
 ```yaml
 data:
@@ -490,7 +475,8 @@ log:
   log_interval: 50
 ```
 
-`model.train()` 中明確指定的參數會覆蓋 `train.yaml` 中的對應設定。
+> [!NOTE]
+> `model.train()` 中明確指定的參數會覆蓋 `train.yaml` 中的對應設定。
 
 ---
 
@@ -540,14 +526,12 @@ python3 train.py
 | 模式 | `weights` | `resume` | 用途 |
 |---|---|---|---|
 | 從頭訓練 | `None` | `None` | 不載入舊 checkpoint，重新建立完整訓練狀態 |
-| Weights-only warm start | checkpoint 路徑 | `None` | 載入模型或 EMA 權重，但重置 optimizer、scheduler、epoch 與最佳指標 |
-| 完整續訓 | `None` | checkpoint 路徑或 `True` | 恢復模型、EMA、optimizer、scheduler、GradScaler、epoch、最佳指標與 RNG state |
+| Weights-only warm start | `checkpoint` 路徑 | `None` | 載入模型或 EMA 權重，但重置 optimizer、scheduler、epoch 與最佳指標 |
+| 接續訓練 | `None` | `checkpoint` 路徑 | 恢復模型、EMA、optimizer、scheduler、GradScaler、epoch、最佳指標與 RNG state |
 
-注意：
+>[!NOTE]
+>weights 與 resume 不可同時使用
 
-```text
-weights 與 resume 不可同時使用
-```
 
 Weights-only warm start：
 
@@ -571,7 +555,7 @@ model.train(
 )
 ```
 
-完整續訓：
+接續訓練：
 
 ```python
 model.train(
@@ -591,19 +575,6 @@ model.train(
     name="lightdet_exp",
 )
 ```
-
-也可以使用：
-
-```python
-resume=True
-```
-
-此時會尋找：
-
-```text
-<project>/<name>/latest.pt
-```
-
 ---
 
 ## 10. `model.train()` 參數
@@ -686,11 +657,7 @@ resume=True
 | `rank_alpha_min` | `float \| None` | Ranking warmup 的最小 alpha |
 | `max_query_loss_weight` | `float \| None` | 負文字 Query loss weight 上限 |
 
-未支援的參數會觸發：
 
-```text
-TypeError: Unsupported train arguments
-```
 
 ---
 
