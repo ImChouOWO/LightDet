@@ -1,6 +1,5 @@
 # ============================================================
 # LightDet train.yaml
-# 僅保留目前 train.py / data.py / loss.py 實際使用的參數
 # ============================================================
 
 data:
@@ -18,8 +17,8 @@ data:
   query_budget: true
 
   negative_query_path: /home/soic/Desktop/LightDet/units/model/cards/cache/negative_query_pool.json
-  negative_sample_ratio: 0.05
-  use_negative_queries_in_val: false
+  negative_sample_ratio: 0.10
+  use_negative_queries_in_val: true
 
 train:
   epochs: 300
@@ -66,7 +65,7 @@ loss:
     expand_cost_giou: 2.0
 
   quality:
-    iou_pos_thr: 0.0
+    iou_pos_thr: 0.1
     qfl_beta: 2.0
     quality_warmup_epoch: 10
 
@@ -75,18 +74,22 @@ loss:
     rank_margin: 0.1
     rank_min_quality_gap: 0.1
     rank_max_pairs: 512
-    rank_start_epoch: 20
-    rank_warmup_epoch: 100
+    rank_start_epoch: 1
+    rank_warmup_epoch: 20
     rank_alpha_min: 0.0
 
   text_negative:
     max_query_loss_weight: 10.0
 
   weight:
-    dynamic: false
-    bbox: 5.0
+    dynamic: true
+    bbox_start: 5.0
+    bbox_end: 4.0
+    bbox_decay_until: 0.5
     giou: 2.0
-    score: 2.0
+    score_start: 2.0
+    score_end: 4.0
+    score_warm_until: 0.4
 
   pos_weight:
     value: 1.0

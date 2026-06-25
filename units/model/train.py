@@ -4001,12 +4001,12 @@ def main() -> None:
         seed=47,
         deterministic=False,
 
-        weights="/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_rank_smooth_010/best_map50_95.pt",
+        weights="/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_neg_pool/best_map50_95.pt",
         resume=None,
         prefer_ema=True,
 
         project="runs/train",
-        name="lightdet_neg_pool",
+        name="lightdet_neg_pool_dynamic",
     )
 
 
