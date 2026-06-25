@@ -1468,40 +1468,102 @@ class BinaryDetectionAPAccumulator:
         num_gt = int(gt_boxes.shape[0])
         num_thresholds = int(self.iou_thresholds.numel())
 
+        if pred_scores.numel() != num_pred:
+            raise ValueError(
+                "pred_boxes/pred_scores size mismatch: "
+                f"{num_pred} != {pred_scores.numel()}"
+            )
+
         self.num_gt += num_gt
         self.num_pred += num_pred
 
         if num_pred == 0:
             return
 
-        # select_predictions_batch 已保證每個 sample 依 score 降冪。
+        # AP matching 必須依 confidence 由高到低逐一處理 prediction。
+        # 即使上游 select_predictions_batch 已排序，這裡仍再次排序，
+        # 避免未來由其他呼叫路徑傳入未排序 prediction 時造成評估偏差。
+        score_order = torch.argsort(
+            pred_scores,
+            descending=True,
+            stable=True,
+        )
+        pred_boxes = pred_boxes[score_order]
+        pred_scores = pred_scores[score_order]
+
+        metric_device = pred_boxes.device
+
+        if gt_boxes.device != metric_device:
+            gt_boxes = gt_boxes.to(metric_device)
+
+        # 每一列對應一個 prediction，每一欄對應一個 IoU threshold。
         tp_matrix = torch.zeros(
             (num_pred, num_thresholds),
             dtype=torch.bool,
+            device=metric_device,
         )
 
         if num_gt > 0:
-            iou_matrix = box_iou_xyxy(pred_boxes, gt_boxes)
-            best_iou, best_gt_index = iou_matrix.max(dim=1)
-
-            matched = torch.zeros(
-                (num_thresholds, num_gt),
-                dtype=torch.bool,
+            iou_matrix = box_iou_xyxy(
+                pred_boxes,
+                gt_boxes,
             )
 
+            iou_thresholds = self.iou_thresholds.to(
+                device=metric_device,
+                dtype=iou_matrix.dtype,
+            )
+
+            # 每個 IoU threshold 都必須維護獨立的 GT 配對狀態。
+            # shape: [num_thresholds, num_gt]
+            matched_gt = torch.zeros(
+                (num_thresholds, num_gt),
+                dtype=torch.bool,
+                device=metric_device,
+            )
+
+            threshold_indices = torch.arange(
+                num_thresholds,
+                device=metric_device,
+            )
+
+            # prediction 已依 confidence 由高到低排列。
             for prediction_index in range(num_pred):
-                gt_index = int(best_gt_index[prediction_index])
-                valid_iou = (
-                    best_iou[prediction_index]
-                    >= self.iou_thresholds
+                # 同一個 prediction 在每個 IoU threshold 下，都只可從
+                # 尚未配對的 GT 中選擇 IoU 最高者。
+                candidate_ious = (
+                    iou_matrix[prediction_index]
+                    .unsqueeze(0)
+                    .expand(num_thresholds, -1)
+                    .masked_fill(matched_gt, -1.0)
                 )
-                is_true_positive = valid_iou & (~matched[:, gt_index])
+
+                best_iou, best_gt_index = candidate_ious.max(dim=1)
+                is_true_positive = best_iou >= iou_thresholds
 
                 tp_matrix[prediction_index] = is_true_positive
-                matched[is_true_positive, gt_index] = True
 
-        self.score_chunks.append(pred_scores.contiguous())
-        self.tp_chunks.append(tp_matrix.contiguous())
+                # 僅更新本次成功配對的 threshold/GT 組合。
+                valid_threshold_indices = threshold_indices[
+                    is_true_positive
+                ]
+                valid_gt_indices = best_gt_index[
+                    is_true_positive
+                ]
+
+                matched_gt[
+                    valid_threshold_indices,
+                    valid_gt_indices,
+                ] = True
+
+        # 累積資料固定搬回 CPU，避免跨 batch 保留 GPU tensor，
+        # 並確保 compute() 的全域排序與累積運算裝置一致。
+        self.score_chunks.append(
+            pred_scores.detach().cpu().contiguous()
+        )
+        self.tp_chunks.append(
+            tp_matrix.detach().cpu().contiguous()
+        )
 
     def compute(self) -> Dict[str, float]:
         if self.num_gt == 0:
