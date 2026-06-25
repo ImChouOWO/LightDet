@@ -6,10 +6,10 @@ from __future__ import annotations
 LightDet 獨立驗證腳本
 
 建議放置位置：
-    LightDet/units/model/validate.py
+    LightDet/units/validate.py
 
 執行方式：
-    cd /home/soic/Desktop/LightDet/units/model
+    cd /home/soic/Desktop/LightDet/units
     python3 validate.py
 
 此腳本不會進行訓練，只會：
@@ -18,7 +18,16 @@ LightDet 獨立驗證腳本
     3. 優先載入 checkpoint 內的 EMA 權重。
     4. 使用 train.py 中修正後的 BinaryDetectionAPAccumulator。
     5. 計算 mAP50、mAP50-95、Precision、Recall、TP、FP。
-    6. 將結果輸出為 JSON。
+    6. 額外使用全部原始預測框計算 Raw Oracle Recall。
+    7. 將結果輸出為 JSON。
+
+Raw Oracle Recall 不套用：
+    - SCORE_THRESHOLD
+    - TOP_K
+    - NMS
+
+其用途是確認模型原始候選框是否曾經覆蓋 GT，
+不是正式部署 Precision / Recall，也不是標準 mAP。
 """
 
 import json
@@ -50,7 +59,7 @@ DATASET_DIR = PROJECT_ROOT / "datasets"
 
 CHECKPOINT_PATH = (
     PROJECT_ROOT
-    / "/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_neg_pool/best_map50_95.pt"
+    / "units/model/runs/train/lightdet_neg_pool/best_map50_95.pt"
 )
 
 OUTPUT_JSON_PATH = (
@@ -70,6 +79,14 @@ TOP_K = 20
 NMS_IOU_THRESHOLD = 0.5
 USE_NMS = True
 USE_TOPK_FALLBACK = False
+
+
+# 是否額外執行 Raw Oracle Recall。
+# True 時會再完整跑一次 validation inference，因此總驗證時間約增加一倍。
+ENABLE_RAW_ORACLE = True
+
+# 使用全部 raw prediction，分別計算各 IoU 閾值下的 GT 覆蓋率。
+RAW_ORACLE_IOU_THRESHOLDS = (0.25, 0.50, 0.75)
 
 
 MAX_VAL_BATCHES: Optional[int] = None
@@ -117,10 +134,14 @@ from units.model.train import (
     configure_process_file_limit,
     configure_torch_runtime,
     ensure_precomputed_bert_raw_cache,
+    forward_model_batch,
+    get_amp_enabled,
     get_loss_weights,
+    get_target_boxes_cpu,
     load_model_config,
     load_train_config,
     parse_amp_dtype,
+    prepare_model_batch,
     resolve_amp_dtype_for_device,
     set_deterministic,
     validate_one_epoch,
@@ -332,6 +353,364 @@ def build_validation_criterion(
         rank_max_pairs=args.rank_max_pairs,
         max_query_loss_weight=args.max_query_loss_weight,
     )
+
+
+
+# Raw Oracle Recall
+
+
+def box_iou_xyxy(
+    boxes1: torch.Tensor,
+    boxes2: torch.Tensor,
+) -> torch.Tensor:
+    """
+    計算兩組 xyxy bbox 的 pairwise IoU。
+
+    boxes1: [N, 4]
+    boxes2: [M, 4]
+    return: [N, M]
+    """
+    boxes1 = boxes1.float().reshape(-1, 4)
+    boxes2 = boxes2.float().reshape(-1, 4)
+
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return boxes1.new_zeros(
+            (boxes1.shape[0], boxes2.shape[0])
+        )
+
+    area1 = (
+        (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0)
+        * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
+    )
+    area2 = (
+        (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0)
+        * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
+    )
+
+    left_top = torch.maximum(
+        boxes1[:, None, :2],
+        boxes2[None, :, :2],
+    )
+    right_bottom = torch.minimum(
+        boxes1[:, None, 2:],
+        boxes2[None, :, 2:],
+    )
+
+    intersection_wh = (
+        right_bottom - left_top
+    ).clamp(min=0)
+
+    intersection = (
+        intersection_wh[..., 0]
+        * intersection_wh[..., 1]
+    )
+
+    union = (
+        area1[:, None]
+        + area2[None, :]
+        - intersection
+    )
+
+    return intersection / union.clamp(min=1e-6)
+
+
+class RawOracleRecallAccumulator:
+    """
+    使用全部 raw prediction 計算每個 GT 的最佳 IoU。
+
+    對每個 GT：
+        best_iou = max IoU(raw prediction, GT)
+
+    Raw Oracle Recall@t：
+        best_iou >= t 的 GT 數 / 全部 GT 數
+
+    此指標：
+      - 不使用 confidence。
+      - 不使用 score threshold。
+      - 不使用 Top-K。
+      - 不使用 NMS。
+      - 允許同一 prediction 成為多個 GT 的最佳候選。
+
+    因此它是候選框覆蓋能力的上限診斷，不是正式偵測指標。
+    """
+
+    def __init__(
+        self,
+        iou_thresholds: Tuple[float, ...],
+    ) -> None:
+        if not iou_thresholds:
+            raise ValueError(
+                "RAW_ORACLE_IOU_THRESHOLDS 不可為空。"
+            )
+
+        self.iou_thresholds = tuple(
+            float(value)
+            for value in iou_thresholds
+        )
+
+        self.best_iou_chunks = []
+        self.num_gt = 0
+        self.num_samples = 0
+        self.num_positive_samples = 0
+        self.num_raw_predictions = 0
+        self.num_raw_predictions_on_positive = 0
+
+    def update(
+        self,
+        pred_boxes: torch.Tensor,
+        gt_boxes: torch.Tensor,
+    ) -> None:
+        pred_boxes = (
+            pred_boxes.detach()
+            .float()
+            .cpu()
+            .reshape(-1, 4)
+        )
+        gt_boxes = (
+            gt_boxes.detach()
+            .float()
+            .cpu()
+            .reshape(-1, 4)
+        )
+
+        num_pred = int(pred_boxes.shape[0])
+        num_gt = int(gt_boxes.shape[0])
+
+        self.num_samples += 1
+        self.num_raw_predictions += num_pred
+        self.num_gt += num_gt
+
+        if num_gt == 0:
+            return
+
+        self.num_positive_samples += 1
+        self.num_raw_predictions_on_positive += num_pred
+
+        if num_pred == 0:
+            best_iou = torch.zeros(
+                num_gt,
+                dtype=torch.float32,
+            )
+        else:
+            iou_matrix = box_iou_xyxy(
+                pred_boxes,
+                gt_boxes,
+            )
+            best_iou = iou_matrix.max(dim=0).values
+
+        self.best_iou_chunks.append(
+            best_iou.contiguous()
+        )
+
+    def compute(self) -> Dict[str, Any]:
+        if self.num_gt == 0:
+            result: Dict[str, Any] = {
+                "num_gt": 0,
+                "num_samples": int(self.num_samples),
+                "num_positive_samples": int(
+                    self.num_positive_samples
+                ),
+                "num_raw_predictions": int(
+                    self.num_raw_predictions
+                ),
+                "avg_raw_predictions_per_sample": (
+                    self.num_raw_predictions
+                    / max(1, self.num_samples)
+                ),
+                "best_iou_mean": 0.0,
+                "best_iou_median": 0.0,
+                "best_iou_p25": 0.0,
+                "best_iou_p75": 0.0,
+            }
+
+            for threshold in self.iou_thresholds:
+                key = f"raw_oracle_recall@{threshold:.2f}"
+                result[key] = 0.0
+
+            return result
+
+        best_iou = torch.cat(
+            self.best_iou_chunks,
+            dim=0,
+        )
+
+        if int(best_iou.numel()) != int(self.num_gt):
+            raise RuntimeError(
+                "Raw Oracle GT 數量不一致："
+                f"best_iou={best_iou.numel()}, "
+                f"num_gt={self.num_gt}"
+            )
+
+        result = {
+            "num_gt": int(self.num_gt),
+            "num_samples": int(self.num_samples),
+            "num_positive_samples": int(
+                self.num_positive_samples
+            ),
+            "num_raw_predictions": int(
+                self.num_raw_predictions
+            ),
+            "num_raw_predictions_on_positive": int(
+                self.num_raw_predictions_on_positive
+            ),
+            "avg_raw_predictions_per_sample": (
+                self.num_raw_predictions
+                / max(1, self.num_samples)
+            ),
+            "avg_raw_predictions_per_positive_sample": (
+                self.num_raw_predictions_on_positive
+                / max(1, self.num_positive_samples)
+            ),
+            "best_iou_mean": float(
+                best_iou.mean().item()
+            ),
+            "best_iou_median": float(
+                best_iou.median().item()
+            ),
+            "best_iou_p25": float(
+                torch.quantile(best_iou, 0.25).item()
+            ),
+            "best_iou_p75": float(
+                torch.quantile(best_iou, 0.75).item()
+            ),
+        }
+
+        for threshold in self.iou_thresholds:
+            key = f"raw_oracle_recall@{threshold:.2f}"
+            result[key] = float(
+                (best_iou >= threshold)
+                .float()
+                .mean()
+                .item()
+            )
+
+        return result
+
+
+@torch.inference_mode()
+def evaluate_raw_oracle_recall(
+    model: torch.nn.Module,
+    val_loader: Any,
+    device: torch.device,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    channels_last: bool,
+    iou_thresholds: Tuple[float, ...],
+    max_val_batches: Optional[int] = None,
+    log_interval: int = 50,
+) -> Dict[str, Any]:
+    """
+    額外執行一次 validation inference，使用全部 raw bbox 計算 Oracle Recall。
+
+    此函式不會呼叫任何 prediction filtering，因此 SCORE_THRESHOLD、
+    TOP_K、NMS_IOU_THRESHOLD 和 USE_NMS 都不會影響結果。
+    """
+    model.eval()
+
+    amp_enabled = get_amp_enabled(
+        device,
+        use_amp,
+    )
+
+    accumulator = RawOracleRecallAccumulator(
+        iou_thresholds=iou_thresholds,
+    )
+
+    total_batches = (
+        len(val_loader)
+        if max_val_batches is None
+        else min(
+            len(val_loader),
+            int(max_val_batches),
+        )
+    )
+
+    oracle_start = time.perf_counter()
+
+    for step, batch in enumerate(val_loader):
+        if (
+            max_val_batches is not None
+            and step >= int(max_val_batches)
+        ):
+            break
+
+        images, query_texts, image_indices = (
+            prepare_model_batch(
+                batch=batch,
+                device=device,
+                channels_last=channels_last,
+            )
+        )
+
+        gt_boxes_cpu = get_target_boxes_cpu(batch)
+
+        with torch.autocast(
+            device_type=device.type,
+            enabled=amp_enabled,
+            dtype=(
+                amp_dtype
+                if amp_enabled
+                else None
+            ),
+        ):
+            outputs = forward_model_batch(
+                model=model,
+                images=images,
+                query_texts=query_texts,
+                image_indices=image_indices,
+            )
+
+            raw_pred_bbox = outputs["bbox"]
+
+        raw_pred_bbox_cpu = (
+            raw_pred_bbox.detach()
+            .float()
+            .cpu()
+        )
+
+        if (
+            int(raw_pred_bbox_cpu.shape[0])
+            != len(gt_boxes_cpu)
+        ):
+            raise RuntimeError(
+                "Raw prediction 與 GT batch size 不一致："
+                f"{raw_pred_bbox_cpu.shape[0]} != "
+                f"{len(gt_boxes_cpu)}"
+            )
+
+        for pred_boxes, gt_boxes in zip(
+            raw_pred_bbox_cpu,
+            gt_boxes_cpu,
+        ):
+            accumulator.update(
+                pred_boxes=pred_boxes,
+                gt_boxes=gt_boxes,
+            )
+
+        should_log = (
+            (step + 1) % max(1, int(log_interval)) == 0
+            or (step + 1) == total_batches
+        )
+
+        if should_log:
+            print(
+                "\r[Raw Oracle] "
+                f"batch={step + 1}/{total_batches}, "
+                f"samples={accumulator.num_samples}, "
+                f"GT={accumulator.num_gt}, "
+                f"raw_pred={accumulator.num_raw_predictions}",
+                end="",
+                flush=True,
+            )
+
+    print()
+
+    metrics = accumulator.compute()
+    metrics["elapsed_seconds"] = (
+        time.perf_counter() - oracle_start
+    )
+
+    return metrics
 
 
 
@@ -570,6 +949,37 @@ def run_validation() -> Dict[str, Any]:
         )
     )
 
+    raw_oracle_metrics: Dict[str, Any] = {}
+
+    if ENABLE_RAW_ORACLE:
+        print("\n[Raw Oracle Recall]")
+        print(
+            "  filters      : disabled "
+            "(raw bbox only)"
+        )
+        print(
+            f"  IoU thresholds: "
+            f"{RAW_ORACLE_IOU_THRESHOLDS}"
+        )
+
+        raw_oracle_metrics = (
+            evaluate_raw_oracle_recall(
+                model=model,
+                val_loader=val_loader,
+                device=device,
+                use_amp=args.use_amp,
+                amp_dtype=amp_dtype,
+                channels_last=args.channels_last,
+                iou_thresholds=(
+                    RAW_ORACLE_IOU_THRESHOLDS
+                ),
+                max_val_batches=(
+                    args.max_val_batches
+                ),
+                log_interval=LOG_INTERVAL,
+            )
+        )
+
     elapsed = time.perf_counter() - start_time
 
     result = {
@@ -601,6 +1011,7 @@ def run_validation() -> Dict[str, Any]:
         "max_val_batches": args.max_val_batches,
         "validation_loss": val_loss_metrics,
         "evaluation": eval_metrics,
+        "raw_oracle": raw_oracle_metrics,
         "elapsed_seconds": elapsed,
     }
 
@@ -657,6 +1068,41 @@ def run_validation() -> Dict[str, Any]:
         f"{eval_metrics.get('num_gt', 0)} / "
         f"{eval_metrics.get('num_pred', 0)}"
     )
+    if raw_oracle_metrics:
+        print("\n[Raw Oracle result]")
+        for threshold in RAW_ORACLE_IOU_THRESHOLDS:
+            key = (
+                f"raw_oracle_recall@"
+                f"{threshold:.2f}"
+            )
+            print(
+                f"  Recall@{threshold:.2f} : "
+                f"{raw_oracle_metrics.get(key, 0.0):.6f}"
+            )
+
+        print(
+            f"  Best IoU mean   : "
+            f"{raw_oracle_metrics.get('best_iou_mean', 0.0):.6f}"
+        )
+        print(
+            f"  Best IoU median : "
+            f"{raw_oracle_metrics.get('best_iou_median', 0.0):.6f}"
+        )
+        print(
+            f"  Best IoU P25/P75: "
+            f"{raw_oracle_metrics.get('best_iou_p25', 0.0):.6f} / "
+            f"{raw_oracle_metrics.get('best_iou_p75', 0.0):.6f}"
+        )
+        print(
+            f"  Raw Pred / GT   : "
+            f"{raw_oracle_metrics.get('num_raw_predictions', 0)} / "
+            f"{raw_oracle_metrics.get('num_gt', 0)}"
+        )
+        print(
+            f"  Oracle elapsed  : "
+            f"{raw_oracle_metrics.get('elapsed_seconds', 0.0):.2f}s"
+        )
+
     print(
         f"  elapsed     : {elapsed:.2f}s"
     )
