@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# LightDet optimized train.py v5: EMA + QFL + scheduled ranking + JSON text negatives
+# LightDet optimized train.py v6: EMA + QFL + scheduled ranking + Raw Oracle Recall
 
 from collections import defaultdict
 from types import SimpleNamespace
@@ -1661,7 +1661,172 @@ class BinaryDetectionAPAccumulator:
 
 
 
-# Unified validation: one forward pass for val loss + metrics
+class RawOracleRecallAccumulator:
+    """
+    使用全部 raw prediction 計算候選框覆蓋能力。
+
+    對每一個 GT，從該 query 的所有原始預測框中取最大 IoU：
+        best_iou(gt) = max IoU(raw_prediction, gt)
+
+    Raw Oracle Recall@t：
+        best_iou >= t 的 GT 數 / 全部 GT 數
+
+    此指標不套用 confidence threshold、Top-K 或 NMS，並允許同一個
+    prediction 成為多個 GT 的最佳候選。因此它是偏樂觀的候選框覆蓋
+    上限，只用於診斷定位能力，不能取代正式 mAP、Precision 或 Recall。
+    """
+
+    def __init__(
+        self,
+        iou_thresholds: Optional[Sequence[float]] = None,
+    ) -> None:
+        if iou_thresholds is None:
+            iou_thresholds = (0.25, 0.50, 0.75)
+
+        self.iou_thresholds = torch.as_tensor(
+            list(iou_thresholds),
+            dtype=torch.float32,
+        )
+
+        if self.iou_thresholds.numel() == 0:
+            raise ValueError(
+                "raw_oracle_iou_thresholds must not be empty"
+            )
+
+        if bool(
+            ((self.iou_thresholds < 0.0) | (self.iou_thresholds > 1.0)).any()
+        ):
+            raise ValueError(
+                "raw_oracle_iou_thresholds must be within [0, 1]"
+            )
+
+        self.best_iou_chunks: List[torch.Tensor] = []
+        self.num_gt = 0
+        self.num_samples = 0
+        self.num_positive_samples = 0
+        self.num_raw_pred = 0
+        self.num_raw_pred_positive = 0
+
+    @staticmethod
+    def threshold_key(threshold: float) -> str:
+        return f"raw_oracle_recall{int(round(float(threshold) * 100)):02d}"
+
+    def update(
+        self,
+        pred_boxes: torch.Tensor,
+        gt_boxes: torch.Tensor,
+    ) -> None:
+        # Raw Oracle 只需要 bbox，不使用 score。固定搬到 CPU，避免跨 batch
+        # 保留 GPU tensor，並讓獨立 validate.py 與 train.py 的結果一致。
+        pred_boxes = (
+            pred_boxes.detach()
+            .to(device="cpu", dtype=torch.float32)
+            .reshape(-1, 4)
+            .contiguous()
+        )
+        gt_boxes = (
+            gt_boxes.detach()
+            .to(device="cpu", dtype=torch.float32)
+            .reshape(-1, 4)
+            .contiguous()
+        )
+
+        num_pred = int(pred_boxes.shape[0])
+        num_gt = int(gt_boxes.shape[0])
+
+        self.num_samples += 1
+        self.num_raw_pred += num_pred
+        self.num_gt += num_gt
+
+        # 負文字 query 沒有 GT，不參與 Raw Oracle Recall，但仍保留於
+        # 正式 AP/Precision 的 FP 計算。
+        if num_gt == 0:
+            return
+
+        self.num_positive_samples += 1
+        self.num_raw_pred_positive += num_pred
+
+        if num_pred == 0:
+            best_iou = torch.zeros(
+                num_gt,
+                dtype=torch.float32,
+            )
+        else:
+            iou_matrix = box_iou_xyxy(
+                pred_boxes,
+                gt_boxes,
+            )
+            # 每一欄是一個 GT，取所有 raw prediction 中的最大 IoU。
+            best_iou = iou_matrix.max(dim=0).values
+
+        self.best_iou_chunks.append(
+            best_iou.detach().cpu().contiguous()
+        )
+
+    def compute(self) -> Dict[str, float]:
+        result: Dict[str, float] = {
+            "raw_oracle_num_gt": int(self.num_gt),
+            "raw_oracle_num_samples": int(self.num_samples),
+            "raw_oracle_positive_samples": int(
+                self.num_positive_samples
+            ),
+            "raw_oracle_num_pred": int(self.num_raw_pred),
+            "raw_oracle_avg_pred_per_sample": (
+                self.num_raw_pred / max(1, self.num_samples)
+            ),
+            "raw_oracle_avg_pred_per_positive_sample": (
+                self.num_raw_pred_positive
+                / max(1, self.num_positive_samples)
+            ),
+        }
+
+        if self.num_gt == 0 or not self.best_iou_chunks:
+            result.update({
+                "raw_best_iou_mean": 0.0,
+                "raw_best_iou_median": 0.0,
+                "raw_best_iou_p25": 0.0,
+                "raw_best_iou_p75": 0.0,
+            })
+
+            for threshold in self.iou_thresholds.tolist():
+                result[self.threshold_key(threshold)] = 0.0
+
+            return result
+
+        best_iou = torch.cat(
+            self.best_iou_chunks,
+            dim=0,
+        )
+
+        if int(best_iou.numel()) != int(self.num_gt):
+            raise RuntimeError(
+                "Raw Oracle GT count mismatch: "
+                f"best_iou={best_iou.numel()}, num_gt={self.num_gt}"
+            )
+
+        result.update({
+            "raw_best_iou_mean": float(best_iou.mean().item()),
+            "raw_best_iou_median": float(best_iou.median().item()),
+            "raw_best_iou_p25": float(
+                torch.quantile(best_iou, 0.25).item()
+            ),
+            "raw_best_iou_p75": float(
+                torch.quantile(best_iou, 0.75).item()
+            ),
+        })
+
+        for threshold in self.iou_thresholds.tolist():
+            result[self.threshold_key(threshold)] = float(
+                (best_iou >= float(threshold))
+                .to(torch.float32)
+                .mean()
+                .item()
+            )
+
+        return result
+
+
+# Unified validation: one forward pass for val loss + metrics + Raw Oracle
 
 
 
@@ -1692,6 +1857,12 @@ def validate_one_epoch(
     use_topk_fallback: bool = False,
     use_nms: bool = True,
     iou_thresholds: Optional[Sequence[float]] = None,
+    compute_raw_oracle: bool = True,
+    raw_oracle_iou_thresholds: Optional[Sequence[float]] = (
+        0.25,
+        0.50,
+        0.75,
+    ),
     max_val_batches: Optional[int] = None,
     log_interval: int = 50,
     progress_leave: bool = True,
@@ -1715,6 +1886,14 @@ def validate_one_epoch(
     metric = (
         BinaryDetectionAPAccumulator(iou_thresholds=iou_thresholds)
         if compute_metrics
+        else None
+    )
+
+    raw_oracle_metric = (
+        RawOracleRecallAccumulator(
+            iou_thresholds=raw_oracle_iou_thresholds,
+        )
+        if compute_metrics and compute_raw_oracle
         else None
     )
 
@@ -1830,6 +2009,31 @@ def validate_one_epoch(
             )
 
         if compute_metrics and metric is not None and gt_boxes_cpu is not None:
+            # Raw Oracle 與正式 filtered metric 共用同一次 model forward。
+            # 先使用全部原始 bbox 更新 Oracle，再做 threshold/Top-K/NMS。
+            if raw_oracle_metric is not None:
+                raw_pred_bbox_cpu = (
+                    pred_bbox.detach()
+                    .to(device="cpu", dtype=torch.float32)
+                    .contiguous()
+                )
+
+                if int(raw_pred_bbox_cpu.shape[0]) != len(gt_boxes_cpu):
+                    raise RuntimeError(
+                        "Raw prediction/GT batch size mismatch: "
+                        f"{raw_pred_bbox_cpu.shape[0]} != "
+                        f"{len(gt_boxes_cpu)}"
+                    )
+
+                for raw_boxes, gt_boxes in zip(
+                    raw_pred_bbox_cpu,
+                    gt_boxes_cpu,
+                ):
+                    raw_oracle_metric.update(
+                        pred_boxes=raw_boxes,
+                        gt_boxes=gt_boxes,
+                    )
+
             pred_scores = pred_score_logit.sigmoid()
 
             if pred_scores.ndim == 3:
@@ -1918,6 +2122,33 @@ def validate_one_epoch(
         eval_metrics = metric.compute()
         metric_time = time.perf_counter() - metric_start
 
+        raw_oracle_time = 0.0
+        if raw_oracle_metric is not None:
+            raw_oracle_start = time.perf_counter()
+            raw_oracle_metrics = raw_oracle_metric.compute()
+            raw_oracle_time = (
+                time.perf_counter() - raw_oracle_start
+            )
+            eval_metrics.update(raw_oracle_metrics)
+
+            raw_oracle_recall50 = float(
+                raw_oracle_metrics.get(
+                    "raw_oracle_recall50",
+                    0.0,
+                )
+            )
+            filtered_recall50 = float(
+                eval_metrics.get("recall", 0.0)
+            )
+
+            eval_metrics["raw_oracle_gap50"] = (
+                raw_oracle_recall50 - filtered_recall50
+            )
+            eval_metrics["raw_oracle_retention50"] = (
+                filtered_recall50
+                / max(raw_oracle_recall50, 1e-12)
+            )
+
         eval_metrics.update({
             "valid_samples": sample_count,
             "skipped_empty_gt": skipped_empty_gt,
@@ -1926,11 +2157,13 @@ def validate_one_epoch(
             ),
             "eval_loop_time": validation_loop_time,
             "eval_metric_time": metric_time,
+            "raw_oracle_metric_time": raw_oracle_time,
         })
 
         tqdm.write(
             f"[Eval Timing] loop={validation_loop_time:.2f}s "
-            f"metric={metric_time:.2f}s"
+            f"metric={metric_time:.2f}s "
+            f"raw_oracle={raw_oracle_time:.2f}s"
         )
         tqdm.write(
             f"Eval Epoch [{epoch}] "
@@ -1944,6 +2177,22 @@ def validate_one_epoch(
             f"Pred={eval_metrics['num_pred']} "
             f"skip_empty={eval_metrics['skipped_empty_gt']}"
         )
+
+        if raw_oracle_metric is not None:
+            tqdm.write(
+                f"Raw Oracle [{epoch}] "
+                f"R25={eval_metrics.get('raw_oracle_recall25', 0.0):.4f} "
+                f"R50={eval_metrics.get('raw_oracle_recall50', 0.0):.4f} "
+                f"R75={eval_metrics.get('raw_oracle_recall75', 0.0):.4f} "
+                f"BestIoUMean="
+                f"{eval_metrics.get('raw_best_iou_mean', 0.0):.4f} "
+                f"BestIoUMedian="
+                f"{eval_metrics.get('raw_best_iou_median', 0.0):.4f} "
+                f"Gap50="
+                f"{eval_metrics.get('raw_oracle_gap50', 0.0):.4f} "
+                f"Retention50="
+                f"{eval_metrics.get('raw_oracle_retention50', 0.0):.4f}"
+            )
 
     return val_loss_metrics, eval_metrics
 
@@ -3089,6 +3338,10 @@ def train(args: SimpleNamespace) -> None:
             use_topk_fallback=args.use_topk_fallback,
             use_nms=args.use_nms,
             iou_thresholds=args.iou_thresholds,
+            compute_raw_oracle=args.compute_raw_oracle,
+            raw_oracle_iou_thresholds=(
+                args.raw_oracle_iou_thresholds
+            ),
             max_val_batches=args.max_val_batches,
             log_interval=args.log_interval,
             progress_leave=args.progress_leave,
@@ -3218,6 +3471,10 @@ def train(args: SimpleNamespace) -> None:
             f"mAP50-95={eval_metrics.get('map50_95', -1):.4f} "
             f"P={eval_metrics.get('precision', -1):.4f} "
             f"R={eval_metrics.get('recall', -1):.4f} "
+            f"Oracle50="
+            f"{eval_metrics.get('raw_oracle_recall50', -1):.4f} "
+            f"Gap50="
+            f"{eval_metrics.get('raw_oracle_gap50', -1):.4f} "
             f"lb={lambda_bbox:.2f} "
             f"lg={lambda_giou:.2f} "
             f"ls={lambda_score:.2f} "
@@ -3365,6 +3622,8 @@ DEFAULT_TRAIN_CFG = {
         "nms_iou_thr": 0.5,
         "use_nms": True,
         "iou_thresholds": None,
+        "compute_raw_oracle": True,
+        "raw_oracle_iou_thresholds": [0.25, 0.50, 0.75],
         "best_metric": "map50_95",
         "use_topk_fallback": False,
     },
@@ -3591,6 +3850,13 @@ def cfg_to_args(
         nms_iou_thr=eval_cfg["nms_iou_thr"],
         use_nms=eval_cfg.get("use_nms", True),
         iou_thresholds=eval_cfg.get("iou_thresholds"),
+        compute_raw_oracle=bool(
+            eval_cfg.get("compute_raw_oracle", True)
+        ),
+        raw_oracle_iou_thresholds=eval_cfg.get(
+            "raw_oracle_iou_thresholds",
+            [0.25, 0.50, 0.75],
+        ),
         best_metric=eval_cfg["best_metric"],
         use_topk_fallback=eval_cfg.get("use_topk_fallback", False),
 
@@ -3723,6 +3989,11 @@ def print_config_summary(
         f"top_k={evaluation['top_k']}, "
         f"use_nms={evaluation.get('use_nms', True)}, "
         f"max_batches={evaluation.get('max_val_batches')}"
+    )
+    print(
+        f"  raw oracle   : enabled="
+        f"{evaluation.get('compute_raw_oracle', True)}, "
+        f"iou={evaluation.get('raw_oracle_iou_thresholds', [0.25, 0.5, 0.75])}"
     )
     print("")
 
