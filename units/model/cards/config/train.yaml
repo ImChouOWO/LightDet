@@ -1,5 +1,11 @@
 # ============================================================
 # LightDet train.yaml
+# 實驗目標：
+#   1. 讓 matcher 適度參考 score
+#   2. 每個 GT 僅保留一個 positive prediction
+#   3. 降低 ranking 與 score loss 的過度干擾
+#   4. 小幅提高 GIoU 權重
+#   5. 每次驗證同時計算 Raw Oracle Recall
 # ============================================================
 
 data:
@@ -20,13 +26,15 @@ data:
   negative_sample_ratio: 0.10
   use_negative_queries_in_val: true
 
+
 train:
-  epochs: 300
+  # 本輪先觀察 30 epoch
+  epochs: 30
   batch_size: 48
-  warmup_epochs: 5
+  warmup_epochs: 3
   num_workers: 16
   device: cuda:1
-  seed: 45
+  seed: 47
   deterministic: false
 
   use_amp: true
@@ -41,41 +49,48 @@ train:
   ema_decay: 0.999
   ema_update_interval: 1
   ema_buffer_update_interval: 1
+
   grad_clip_norm: 1.0
 
+
 optim:
-  lr_vision: 0.0001
-  lr_text: 0.00001
-  lr_transformer: 0.0001
-  lr_head: 0.0001
+  # 以既有最佳權重進行 weights-only warm start
+  lr_vision: 0.00002
+  lr_text: 0.000001
+  lr_transformer: 0.00002
+  lr_head: 0.00005
+
   weight_decay: 0.0001
   min_lr_ratio: 0.05
-  max_warmup_steps: 3000
+  max_warmup_steps: 1500
   fused: true
+
 
 loss:
   matcher:
-    cost_score: 0.0
+    cost_score: 0.25
 
   score_sampling:
     hard_negative_ratio: 3
     positive_ratio: 1.0
-    max_positive_per_gt: 2
+    max_positive_per_gt: 1
     expand_cost_bbox: 5.0
     expand_cost_giou: 2.0
 
   quality:
     iou_pos_thr: 0.1
     qfl_beta: 2.0
-    quality_warmup_epoch: 10
+    quality_warmup_epoch: 5
 
   ranking:
-    lambda_rank: 0.3
+  
+    lambda_rank: 0.15
     rank_margin: 0.1
     rank_min_quality_gap: 0.1
     rank_max_pairs: 512
+
     rank_start_epoch: 1
-    rank_warmup_epoch: 20
+    rank_warmup_epoch: 10
     rank_alpha_min: 0.0
 
   text_negative:
@@ -83,33 +98,51 @@ loss:
 
   weight:
     dynamic: true
+
     bbox_start: 5.0
-    bbox_end: 4.0
+    bbox_end: 4.5
     bbox_decay_until: 0.5
-    giou: 2.0
+
+    # 小幅提高定位品質權重
+    giou: 2.5
+
+    # 避免 score loss 持續升到 4.0
     score_start: 2.0
-    score_end: 4.0
+    score_end: 3.0
     score_warm_until: 0.4
 
   pos_weight:
     value: 1.0
 
+
 eval:
   val_loss_interval: 5
   eval_interval: 1
   max_val_batches: null
+
   score_thr: 0.001
   top_k: 20
   nms_iou_thr: 0.5
   use_nms: true
-  best_metric: map50_95
   use_topk_fallback: false
 
+  best_metric: map50_95
+
+  compute_raw_oracle: true
+
+  raw_oracle_iou_thresholds:
+    - 0.25
+    - 0.50
+    - 0.75
+
+
 log:
-  save_dir: runs/train/lightdet_aligned_qfl
+  save_dir: runs/train/lightdet_match_score_025
   resume_path: null
+
   save_latest_interval: 1
-  save_epoch_interval: 50
+  save_epoch_interval: 10
+
   emit_step_metrics: false
   log_interval: 50
   progress_leave: true
