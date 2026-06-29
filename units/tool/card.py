@@ -686,57 +686,67 @@ class DenseHead(nn.Module):
         num_fusion=16,
         num_image=400,
         num_text=32,
-        alpha=0.4
+        alpha=0.4,  # 保留此參數以相容舊呼叫，但不再使用
     ):
         super().__init__()
 
         self.num_fusion = num_fusion
         self.num_image = num_image
         self.num_text = num_text
-        self.alpha = alpha
-        self.alpha_logit = nn.Parameter(torch.tensor(0.0))
-        self.img_head = nn.Sequential(
+
+        # BBox 專用偵測頭
+        self.bbox_head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 5)
+            nn.Linear(hidden_dim, 4),
         )
 
-        self.fusion_score = nn.Sequential(
+        # Score 專用偵測頭
+        # 輸出 raw logit，不在模型內執行 sigmoid
+        self.score_head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(hidden_dim, 1),
         )
 
     def forward(self, x):
-        fusion_tokens = x[:, :self.num_fusion, :]
+        """
+        Args:
+            x:[fusion_tokens,img_tokens,text_tokens]
+        shape:[B, num_fusion + num_image + num_text, hidden_dim]
+        """
+        img_tokens = x[:,self.num_fusion:self.num_fusion + self.num_image,:]
 
-        img_tokens = x[
-            :,
-            self.num_fusion:self.num_fusion + self.num_image,
-            :
-        ]
+        bbox_raw = self.bbox_head(img_tokens)
 
-        img_pred = self.img_head(img_tokens)
+        bbox_raw = bbox_raw.sigmoid()
 
-        bbox_raw = img_pred[..., :4].sigmoid()
+        x1 = torch.minimum(
+            bbox_raw[..., 0],
+            bbox_raw[..., 2],
+        )
+        y1 = torch.minimum(
+            bbox_raw[..., 1],
+            bbox_raw[..., 3],
+        )
+        x2 = torch.maximum(
+            bbox_raw[..., 0],
+            bbox_raw[..., 2],
+        )
+        y2 = torch.maximum(
+            bbox_raw[..., 1],
+            bbox_raw[..., 3],
+        )
 
-        x1 = torch.minimum(bbox_raw[..., 0], bbox_raw[..., 2])
-        y1 = torch.minimum(bbox_raw[..., 1], bbox_raw[..., 3])
-        x2 = torch.maximum(bbox_raw[..., 0], bbox_raw[..., 2])
-        y2 = torch.maximum(bbox_raw[..., 1], bbox_raw[..., 3])
+        bbox = torch.stack(
+            [x1, y1, x2, y2],
+            dim=-1,
+        )
+        score_logit = self.score_head(img_tokens)
 
-        bbox = torch.stack([x1, y1, x2, y2], dim=-1)
-        img_score = img_pred[..., 4:5]
-
-        fusion_global = fusion_tokens.mean(dim=1, keepdim=True)
-        fusion_score = self.fusion_score(fusion_global)
-        alpha = torch.sigmoid(self.alpha_logit)
-        score_logit = img_score + alpha * fusion_score
-        
-
-        return bbox, score_logit  
+        return bbox, score_logit
     
 class VisionTextModel(nn.Module):
     def __init__(

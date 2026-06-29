@@ -4326,7 +4326,7 @@ def main() -> None:
             "/home/soic/Desktop/LightDet/units/model/cards/config/train.yaml"
         ),
         data="/home/soic/Desktop/LightDet/datasets",
-        epochs=300,
+        epochs=100,
         imgsz=512,
         batch=48,
         device=1,
