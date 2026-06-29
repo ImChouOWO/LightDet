@@ -4334,12 +4334,12 @@ def main() -> None:
         seed=47,
         deterministic=False,
 
-        weights="/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_neg_pool/best_map50_95.pt",
+        weights="/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_neg_pool_dynamic/best_map50_95.pt",
         resume=None,
         prefer_ema=True,
 
         project="runs/train",
-        name="lightdet_neg_pool_dynamic",
+        name="lightdet_with_score_cost",
     )
 
 

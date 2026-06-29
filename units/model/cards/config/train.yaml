@@ -1,12 +1,17 @@
+
 # ============================================================
 # LightDet train.yaml
+#
 # 實驗目標：
-#   1. 讓 matcher 適度參考 score
-#   2. 每個 GT 僅保留一個 positive prediction
-#   3. 降低 ranking 與 score loss 的過度干擾
-#   4. 小幅提高 GIoU 權重
-#   5. 每次驗證同時計算 Raw Oracle Recall
+#   1. 使用最佳 EMA 權重進行 weights-only warm start
+#   2. Matcher 僅適度參考 confidence score
+#   3. 每個 GT 最多保留 2 個 positive predictions
+#   4. 每個 Query 使用較完整的 hard negatives 計算 QFL
+#   5. 使用 per-query、logit-based ranking
+#   6. 延後並降低 ranking loss，避免 score distribution 崩壞
+#   7. 每次驗證同時計算 Raw Oracle Recall
 # ============================================================
+
 
 data:
   dataset_dir: /home/soic/Desktop/LightDet/datasets
@@ -18,6 +23,7 @@ data:
   prebuild_image_cache: true
   prefetch_factor: 4
   cache_workers: 8
+
   pin_memory: true
   persistent_workers: true
   query_budget: true
@@ -28,11 +34,12 @@ data:
 
 
 train:
-  # 本輪先觀察 30 epoch
+  # 本輪先測試 30 epochs
   epochs: 30
   batch_size: 48
   warmup_epochs: 3
   num_workers: 16
+
   device: cuda:1
   seed: 47
   deterministic: false
@@ -41,6 +48,7 @@ train:
   amp_dtype: bf16
   allow_tf32: true
   matmul_precision: high
+
   channels_last: false
   compile: false
   startup_smoke_test: true
@@ -54,72 +62,115 @@ train:
 
 
 optim:
-  # 以既有最佳權重進行 weights-only warm start
-  lr_vision: 0.00002
+  # 平衡型 weights-only warm-start LR
+  # 不會像保守版一樣過低，也比上一輪更能保護 score head
+  lr_vision: 0.000015
   lr_text: 0.000001
-  lr_transformer: 0.00002
-  lr_head: 0.00005
+  lr_transformer: 0.000015
+  lr_head: 0.000030
 
   weight_decay: 0.0001
+
+  # Warmup + cosine decay
   min_lr_ratio: 0.05
   max_warmup_steps: 1500
+
   fused: true
 
 
 loss:
   matcher:
-    cost_score: 0.25
+    # Matcher 的定位成本
+    cost_bbox: 5.0
+    cost_giou: 2.0
+
+    # 從 0.25 降為 0.10，避免初始錯誤 score 主導 assignment
+    cost_score: 0.10
+
 
   score_sampling:
-    hard_negative_ratio: 3
+    # 新版 loss.py 會對每個 Query 選：
+    # positive_count × hard_negative_ratio
+    #
+    # 1 positive  -> 最多 32 negatives
+    # 2 positives -> 最多 64 negatives
+    #
+    # 比舊設定 3 更接近完整 negative supervision
+    hard_negative_ratio: 32
+
     positive_ratio: 1.0
-    max_positive_per_gt: 1
+
+    # 恢復為 2，避免可用的次佳框全部被當作 negative
+    max_positive_per_gt: 2
+
     expand_cost_bbox: 5.0
     expand_cost_giou: 2.0
 
+
   quality:
+    # 額外 positive 的最低 IoU 條件
     iou_pos_thr: 0.1
+
+    # 必須明確設為 0，避免低 IoU positive 被強制指定為 0.25
+    quality_min: 0.0
+    quality_max: 1.0
+
     qfl_beta: 2.0
-    quality_warmup_epoch: 5
+
+    # 前期先讓 positive target 接近 1，
+    # 再逐步轉換為 IoU quality target
+    quality_warmup_epoch: 10
+
 
   ranking:
-  
-    lambda_rank: 0.15
+    # 新版使用 per-query logit ranking，
+    # raw ranking loss 約為 0.7 左右，因此權重不宜再使用 0.15
+    lambda_rank: 0.03
+
     rank_margin: 0.1
     rank_min_quality_gap: 0.1
     rank_max_pairs: 512
 
-    rank_start_epoch: 1
-    rank_warmup_epoch: 10
+    # 延後 ranking，先讓 QFL score 穩定
+    rank_start_epoch: 10
+    rank_warmup_epoch: 20
     rank_alpha_min: 0.0
+
 
   text_negative:
     max_query_loss_weight: 10.0
 
+
   weight:
     dynamic: true
 
+    # BBox regression
     bbox_start: 5.0
     bbox_end: 4.5
     bbox_decay_until: 0.5
 
-    # 小幅提高定位品質權重
-    giou: 2.5
+    # 恢復為 2.0，避免同時過度提高定位 loss
+    giou: 2.0
 
-    # 避免 score loss 持續升到 4.0
-    score_start: 2.0
-    score_end: 3.0
-    score_warm_until: 0.4
+    # 降低 score loss 對既有 confidence distribution 的衝擊
+    score_start: 1.5
+    score_end: 2.5
+    score_warm_until: 0.5
+
 
   pos_weight:
     value: 1.0
 
 
 eval:
+  # 每 5 epochs 計算一次完整 validation loss
   val_loss_interval: 5
+
+  # 每個 epoch 計算正式 detection metrics
   eval_interval: 1
   max_val_batches: null
 
+  # 正式評估條件固定，確保不同實驗可比較
   score_thr: 0.001
   top_k: 20
   nms_iou_thr: 0.5
@@ -128,8 +179,8 @@ eval:
 
   best_metric: map50_95
 
+  # Raw Oracle 診斷
   compute_raw_oracle: true
-
   raw_oracle_iou_thresholds:
     - 0.25
     - 0.50
@@ -137,7 +188,9 @@ eval:
 
 
 log:
-  save_dir: runs/train/lightdet_match_score_025
+  save_dir: runs/train/lightdet_per_query_rank_safe_v2
+
+  # weights-only warm start 不使用 resume
   resume_path: null
 
   save_latest_interval: 1
@@ -145,5 +198,6 @@ log:
 
   emit_step_metrics: false
   log_interval: 50
+
   progress_leave: true
   progress_mininterval: 0.5
