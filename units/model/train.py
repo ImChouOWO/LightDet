@@ -4333,13 +4333,11 @@ def main() -> None:
         workers=16,
         seed=47,
         deterministic=False,
-
-        weights="/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_neg_pool_dynamic/best_map50_95.pt",
+        weights=None,
         resume=None,
         prefer_ema=True,
-
         project="runs/train",
-        name="lightdet_with_score_cost",
+        name="lightdet_Decouple_head",
     )
 
 
