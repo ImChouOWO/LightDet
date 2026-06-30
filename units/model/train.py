@@ -4663,7 +4663,6 @@ def main() -> None:
         device=1,
         workers=16,
         seed=47,
-        deterministic=False,
         weights=None,
         resume=None,
         prefer_ema=True,
