@@ -59,8 +59,9 @@ DATASET_DIR = PROJECT_ROOT / "datasets"
 
 CHECKPOINT_PATH = (
     PROJECT_ROOT
-    / "units/model/runs/train/lightdet_neg_pool/best_map50_95.pt"
+    / "units/model/runs/train/lightdet_Decouple_head_2/best_map50_95.pt"
 )
+
 
 OUTPUT_JSON_PATH = (
     CHECKPOINT_PATH.parent
@@ -74,10 +75,10 @@ PREFER_EMA = True
 USE_NEGATIVE_QUERIES_IN_VAL = False
 
 
-SCORE_THRESHOLD = 0.001
-TOP_K = 20
+SCORE_THRESHOLD = 0.0
+TOP_K = 100
 NMS_IOU_THRESHOLD = 0.5
-USE_NMS = True
+USE_NMS = False
 USE_TOPK_FALLBACK = False
 
 

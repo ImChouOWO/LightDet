@@ -1,6 +1,6 @@
 data:
   dataset_dir: /home/soic/Desktop/LightDet/datasets
-  image_size: 1024
+  image_size: 512
   max_text_aug_per_image: 1
 
   cache_images: true
@@ -14,14 +14,14 @@ data:
   query_budget: true
 
   negative_query_path: /home/soic/Desktop/LightDet/units/model/cards/cache/negative_query_pool.json
-  negative_sample_ratio: 0.10
-  use_negative_queries_in_val: true
+  negative_sample_ratio: 0.05
+  use_negative_queries_in_val: false
 
 
 train:
   epochs: 100
   batch_size: 48
-  warmup_epochs: 2
+  warmup_epochs: 3
   num_workers: 16
 
   device: cuda:1
@@ -42,18 +42,18 @@ train:
   ema_update_interval: 1
   ema_buffer_update_interval: 1
 
-  grad_clip_norm: 2.0
+  grad_clip_norm: 1.0
 
 
 optim:
-  lr_vision: 0.000150
-  lr_text: 0.000080
-  lr_transformer: 0.000250
-  lr_head: 0.000400
+  lr_vision: 0.000100
+  lr_text: 0.000050
+  lr_transformer: 0.000150
+  lr_head: 0.000250
 
   weight_decay: 0.0001
   min_lr_ratio: 0.05
-  max_warmup_steps: 800
+  max_warmup_steps: 4000
   fused: true
 
 
@@ -61,10 +61,10 @@ loss:
   matcher:
     cost_bbox: 5.0
     cost_giou: 2.0
-    cost_score: 0.05
+    cost_score: 0.0
 
   score_sampling:
-    hard_negative_ratio: 16
+    hard_negative_ratio: 8
     positive_ratio: 1.0
     max_positive_per_gt: 2
     expand_cost_bbox: 5.0
@@ -75,32 +75,32 @@ loss:
     quality_min: 0.0
     quality_max: 1.0
     qfl_beta: 2.0
-    quality_warmup_epoch: 8
+    quality_warmup_epoch: 15
 
   ranking:
-    lambda_rank: 0.01
+    lambda_rank: 0.1
     rank_margin: 0.1
     rank_min_quality_gap: 0.1
     rank_max_pairs: 512
-    rank_start_epoch: 15
-    rank_warmup_epoch: 25
+    rank_start_epoch: 30
+    rank_warmup_epoch: 50
     rank_alpha_min: 0.0
 
   text_negative:
-    max_query_loss_weight: 10.0
+    max_query_loss_weight: 4.0
 
   weight:
     dynamic: true
     bbox_start: 5.0
-    bbox_end: 4.0
-    bbox_decay_until: 0.4
+    bbox_end: 4.5
+    bbox_decay_until: 0.5
     giou: 2.0
-    score_start: 2.0
-    score_end: 3.0
-    score_warm_until: 0.4
+    score_start: 1.5
+    score_end: 2.5
+    score_warm_until: 0.5
 
   pos_weight:
-    value: 2.5
+    value: 2.0
 
 
 eval:
@@ -115,7 +115,6 @@ eval:
   use_topk_fallback: false
 
   best_metric: map50_95
-
   compute_raw_oracle: true
   raw_oracle_iou_thresholds:
     - 0.25
@@ -124,7 +123,7 @@ eval:
 
 
 log:
-  save_dir: runs/train/lightdet_decoupled_scratch_aggressive_seed47
+  save_dir: runs/train/lightdet_decoupled_grid10_seed47
   resume_path: null
 
   save_latest_interval: 1

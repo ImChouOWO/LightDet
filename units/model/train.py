@@ -3087,10 +3087,7 @@ def train(args: SimpleNamespace) -> None:
     )
 
     total_steps = args.epochs * len(train_loader)
-    warmup_steps = min(
-        args.max_warmup_steps,
-        args.warmup_epochs * len(train_loader),
-    )
+    warmup_steps = args.warmup_epochs * len(train_loader)
 
     scheduler = WarmupCosineScheduler(
         optimizer=optimizer,
@@ -4337,7 +4334,7 @@ def main() -> None:
         resume=None,
         prefer_ema=True,
         project="runs/train",
-        name="lightdet_Decouple_head",
+        name="lightdet_Decouple_head_2",
     )
 
 
