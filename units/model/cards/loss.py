@@ -191,20 +191,34 @@ class HungarianOneToOneMatcher:
                     * pred_score[batch_index, :, None]
                 )
 
-            pred_indices_np, gt_indices_np = linear_sum_assignment(
-                cost.detach().cpu().numpy()
-            )
+            # Query-conditioned datasets frequently contain exactly one GT.
+            # In this case Hungarian matching has a closed-form exact solution:
+            # select the single prediction with minimum matching cost. This avoids
+            # a GPU -> CPU synchronization and a SciPy call for every query.
+            if num_gt == 1:
+                pred_indices = torch.argmin(
+                    cost[:, 0],
+                ).reshape(1).to(dtype=torch.long)
+                gt_indices = torch.zeros(
+                    1,
+                    dtype=torch.long,
+                    device=device,
+                )
+            else:
+                pred_indices_np, gt_indices_np = linear_sum_assignment(
+                    cost.detach().cpu().numpy()
+                )
 
-            pred_indices = torch.as_tensor(
-                pred_indices_np,
-                dtype=torch.long,
-                device=device,
-            )
-            gt_indices = torch.as_tensor(
-                gt_indices_np,
-                dtype=torch.long,
-                device=device,
-            )
+                pred_indices = torch.as_tensor(
+                    pred_indices_np,
+                    dtype=torch.long,
+                    device=device,
+                )
+                gt_indices = torch.as_tensor(
+                    gt_indices_np,
+                    dtype=torch.long,
+                    device=device,
+                )
 
             assignments.append(
                 (pred_indices, gt_indices)
@@ -313,6 +327,52 @@ class OneToManyMatcher:
                 max(minimum_budget, ratio_budget),
                 maximum_budget,
             )
+
+            # Exact vectorized fast path for the common single-GT query.
+            # The best prediction is always selected. Additional positives follow
+            # the same low-cost ordering and optional IoU gate as the generic path,
+            # but without Python loops or repeated CUDA .item() synchronizations.
+            if num_gt == 1:
+                target_count = min(
+                    positive_budget,
+                    self.max_positive_per_gt,
+                    num_pred,
+                )
+
+                ordered_pred = torch.argsort(
+                    cost[:, 0],
+                    descending=False,
+                )
+                base_pred = ordered_pred[:1]
+
+                if target_count > 1:
+                    extra_pred = ordered_pred[1:]
+
+                    if self.min_extra_positive_iou > 0:
+                        extra_pred = extra_pred[
+                            iou_matrix[extra_pred, 0]
+                            >= self.min_extra_positive_iou
+                        ]
+
+                    extra_pred = extra_pred[: target_count - 1]
+                    selected_pred_tensor = torch.cat(
+                        [base_pred, extra_pred],
+                        dim=0,
+                    )
+                else:
+                    selected_pred_tensor = base_pred
+
+                selected_gt_tensor = torch.zeros_like(
+                    selected_pred_tensor,
+                    dtype=torch.long,
+                )
+                assignments.append(
+                    (
+                        selected_pred_tensor.to(dtype=torch.long),
+                        selected_gt_tensor,
+                    )
+                )
+                continue
 
             base_pred, base_gt = self._greedy_one_to_one(cost)
             selected_pred: List[int] = []
