@@ -8,5 +8,11 @@ model:
   text_max_length: 32
   fusion_token_num: 16
   dropout: 0.1
+
   freeze_bert: true
   precomputed_bert_path: /home/soic/Desktop/LightDet/units/model/cards/cache/bert_raw_cache.pt
+
+  # Hybrid detection
+  use_auxiliary_head: true
+  auxiliary_in_eval: false
+  initialize_aux_from_main: true

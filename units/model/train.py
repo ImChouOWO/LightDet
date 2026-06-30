@@ -394,14 +394,27 @@ def forward_model_batch(
     images: torch.Tensor,
     query_texts: List[str],
     image_indices: Optional[torch.Tensor],
-) -> Dict[str, torch.Tensor]:
-    if image_indices is None:
-        return model(images, query_texts)
+    return_aux: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """
+    Unified model forward.
+
+    return_aux:
+        None  -> let VisionTextModel decide from train/eval mode
+        True  -> force main + auxiliary outputs
+        False -> force main-only output
+    """
+    model_kwargs: Dict[str, Any] = {
+        "return_aux": return_aux,
+    }
+
+    if image_indices is not None:
+        model_kwargs["image_indices"] = image_indices
 
     return model(
         images,
         query_texts,
-        image_indices=image_indices,
+        **model_kwargs,
     )
 
 
@@ -481,10 +494,24 @@ def run_startup_smoke_test(
                     images=images,
                     query_texts=query_texts,
                     image_indices=image_indices,
+                    return_aux=True,
                 )
 
                 pred_bbox = outputs["bbox"]
                 pred_score_logit = get_score_logit(outputs)
+                aux_pred_bbox = outputs.get("aux_bbox")
+                aux_pred_score_logit = outputs.get(
+                    "aux_score_logit"
+                )
+
+                if (
+                    aux_pred_bbox is None
+                    or aux_pred_score_logit is None
+                ):
+                    raise RuntimeError(
+                        "Startup hybrid check requires auxiliary "
+                        "bbox and score outputs."
+                    )
 
                 loss, _ = criterion(
                     pred_bbox=pred_bbox,
@@ -502,6 +529,8 @@ def run_startup_smoke_test(
                     rank_alpha_min=args.rank_alpha_min,
                     query_loss_weights=batch.get("query_loss_weights"),
                     text_negative_mask=batch.get("text_negative_mask"),
+                    aux_pred_bbox=aux_pred_bbox,
+                    aux_pred_score_logit=aux_pred_score_logit,
                 )
 
         expected_queries = len(query_texts)
@@ -515,10 +544,28 @@ def run_startup_smoke_test(
                 "Model score batch does not match query count: "
                 f"{pred_score_logit.shape[0]} != {expected_queries}"
             )
+        if aux_pred_bbox.shape[0] != expected_queries:
+            raise RuntimeError(
+                "Aux bbox batch does not match query count: "
+                f"{aux_pred_bbox.shape[0]} != {expected_queries}"
+            )
+        if aux_pred_score_logit.shape[0] != expected_queries:
+            raise RuntimeError(
+                "Aux score batch does not match query count: "
+                f"{aux_pred_score_logit.shape[0]} != {expected_queries}"
+            )
         if not bool(torch.isfinite(pred_bbox).all().item()):
             raise FloatingPointError("Startup bbox output contains NaN/Inf")
         if not bool(torch.isfinite(pred_score_logit).all().item()):
             raise FloatingPointError("Startup score output contains NaN/Inf")
+        if not bool(torch.isfinite(aux_pred_bbox).all().item()):
+            raise FloatingPointError(
+                "Startup auxiliary bbox output contains NaN/Inf"
+            )
+        if not bool(torch.isfinite(aux_pred_score_logit).all().item()):
+            raise FloatingPointError(
+                "Startup auxiliary score output contains NaN/Inf"
+            )
         if not bool(torch.isfinite(loss).item()):
             raise FloatingPointError("Startup loss is NaN/Inf")
 
@@ -530,6 +577,8 @@ def run_startup_smoke_test(
             f"queries={expected_queries}, "
             f"bbox={tuple(pred_bbox.shape)}, "
             f"score={tuple(pred_score_logit.shape)}, "
+            f"aux_bbox={tuple(aux_pred_bbox.shape)}, "
+            f"aux_score={tuple(aux_pred_score_logit.shape)}, "
             f"loss={loss.item():.6f}"
         )
     finally:
@@ -720,7 +769,76 @@ def build_optimizer(
     return optimizer
 
 
+def resolve_scheduler_steps(
+    *,
+    epochs: int,
+    steps_per_epoch: int,
+    warmup_epochs: float,
+    max_warmup_steps: Optional[int],
+) -> Tuple[int, int, int]:
+    """
+    Resolve total and warmup steps from the YAML configuration.
+
+    warmup_epochs determines the requested warmup duration.
+    max_warmup_steps is only an upper bound; None or a value <= 0 disables
+    the cap. warmup is always kept below total_steps so cosine decay has at
+    least one step.
+    """
+    epochs = int(epochs)
+    steps_per_epoch = int(steps_per_epoch)
+    warmup_epochs = float(warmup_epochs)
+
+    if epochs <= 0:
+        raise ValueError(f"epochs must be > 0, got {epochs}")
+    if steps_per_epoch <= 0:
+        raise ValueError(
+            "steps_per_epoch must be > 0, got "
+            f"{steps_per_epoch}"
+        )
+    if warmup_epochs < 0:
+        raise ValueError(
+            "warmup_epochs must be >= 0, got "
+            f"{warmup_epochs}"
+        )
+
+    total_steps = epochs * steps_per_epoch
+    requested_warmup_steps = int(
+        math.ceil(warmup_epochs * steps_per_epoch)
+    )
+
+    if max_warmup_steps is None:
+        effective_warmup_steps = requested_warmup_steps
+    else:
+        max_warmup_steps = int(max_warmup_steps)
+        if max_warmup_steps > 0:
+            effective_warmup_steps = min(
+                requested_warmup_steps,
+                max_warmup_steps,
+            )
+        else:
+            effective_warmup_steps = requested_warmup_steps
+
+    effective_warmup_steps = min(
+        effective_warmup_steps,
+        max(total_steps - 1, 0),
+    )
+
+    return (
+        int(total_steps),
+        int(requested_warmup_steps),
+        int(effective_warmup_steps),
+    )
+
+
 class WarmupCosineScheduler:
+    """
+    Step-based linear warmup followed by cosine decay.
+
+    step() must be called immediately before each optimizer update. This makes
+    the first optimizer step use the first warmup LR instead of the full base
+    LR. step_num records the number of optimizer updates already scheduled.
+    """
+
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
@@ -733,28 +851,140 @@ class WarmupCosineScheduler:
         self.total_steps = int(total_steps)
         self.min_lr_ratio = float(min_lr_ratio)
         self.step_num = 0
-        self.base_lrs = [group["lr"] for group in optimizer.param_groups]
+        self.base_lrs = [
+            float(group["lr"])
+            for group in optimizer.param_groups
+        ]
+
+        if self.total_steps <= 0:
+            raise ValueError(
+                f"total_steps must be > 0, got {self.total_steps}"
+            )
+        if not 0 <= self.warmup_steps < self.total_steps:
+            raise ValueError(
+                "warmup_steps must satisfy 0 <= warmup_steps < "
+                f"total_steps, got {self.warmup_steps} and "
+                f"{self.total_steps}"
+            )
+        if not 0.0 <= self.min_lr_ratio <= 1.0:
+            raise ValueError(
+                "min_lr_ratio must be in [0, 1], got "
+                f"{self.min_lr_ratio}"
+            )
+        if not self.base_lrs:
+            raise ValueError(
+                "optimizer must contain at least one parameter group"
+            )
+
+    def _factor(self, step_num: int) -> float:
+        step_num = min(
+            max(int(step_num), 0),
+            self.total_steps,
+        )
+
+        if self.warmup_steps > 0 and step_num <= self.warmup_steps:
+            return float(step_num) / float(self.warmup_steps)
+
+        decay_steps = self.total_steps - self.warmup_steps
+        progress = (step_num - self.warmup_steps) / max(1, decay_steps)
+        progress = min(max(float(progress), 0.0), 1.0)
+
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return (
+            self.min_lr_ratio
+            + (1.0 - self.min_lr_ratio) * cosine
+        )
+
+    def _apply_step_lr(self, step_num: int) -> None:
+        factor = self._factor(step_num)
+
+        if len(self.optimizer.param_groups) != len(self.base_lrs):
+            raise RuntimeError(
+                "Optimizer parameter-group count changed after scheduler "
+                "construction."
+            )
+
+        for group, base_lr in zip(
+            self.optimizer.param_groups,
+            self.base_lrs,
+        ):
+            group["lr"] = float(base_lr) * factor
 
     def step(self) -> None:
-        self.step_num += 1
+        if self.step_num < self.total_steps:
+            self.step_num += 1
 
-        if self.step_num <= self.warmup_steps:
-            factor = self.step_num / max(1, self.warmup_steps)
-        else:
-            progress = (self.step_num - self.warmup_steps) / max(
-                1,
-                self.total_steps - self.warmup_steps,
-            )
-            progress = min(max(progress, 0.0), 1.0)
-
-            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-            factor = self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cosine
-
-        for group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
-            group["lr"] = base_lr * factor
+        self._apply_step_lr(self.step_num)
 
     def get_lr(self) -> List[float]:
-        return [group["lr"] for group in self.optimizer.param_groups]
+        return [
+            float(group["lr"])
+            for group in self.optimizer.param_groups
+        ]
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.__class__.__name__,
+            "warmup_steps": int(self.warmup_steps),
+            "total_steps": int(self.total_steps),
+            "min_lr_ratio": float(self.min_lr_ratio),
+            "step_num": int(self.step_num),
+            "base_lrs": list(self.base_lrs),
+        }
+
+    def load_state_dict(
+        self,
+        state_dict: Dict[str, Any],
+    ) -> None:
+        if not isinstance(state_dict, dict):
+            raise TypeError(
+                "scheduler state_dict must be a dict, got "
+                f"{type(state_dict)}"
+            )
+
+        warmup_steps = int(
+            state_dict.get("warmup_steps", self.warmup_steps)
+        )
+        total_steps = int(
+            state_dict.get("total_steps", self.total_steps)
+        )
+        min_lr_ratio = float(
+            state_dict.get("min_lr_ratio", self.min_lr_ratio)
+        )
+        step_num = int(
+            state_dict.get("step_num", 0)
+        )
+        base_lrs = [
+            float(value)
+            for value in state_dict.get("base_lrs", self.base_lrs)
+        ]
+
+        if total_steps <= 0:
+            raise ValueError(
+                f"Invalid scheduler total_steps: {total_steps}"
+            )
+        if not 0 <= warmup_steps < total_steps:
+            raise ValueError(
+                "Invalid scheduler warmup_steps/total_steps: "
+                f"{warmup_steps}/{total_steps}"
+            )
+        if not 0.0 <= min_lr_ratio <= 1.0:
+            raise ValueError(
+                f"Invalid scheduler min_lr_ratio: {min_lr_ratio}"
+            )
+        if len(base_lrs) != len(self.optimizer.param_groups):
+            raise ValueError(
+                "Scheduler base_lrs/optimizer group mismatch: "
+                f"{len(base_lrs)} != "
+                f"{len(self.optimizer.param_groups)}"
+            )
+
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.min_lr_ratio = min_lr_ratio
+        self.step_num = min(max(step_num, 0), total_steps)
+        self.base_lrs = base_lrs
+        self._apply_step_lr(self.step_num)
 
 
 
@@ -1056,6 +1286,9 @@ def train_one_epoch(
         batch_sampler.set_epoch(epoch)
 
     total_loss_sum = torch.zeros((), device=device)
+    total_main_loss_sum = torch.zeros((), device=device)
+    total_aux_loss_sum = torch.zeros((), device=device)
+    total_aux_contrib_sum = torch.zeros((), device=device)
     total_bbox_sum = torch.zeros((), device=device)
     total_giou_sum = torch.zeros((), device=device)
     total_score_sum = torch.zeros((), device=device)
@@ -1120,6 +1353,10 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
+        # Schedule the LR before the optimizer update so the very first update
+        # uses the first warmup LR instead of the full base learning rate.
+        scheduler.step()
+
         with autocast(
             device_type=device.type,
             enabled=amp_enabled,
@@ -1130,10 +1367,24 @@ def train_one_epoch(
                 images=images,
                 query_texts=query_texts,
                 image_indices=image_indices,
+                return_aux=True,
             )
 
             pred_bbox = outputs["bbox"]
             pred_score_logit = get_score_logit(outputs)
+            aux_pred_bbox = outputs.get("aux_bbox")
+            aux_pred_score_logit = outputs.get(
+                "aux_score_logit"
+            )
+
+            if (
+                aux_pred_bbox is None
+                or aux_pred_score_logit is None
+            ):
+                raise RuntimeError(
+                    "Hybrid training requires aux_bbox and "
+                    "aux_score_logit from VisionTextModel."
+                )
 
             loss, loss_dict = criterion(
                 pred_bbox=pred_bbox,
@@ -1151,6 +1402,8 @@ def train_one_epoch(
                 rank_alpha_min=rank_alpha_min,
                 query_loss_weights=batch.get("query_loss_weights"),
                 text_negative_mask=batch.get("text_negative_mask"),
+                aux_pred_bbox=aux_pred_bbox,
+                aux_pred_score_logit=aux_pred_score_logit,
             )
 
         if scaler.is_enabled():
@@ -1176,14 +1429,24 @@ def train_one_epoch(
 
             optimizer.step()
 
-        scheduler.step()
-
         if ema is not None:
             ema.update(ema_source_model)
 
         zero = pred_bbox.new_zeros(())
 
         loss_det = loss.detach()
+        main_loss_det = loss_dict.get(
+            "loss_main_total",
+            loss_det,
+        ).detach()
+        aux_loss_det = loss_dict.get(
+            "loss_aux_total",
+            zero,
+        ).detach()
+        aux_contrib_det = loss_dict.get(
+            "loss_aux_contrib",
+            zero,
+        ).detach()
         bbox_det = loss_dict["loss_bbox"].detach()
         giou_det = loss_dict["loss_giou"].detach()
         score_det = loss_dict["loss_score"].detach()
@@ -1205,6 +1468,9 @@ def train_one_epoch(
         )
 
         total_loss_sum.add_(loss_det)
+        total_main_loss_sum.add_(main_loss_det)
+        total_aux_loss_sum.add_(aux_loss_det)
+        total_aux_contrib_sum.add_(aux_contrib_det)
         total_bbox_sum.add_(bbox_det)
         total_giou_sum.add_(giou_det)
         total_score_sum.add_(score_det)
@@ -1221,6 +1487,9 @@ def train_one_epoch(
         if should_log:
             current_lr = scheduler.get_lr()[0]
             loss_item = float(loss_det.item())
+            main_loss_item = float(main_loss_det.item())
+            aux_loss_item = float(aux_loss_det.item())
+            aux_contrib_item = float(aux_contrib_det.item())
             bbox_item = float(bbox_det.item())
             giou_item = float(giou_det.item())
             score_item = float(score_det.item())
@@ -1252,6 +1521,8 @@ def train_one_epoch(
                 "lr": f"{current_lr:.2e}",
                 "loss": f"{loss_item:.4f}",
                 "avg": f"{avg_loss:.4f}",
+                "main": f"{main_loss_item:.4f}",
+                "aux": f"{aux_contrib_item:.4f}",
                 "bbox": f"{bbox_item:.4f}",
                 "giou": f"{giou_item:.4f}",
                 "score": f"{score_item:.4f}",
@@ -1273,6 +1544,9 @@ def train_one_epoch(
                     "lr": current_lr,
                     "train_loss": loss_item,
                     "train_loss_avg": avg_loss,
+                    "loss_main_total": main_loss_item,
+                    "loss_aux_total": aux_loss_item,
+                    "loss_aux_contrib": aux_contrib_item,
                     "loss_bbox": bbox_item,
                     "loss_giou": giou_item,
                     "loss_score": score_item,
@@ -1299,6 +1573,15 @@ def train_one_epoch(
 
     return {
         "train_loss": float((total_loss_sum / num_batches).item()),
+        "train_loss_main": float(
+            (total_main_loss_sum / num_batches).item()
+        ),
+        "train_loss_aux": float(
+            (total_aux_loss_sum / num_batches).item()
+        ),
+        "train_loss_aux_contrib": float(
+            (total_aux_contrib_sum / num_batches).item()
+        ),
         "train_loss_bbox": float((total_bbox_sum / num_batches).item()),
         "train_loss_giou": float((total_giou_sum / num_batches).item()),
         "train_loss_score": float((total_score_sum / num_batches).item()),
@@ -1958,6 +2241,7 @@ def validate_one_epoch(
                 images=images,
                 query_texts=query_texts,
                 image_indices=image_indices,
+                return_aux=False,
             )
 
             pred_bbox = outputs["bbox"]
@@ -2261,6 +2545,8 @@ def build_checkpoint(
         "ema": ema.ema.state_dict() if ema is not None else None,
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        # Legacy key retained so older tools can still inspect the checkpoint.
         "scheduler_step": scheduler.step_num,
         "best_metric": best_metric,
         "best_metric_name": best_metric_name,
@@ -2269,14 +2555,8 @@ def build_checkpoint(
         "eval_metrics": eval_metrics,
         "train_config": train_config,
         "dynamic_config": dynamic_config,
-        "scheduler_config": {
-            "name": "WarmupCosineScheduler",
-            "warmup_steps": scheduler.warmup_steps,
-            "total_steps": scheduler.total_steps,
-            "min_lr_ratio": scheduler.min_lr_ratio,
-            "step_num": scheduler.step_num,
-            "base_lrs": scheduler.base_lrs,
-        },
+        # Legacy alias retained for checkpoints produced by earlier versions.
+        "scheduler_config": scheduler.state_dict(),
         "rng_state": get_rng_state_dict(),
     }
 
@@ -2598,8 +2878,37 @@ def load_checkpoint(
     if "scaler" in checkpoint:
         scaler.load_state_dict(checkpoint["scaler"])
 
-    if "scheduler_step" in checkpoint:
-        scheduler.step_num = int(checkpoint["scheduler_step"])
+    scheduler_state = checkpoint.get("scheduler")
+
+    if not isinstance(scheduler_state, dict):
+        scheduler_state = checkpoint.get("scheduler_config")
+
+    if isinstance(scheduler_state, dict):
+        runtime_scheduler = scheduler.state_dict()
+        scheduler.load_state_dict(scheduler_state)
+
+        if (
+            int(runtime_scheduler["total_steps"])
+            != int(scheduler.total_steps)
+            or int(runtime_scheduler["warmup_steps"])
+            != int(scheduler.warmup_steps)
+        ):
+            print(
+                "[Checkpoint] Restored scheduler geometry from checkpoint: "
+                f"warmup={scheduler.warmup_steps}, "
+                f"total={scheduler.total_steps}."
+            )
+    elif "scheduler_step" in checkpoint:
+        # Backward compatibility for old checkpoints that stored only a step.
+        scheduler.step_num = min(
+            max(int(checkpoint["scheduler_step"]), 0),
+            scheduler.total_steps,
+        )
+        scheduler._apply_step_lr(scheduler.step_num)
+        print(
+            "[Checkpoint] Legacy scheduler_step restored; "
+            "runtime warmup/total configuration retained."
+        )
 
     if "rng_state" in checkpoint:
         restore_rng_state(checkpoint["rng_state"])
@@ -3014,6 +3323,9 @@ def train(args: SimpleNamespace) -> None:
         dropout=args.dropout,
         freeze_bert=args.freeze_bert,
         precomputed_bert_path=args.precomputed_bert_path,
+        use_auxiliary_head=args.use_auxiliary_head,
+        auxiliary_in_eval=args.auxiliary_in_eval,
+        initialize_aux_from_main=args.initialize_aux_from_main,
     ).to(device)
 
     if args.channels_last:
@@ -3061,6 +3373,8 @@ def train(args: SimpleNamespace) -> None:
         rank_min_quality_gap=args.rank_min_quality_gap,
         rank_max_pairs=args.rank_max_pairs,
         max_query_loss_weight=args.max_query_loss_weight,
+        aux_loss_weight=args.aux_loss_weight,
+        aux_cost_score=args.aux_cost_score,
     )
 
     if args.startup_smoke_test:
@@ -3086,8 +3400,16 @@ def train(args: SimpleNamespace) -> None:
         fused=args.fused_optimizer,
     )
 
-    total_steps = args.epochs * len(train_loader)
-    warmup_steps = args.warmup_epochs * len(train_loader)
+    (
+        total_steps,
+        requested_warmup_steps,
+        warmup_steps,
+    ) = resolve_scheduler_steps(
+        epochs=args.epochs,
+        steps_per_epoch=len(train_loader),
+        warmup_epochs=args.warmup_epochs,
+        max_warmup_steps=args.max_warmup_steps,
+    )
 
     scheduler = WarmupCosineScheduler(
         optimizer=optimizer,
@@ -3176,6 +3498,14 @@ def train(args: SimpleNamespace) -> None:
         f"[Info] Optimizer groups={len(optimizer.param_groups)}, "
         f"fused_requested={args.fused_optimizer}"
     )
+    print(
+        "[Info] Scheduler: "
+        f"total_steps={total_steps}, "
+        f"warmup_requested={requested_warmup_steps}, "
+        f"warmup_cap={args.max_warmup_steps}, "
+        f"warmup_effective={warmup_steps}, "
+        f"min_lr_ratio={args.min_lr_ratio}"
+    )
     print(f"[Info] Model parameters: total={total_params}, trainable={trainable_params}")
     print(f"[Info] Train batches: {len(train_loader)}")
     print(f"[Info] Val batches: {len(val_loader)}")
@@ -3188,6 +3518,11 @@ def train(args: SimpleNamespace) -> None:
     print(
         f"[Info] EMA: enabled={args.use_ema}, decay={args.ema_decay}, "
         f"update_interval={args.ema_update_interval}"
+    )
+    print(
+        f"[Info] Hybrid: main=Hungarian one-to-one, "
+        f"aux=one-to-many, aux_weight={args.aux_loss_weight:.3f}, "
+        f"aux_eval={args.auxiliary_in_eval}"
     )
 
     if args.resume_path is not None:
@@ -3241,7 +3576,9 @@ def train(args: SimpleNamespace) -> None:
         "train_loader_len": len(train_loader),
         "val_loader_len": len(val_loader),
         "total_steps": total_steps,
+        "requested_warmup_steps": requested_warmup_steps,
         "warmup_steps": warmup_steps,
+        "max_warmup_steps": args.max_warmup_steps,
         "checkpoint_mode": (
             "weights_only"
             if getattr(args, "weights_path", None) is not None
@@ -3350,6 +3687,7 @@ def train(args: SimpleNamespace) -> None:
             "lambda_giou": lambda_giou,
             "lambda_score": lambda_score,
             "lambda_rank_max": float(args.lambda_rank),
+            "lambda_aux": float(args.aux_loss_weight),
             "pos_weight": pos_weight,
             "quality_warmup_epoch": int(args.quality_warmup_epoch),
             "rank_start_epoch": int(args.rank_start_epoch),
@@ -3503,6 +3841,9 @@ DEFAULT_MODEL_CFG = {
             "cache",
             "bert_raw_cache.pt",
         ),
+        "use_auxiliary_head": True,
+        "auxiliary_in_eval": False,
+        "initialize_aux_from_main": True,
     }
 }
 
@@ -3562,6 +3903,10 @@ DEFAULT_TRAIN_CFG = {
         "fused": True,
     },
     "loss": {
+        "hybrid": {
+            "aux_loss_weight": 0.5,
+            "aux_cost_score": 0.0,
+        },
         "matcher": {
             "cost_bbox": 5.0,
             "cost_giou": 2.0,
@@ -3615,9 +3960,9 @@ DEFAULT_TRAIN_CFG = {
         "eval_interval": 1,
         "max_val_batches": None,
         "score_thr": 0.001,
-        "top_k": 20,
+        "top_k": 100,
         "nms_iou_thr": 0.5,
-        "use_nms": True,
+        "use_nms": False,
         "iou_thresholds": None,
         "compute_raw_oracle": True,
         "raw_oracle_iou_thresholds": [0.25, 0.50, 0.75],
@@ -3717,6 +4062,7 @@ def cfg_to_args(
     eval_cfg = train_cfg_all["eval"]
     log_cfg = train_cfg_all["log"]
 
+    hybrid_cfg = loss_cfg.get("hybrid", {})
     matcher_cfg = loss_cfg.get("matcher", {})
     weight_cfg = loss_cfg.get("weight", {})
     pos_weight_cfg = loss_cfg.get("pos_weight", {})
@@ -3783,6 +4129,15 @@ def cfg_to_args(
         dropout=model_cfg["dropout"],
         freeze_bert=model_cfg["freeze_bert"],
         precomputed_bert_path=model_cfg.get("precomputed_bert_path"),
+        use_auxiliary_head=bool(
+            model_cfg.get("use_auxiliary_head", True)
+        ),
+        auxiliary_in_eval=bool(
+            model_cfg.get("auxiliary_in_eval", False)
+        ),
+        initialize_aux_from_main=bool(
+            model_cfg.get("initialize_aux_from_main", True)
+        ),
 
         # optimizer
         lr_vision=optim_cfg["lr_vision"],
@@ -3791,8 +4146,16 @@ def cfg_to_args(
         lr_head=optim_cfg["lr_head"],
         weight_decay=optim_cfg["weight_decay"],
         min_lr_ratio=optim_cfg["min_lr_ratio"],
-        max_warmup_steps=optim_cfg["max_warmup_steps"],
+        max_warmup_steps=optim_cfg.get("max_warmup_steps", 3000),
         fused_optimizer=optim_cfg.get("fused", True),
+
+        # hybrid loss
+        aux_loss_weight=float(
+            hybrid_cfg.get("aux_loss_weight", 0.5)
+        ),
+        aux_cost_score=float(
+            hybrid_cfg.get("aux_cost_score", 0.0)
+        ),
 
         # matcher
         cost_bbox=matcher_cfg.get("cost_bbox", 5.0),
@@ -3884,6 +4247,7 @@ def print_config_summary(
     evaluation = train_cfg["eval"]
     logging = train_cfg["log"]
 
+    hybrid = loss.get("hybrid", {})
     matcher = loss.get("matcher", {})
     weight = loss.get("weight", {})
     pos_weight = loss.get("pos_weight", {})
@@ -3943,11 +4307,23 @@ def print_config_summary(
     print(f"  num_heads    : {model['num_heads']}")
     print(f"  mlp_ratio    : {model['mlp_ratio']}")
     print(f"  bert_cache   : {model.get('precomputed_bert_path')}")
+    print(
+        f"  hybrid head  : enabled="
+        f"{model.get('use_auxiliary_head', True)}, "
+        f"aux_eval={model.get('auxiliary_in_eval', False)}, "
+        f"init_from_main="
+        f"{model.get('initialize_aux_from_main', True)}"
+    )
     print(f"  lr_vision    : {optimizer['lr_vision']}")
     print(f"  lr_text      : {optimizer['lr_text']}")
     print(f"  lr_trans     : {optimizer['lr_transformer']}")
     print(f"  lr_head      : {optimizer['lr_head']}")
     print(f"  fused AdamW  : {optimizer.get('fused', True)}")
+    print(
+        f"  hybrid loss  : weight="
+        f"{hybrid.get('aux_loss_weight', 0.5)}, "
+        f"aux_score_cost={hybrid.get('aux_cost_score', 0.0)}"
+    )
     print(
         f"  matcher      : bbox={matcher.get('cost_bbox', 5.0)}, "
         f"giou={matcher.get('cost_giou', 2.0)}, "
@@ -3996,15 +4372,30 @@ def print_config_summary(
 
 
 class LightDet:
-    def __init__(self, model: str = "cards/config/model.yaml") -> None:
+    """
+    YOLO-style training interface.
+
+    Frequently changed runtime values stay in model.train(...).
+    Model, optimizer, matcher, loss, EMA, AMP, cache and evaluation details
+    remain in model.yaml / train.yaml as the single source of truth.
+    """
+
+    def __init__(
+        self,
+        model: str = "cards/config/model.yaml",
+    ) -> None:
         self.model_cfg_path = model
-        self.model_cfg = load_model_config(model)
+        self.model_cfg = load_model_config(
+            model
+        )
 
     def inspect_checkpoint(
         self,
         checkpoint_path: str,
     ) -> Dict[str, Any]:
-        return inspect_checkpoint_file(checkpoint_path)
+        return inspect_checkpoint_file(
+            checkpoint_path
+        )
 
     def train(
         self,
@@ -4016,269 +4407,180 @@ class LightDet:
         device: Optional[Any] = None,
         workers: Optional[int] = None,
         seed: Optional[int] = None,
-        deterministic: Optional[bool] = None,
-        cache_images: Optional[bool] = None,
-        image_cache_dir: Optional[str] = None,
-        prebuild_image_cache: Optional[bool] = None,
-        prefetch_factor: Optional[int] = None,
-        pin_memory: Optional[bool] = None,
-        persistent_workers: Optional[bool] = None,
-        negative_query_path: Optional[str] = None,
-        negative_sample_ratio: Optional[float] = None,
-        use_negative_queries_in_val: Optional[bool] = None,
         project: str = "runs/train",
         name: str = "exp",
-
-        # Runtime checkpoint controls. These are intentionally not read from
-        # YAML, matching the common YOLO-style model.train(...) interface.
         weights: Optional[str] = None,
         resume: Optional[Any] = None,
         prefer_ema: bool = True,
-
-        lr: Optional[float] = None,
-        lr_vision: Optional[float] = None,
-        lr_text: Optional[float] = None,
-        lr_transformer: Optional[float] = None,
-        lr_head: Optional[float] = None,
-        weight_decay: Optional[float] = None,
-        score_thr: Optional[float] = None,
-        top_k: Optional[int] = None,
-        nms_iou_thr: Optional[float] = None,
-        use_nms: Optional[bool] = None,
-        use_topk_fallback: Optional[bool] = None,
-        amp_dtype: Optional[str] = None,
-        compile_model: Optional[bool] = None,
-        channels_last: Optional[bool] = None,
-        startup_smoke_test: Optional[bool] = None,
-        use_ema: Optional[bool] = None,
-        ema_decay: Optional[float] = None,
-        hard_negative_ratio: Optional[int] = None,
-        positive_ratio: Optional[float] = None,
-        max_positive_per_gt: Optional[int] = None,
-        iou_pos_thr: Optional[float] = None,
-        quality_min: Optional[float] = None,
-        quality_max: Optional[float] = None,
-        qfl_beta: Optional[float] = None,
-        quality_warmup_epoch: Optional[int] = None,
-        lambda_rank: Optional[float] = None,
-        rank_start_epoch: Optional[int] = None,
-        rank_warmup_epoch: Optional[int] = None,
-        rank_alpha_min: Optional[float] = None,
-        max_query_loss_weight: Optional[float] = None,
-        **kwargs: Any,
     ) -> None:
-        model_cfg = deepcopy_cfg(self.model_cfg)
-        train_cfg = load_train_config(cfg)
+        """
+        Train LightDet through a compact YOLO-like function call.
+
+        Runtime arguments:
+            data:
+                Dataset root.
+            epochs, imgsz, batch, device, workers, seed:
+                Common experiment overrides.
+            project, name:
+                Output directory: project/name.
+            weights:
+                Weights-only warm start. Optimizer and epoch restart.
+            resume:
+                Full-state resume. True resolves project/name/latest.pt.
+            prefer_ema:
+                Prefer EMA weights when using weights=...
+
+        All advanced settings are read from YAML, including:
+            learning rates, AMP, EMA, compile, cache, hybrid loss,
+            one-to-many expansion, ranking loss and evaluation policy.
+        """
+        model_cfg = deepcopy_cfg(
+            self.model_cfg
+        )
+        train_cfg = load_train_config(
+            cfg
+        )
 
         if data is not None:
-            train_cfg["data"]["dataset_dir"] = data
-        if epochs is not None:
-            train_cfg["train"]["epochs"] = epochs
-        if imgsz is not None:
-            train_cfg["data"]["image_size"] = imgsz
-        if batch is not None:
-            train_cfg["train"]["batch_size"] = batch
+            train_cfg["data"][
+                "dataset_dir"
+            ] = str(data)
 
-        if device is not None:
-            train_cfg["train"]["device"] = normalize_device(device)
-        else:
-            train_cfg["train"]["device"] = normalize_device(
-                train_cfg["train"]["device"]
-            )
+        if epochs is not None:
+            train_cfg["train"][
+                "epochs"
+            ] = int(epochs)
+
+        if imgsz is not None:
+            train_cfg["data"][
+                "image_size"
+            ] = int(imgsz)
+
+        if batch is not None:
+            train_cfg["train"][
+                "batch_size"
+            ] = int(batch)
 
         if workers is not None:
-            train_cfg["train"]["num_workers"] = workers
-        if seed is not None:
-            train_cfg["train"]["seed"] = seed
-        if deterministic is not None:
-            train_cfg["train"]["deterministic"] = deterministic
-        if cache_images is not None:
-            train_cfg["data"]["cache_images"] = bool(cache_images)
-        if image_cache_dir is not None:
-            train_cfg["data"]["image_cache_dir"] = image_cache_dir
-        if prebuild_image_cache is not None:
-            train_cfg["data"]["prebuild_image_cache"] = bool(
-                prebuild_image_cache
-            )
-        if prefetch_factor is not None:
-            train_cfg["data"]["prefetch_factor"] = int(prefetch_factor)
-        if pin_memory is not None:
-            train_cfg["data"]["pin_memory"] = bool(pin_memory)
-        if persistent_workers is not None:
-            train_cfg["data"]["persistent_workers"] = bool(
-                persistent_workers
-            )
-        if negative_query_path is not None:
-            train_cfg["data"]["negative_query_path"] = str(
-                negative_query_path
-            )
-        if negative_sample_ratio is not None:
-            ratio = float(negative_sample_ratio)
-            if not 0.0 <= ratio <= 1.0:
-                raise ValueError(
-                    "negative_sample_ratio must be in [0, 1], "
-                    f"got {ratio}"
-                )
-            train_cfg["data"]["negative_sample_ratio"] = ratio
-        if use_negative_queries_in_val is not None:
-            train_cfg["data"]["use_negative_queries_in_val"] = bool(
-                use_negative_queries_in_val
-            )
-        if project is not None and name is not None:
-            train_cfg["log"]["save_dir"] = os.path.join(project, name)
+            train_cfg["train"][
+                "num_workers"
+            ] = int(workers)
 
-        # --------------------------------------------------------------
-        # Runtime checkpoint mode
-        # --------------------------------------------------------------
-        resolved_weights_path: Optional[str] = None
-        resolved_resume_path: Optional[str] = None
+        if seed is not None:
+            train_cfg["train"][
+                "seed"
+            ] = int(seed)
+
+        if device is not None:
+            train_cfg["train"][
+                "device"
+            ] = normalize_device(
+                device
+            )
+        else:
+            train_cfg["train"][
+                "device"
+            ] = normalize_device(
+                train_cfg["train"][
+                    "device"
+                ]
+            )
+
+        train_cfg["log"]["save_dir"] = (
+            os.path.join(
+                str(project),
+                str(name),
+            )
+        )
+
+        resolved_weights_path: Optional[
+            str
+        ] = None
+        resolved_resume_path: Optional[
+            str
+        ] = None
 
         if weights is not None:
             if isinstance(weights, bool):
-                if weights:
-                    raise TypeError(
-                        "weights=True is ambiguous. Pass the checkpoint path "
-                        "as a string, or use weights=None."
-                    )
-            else:
-                resolved_weights_path = os.path.abspath(str(weights))
+                raise TypeError(
+                    "weights must be a checkpoint "
+                    "path or None."
+                )
+
+            resolved_weights_path = (
+                os.path.abspath(
+                    str(weights)
+                )
+            )
 
         if isinstance(resume, bool):
             if resume:
-                if project is None or name is None:
-                    raise ValueError(
-                        "resume=True requires both project and name so "
-                        "latest.pt can be resolved."
+                resolved_resume_path = (
+                    os.path.abspath(
+                        os.path.join(
+                            str(project),
+                            str(name),
+                            "latest.pt",
+                        )
                     )
-                resolved_resume_path = os.path.abspath(
-                    os.path.join(project, name, "latest.pt")
                 )
         elif resume is not None:
-            resolved_resume_path = os.path.abspath(str(resume))
+            resolved_resume_path = (
+                os.path.abspath(
+                    str(resume)
+                )
+            )
 
         if (
-            resolved_weights_path is not None
-            and resolved_resume_path is not None
+            resolved_weights_path
+            is not None
+            and resolved_resume_path
+            is not None
         ):
             raise ValueError(
-                "weights and resume cannot be used together. "
-                "Use weights for a weights-only warm start, or resume for "
-                "restoring the complete training state."
+                "weights and resume cannot be "
+                "used together."
             )
 
         if (
-            resolved_weights_path is not None
-            and not os.path.isfile(resolved_weights_path)
+            resolved_weights_path
+            is not None
+            and not os.path.isfile(
+                resolved_weights_path
+            )
         ):
             raise FileNotFoundError(
-                f"Weights checkpoint not found: {resolved_weights_path}"
+                "Weights checkpoint not found: "
+                f"{resolved_weights_path}"
             )
 
         if (
-            resolved_resume_path is not None
-            and not os.path.isfile(resolved_resume_path)
+            resolved_resume_path
+            is not None
+            and not os.path.isfile(
+                resolved_resume_path
+            )
         ):
             raise FileNotFoundError(
-                f"Resume checkpoint not found: {resolved_resume_path}"
+                "Resume checkpoint not found: "
+                f"{resolved_resume_path}"
             )
 
-        # YAML is not allowed to control resume in this interface. The runtime
-        # model.train(...) argument is the single source for checkpoint mode.
-        train_cfg["log"]["resume_path"] = resolved_resume_path
+        # Main branch is one-to-one and is evaluated without NMS.
+        train_cfg["eval"]["use_nms"] = False
 
-        if lr is not None:
-            train_cfg["optim"]["lr_vision"] = lr
-            train_cfg["optim"]["lr_transformer"] = lr
-            train_cfg["optim"]["lr_head"] = lr
-        if lr_vision is not None:
-            train_cfg["optim"]["lr_vision"] = lr_vision
-        if lr_text is not None:
-            train_cfg["optim"]["lr_text"] = lr_text
-        if lr_transformer is not None:
-            train_cfg["optim"]["lr_transformer"] = lr_transformer
-        if lr_head is not None:
-            train_cfg["optim"]["lr_head"] = lr_head
-        if weight_decay is not None:
-            train_cfg["optim"]["weight_decay"] = weight_decay
-
-        if score_thr is not None:
-            train_cfg["eval"]["score_thr"] = score_thr
-        if top_k is not None:
-            train_cfg["eval"]["top_k"] = top_k
-        if nms_iou_thr is not None:
-            train_cfg["eval"]["nms_iou_thr"] = nms_iou_thr
-        if use_nms is not None:
-            train_cfg["eval"]["use_nms"] = bool(use_nms)
-        if use_topk_fallback is not None:
-            train_cfg["eval"]["use_topk_fallback"] = bool(
-                use_topk_fallback
-            )
-
-        if amp_dtype is not None:
-            train_cfg["train"]["amp_dtype"] = amp_dtype
-        if compile_model is not None:
-            train_cfg["train"]["compile"] = bool(compile_model)
-        if channels_last is not None:
-            train_cfg["train"]["channels_last"] = bool(channels_last)
-
-        if startup_smoke_test is not None:
-            train_cfg["train"]["startup_smoke_test"] = bool(startup_smoke_test)
-        if use_ema is not None:
-            train_cfg["train"]["use_ema"] = bool(use_ema)
-        if ema_decay is not None:
-            decay = float(ema_decay)
-            if not 0.0 <= decay < 1.0:
-                raise ValueError(f"ema_decay must be in [0, 1), got {decay}")
-            train_cfg["train"]["ema_decay"] = decay
-
-        if hard_negative_ratio is not None:
-            train_cfg["loss"]["score_sampling"][
-                "hard_negative_ratio"
-            ] = hard_negative_ratio
-        if positive_ratio is not None:
-            train_cfg["loss"]["score_sampling"][
-                "positive_ratio"
-            ] = positive_ratio
-        if max_positive_per_gt is not None:
-            train_cfg["loss"]["score_sampling"][
-                "max_positive_per_gt"
-            ] = max_positive_per_gt
-        if iou_pos_thr is not None:
-            train_cfg["loss"]["quality"]["iou_pos_thr"] = iou_pos_thr
-        if quality_min is not None:
-            train_cfg["loss"]["quality"]["quality_min"] = quality_min
-        if quality_max is not None:
-            train_cfg["loss"]["quality"]["quality_max"] = quality_max
-        if qfl_beta is not None:
-            train_cfg["loss"]["quality"]["qfl_beta"] = qfl_beta
-        if quality_warmup_epoch is not None:
-            train_cfg["loss"]["quality"][
-                "quality_warmup_epoch"
-            ] = quality_warmup_epoch
-        if lambda_rank is not None:
-            train_cfg["loss"]["ranking"]["lambda_rank"] = lambda_rank
-        if rank_start_epoch is not None:
-            train_cfg["loss"]["ranking"][
-                "rank_start_epoch"
-            ] = rank_start_epoch
-        if rank_warmup_epoch is not None:
-            train_cfg["loss"]["ranking"][
-                "rank_warmup_epoch"
-            ] = rank_warmup_epoch
-        if rank_alpha_min is not None:
-            train_cfg["loss"]["ranking"]["rank_alpha_min"] = rank_alpha_min
-        if max_query_loss_weight is not None:
-            train_cfg["loss"]["text_negative"][
-                "max_query_loss_weight"
-            ] = max(1.0, float(max_query_loss_weight))
-
-        if kwargs:
-            unknown = ", ".join(kwargs.keys())
-            raise TypeError(f"Unsupported train arguments: {unknown}")
+        # Checkpoint mode is controlled only by this function call.
+        train_cfg["log"][
+            "resume_path"
+        ] = resolved_resume_path
 
         set_deterministic(
-            seed=train_cfg["train"]["seed"],
-            deterministic=train_cfg["train"]["deterministic"],
+            seed=train_cfg["train"][
+                "seed"
+            ],
+            deterministic=train_cfg[
+                "train"
+            ]["deterministic"],
         )
 
         args = cfg_to_args(
@@ -4286,25 +4588,57 @@ class LightDet:
             train_cfg_all=train_cfg,
         )
 
-        # Checkpoint mode is controlled only by model.train(...), not YAML.
-        args.weights_path = resolved_weights_path
-        args.resume_path = resolved_resume_path
-        args.prefer_ema = bool(prefer_ema)
+        args.weights_path = (
+            resolved_weights_path
+        )
+        args.resume_path = (
+            resolved_resume_path
+        )
+        args.prefer_ema = bool(
+            prefer_ema
+        )
 
-        print_config_summary(model_cfg=model_cfg, train_cfg=train_cfg)
+        print_config_summary(
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+        )
 
         if args.weights_path is not None:
-            print("\n[Info] Training mode: weights-only warm start")
-            print(f"  weights      : {args.weights_path}")
-            print(f"  prefer EMA   : {args.prefer_ema}")
-            print("  optimizer    : reset")
-            print("  scheduler    : reset")
-            print("  epoch        : restart from 1")
+            print(
+                "\n[Info] Training mode: "
+                "weights-only warm start"
+            )
+            print(
+                f"  weights      : "
+                f"{args.weights_path}"
+            )
+            print(
+                f"  prefer EMA   : "
+                f"{args.prefer_ema}"
+            )
+            print(
+                "  optimizer    : reset"
+            )
+            print(
+                "  scheduler    : reset"
+            )
+            print(
+                "  epoch        : restart from 1"
+            )
         elif args.resume_path is not None:
-            print("\n[Info] Training mode: full resume")
-            print(f"  checkpoint   : {args.resume_path}")
+            print(
+                "\n[Info] Training mode: "
+                "full resume"
+            )
+            print(
+                f"  checkpoint   : "
+                f"{args.resume_path}"
+            )
         else:
-            print("\n[Info] Training mode: train from scratch")
+            print(
+                "\n[Info] Training mode: "
+                "train from scratch"
+            )
 
         return train(args)
 

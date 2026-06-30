@@ -35,6 +35,7 @@ train:
 
   channels_last: false
   compile: false
+  compile_mode: reduce-overhead
   startup_smoke_test: true
 
   use_ema: true
@@ -58,15 +59,24 @@ optim:
 
 
 loss:
+  # Main branch 使用 Hungarian One-to-One。
+  # Auxiliary branch 使用 One-to-Many。
+  hybrid:
+    aux_loss_weight: 0.5
+    aux_cost_score: 0.0
+
+  # Main One-to-One matcher
   matcher:
     cost_bbox: 5.0
     cost_giou: 2.0
     cost_score: 0.0
 
+  # Auxiliary One-to-Many assignment / score sampling
   score_sampling:
     hard_negative_ratio: 8
     positive_ratio: 1.0
     max_positive_per_gt: 2
+    aux_positive_label: 0.7
     expand_cost_bbox: 5.0
     expand_cost_giou: 2.0
 
@@ -108,13 +118,16 @@ eval:
   eval_interval: 1
   max_val_batches: null
 
+  # 僅評估 Main One-to-One branch。
   score_thr: 0.001
-  top_k: 20
+  top_k: 100
   nms_iou_thr: 0.5
-  use_nms: true
+  use_nms: false
   use_topk_fallback: false
 
+  iou_thresholds: null
   best_metric: map50_95
+
   compute_raw_oracle: true
   raw_oracle_iou_thresholds:
     - 0.25
@@ -123,7 +136,7 @@ eval:
 
 
 log:
-  save_dir: runs/train/lightdet_decoupled_grid10_seed47
+  save_dir: runs/train/lightdet_hybrid_grid10_seed47
   resume_path: null
 
   save_latest_interval: 1
