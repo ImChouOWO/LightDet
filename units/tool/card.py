@@ -139,6 +139,25 @@ class FusionBlock(nn.Module):
 
 
 class TransformerBlock(nn.Module):
+    """
+    Shared Transformer with isolated Main/Aux query groups.
+
+    Isolation is implemented by stacking the two groups on the batch
+    dimension before a single TransformerEncoder call:
+
+        [B, T, C] main
+        [B, T, C] aux
+            -> cat(dim=0)
+        [2B, T, C]
+
+    Self-attention never crosses batch elements, so Main and Aux cannot read
+    each other's token states. The Transformer weights remain shared and the
+    two groups are still processed in one batched GPU call.
+    """
+
+    MAIN_GROUP = 0
+    AUX_GROUP = 1
+
     def __init__(
         self,
         hidden_dim=512,
@@ -147,13 +166,35 @@ class TransformerBlock(nn.Module):
         num_layers=1,
         mlp_ratio=4.0,
         dropout=0.1,
+        query_group_init_std=0.02,
     ):
         super().__init__()
+
+        self.hidden_dim = int(hidden_dim)
 
         self.fuse = FusionBlock(
             hidden_dim=hidden_dim,
             fusion_token_num=fusion_token_num,
         )
+
+        # Distinguishes the duplicated prediction-token groups while keeping
+        # all Transformer weights shared. Main starts as the legacy path;
+        # Aux receives a small learned offset to break symmetry.
+        self.query_group_embeddings = nn.Parameter(
+            torch.zeros(
+                2,
+                1,
+                self.hidden_dim,
+            )
+        )
+        if float(query_group_init_std) > 0.0:
+            nn.init.normal_(
+                self.query_group_embeddings.data[
+                    self.AUX_GROUP
+                ],
+                mean=0.0,
+                std=float(query_group_init_std),
+            )
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
@@ -176,31 +217,98 @@ class TransformerBlock(nn.Module):
             hidden_dim
         )
 
+    @staticmethod
+    def _build_padding_mask(
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if mask is None:
+            return None
+        return torch.eq(mask, 0)
+
+    def _add_group_embedding(
+        self,
+        x: torch.Tensor,
+        group_index: int,
+    ) -> torch.Tensor:
+        return (
+            x
+            + self.query_group_embeddings[
+                int(group_index)
+            ].to(
+                device=x.device,
+                dtype=x.dtype,
+            )
+        )
+
     def forward(
         self,
         img_token,
         text_token,
         text_mask,
+        return_aux=False,
     ):
-        x, mask = self.fuse(
+        """
+        Returns:
+            main_out: [B, T, C]
+            aux_out : [B, T, C] or None
+        """
+        base_x, mask = self.fuse(
             img_token,
             text_token,
             text_mask,
         )
-
-        padding_mask = None
-        if mask is not None:
-            padding_mask = torch.eq(
-                mask,
-                0,
-            )
-
-        x = self.transformer(
-            x,
-            src_key_padding_mask=padding_mask,
+        padding_mask = self._build_padding_mask(
+            mask
         )
 
-        return self.norm(x)
+        main_x = self._add_group_embedding(
+            base_x,
+            self.MAIN_GROUP,
+        )
+
+        if not bool(return_aux):
+            main_out = self.transformer(
+                main_x,
+                src_key_padding_mask=padding_mask,
+            )
+            return self.norm(main_out), None
+
+        aux_x = self._add_group_embedding(
+            base_x,
+            self.AUX_GROUP,
+        )
+
+        # Batch-axis grouping gives exact query isolation without creating a
+        # 2T x 2T attention matrix. This is more efficient than concatenating
+        # both groups along the token dimension with a block-diagonal mask.
+        grouped_x = torch.cat(
+            [main_x, aux_x],
+            dim=0,
+        )
+
+        if padding_mask is None:
+            grouped_padding_mask = None
+        else:
+            grouped_padding_mask = torch.cat(
+                [padding_mask, padding_mask],
+                dim=0,
+            )
+
+        grouped_out = self.transformer(
+            grouped_x,
+            src_key_padding_mask=(
+                grouped_padding_mask
+            ),
+        )
+        grouped_out = self.norm(
+            grouped_out
+        )
+
+        batch_size = int(base_x.shape[0])
+        main_out = grouped_out[:batch_size]
+        aux_out = grouped_out[batch_size:]
+
+        return main_out, aux_out
 
 
 class Bert(nn.Module):
@@ -1121,17 +1229,25 @@ class DenseHead(nn.Module):
 
 class VisionTextModel(nn.Module):
     """
-    Hybrid LightDet model.
+    H-DETR-style query-isolated LightDet model.
 
-    Main:
+    Shared:
+        BottleNet / image projector / BERT / Transformer weights
+
+    Main query group:
+        Isolated Transformer sequence
         self.head
-        Hungarian one-to-one loss
+        One-to-one loss
         Used for validation and inference
 
-    Auxiliary:
+    Auxiliary query group:
+        Isolated Transformer sequence
         self.aux_head
-        One-to-many loss
-        Computed during training by default
+        Repeated-GT one-to-many loss
+        Used during training only by default
+
+    The two groups are stacked along the Transformer batch dimension. They
+    share weights and source features but cannot exchange self-attention.
     """
 
     def __init__(
@@ -1150,6 +1266,7 @@ class VisionTextModel(nn.Module):
         use_auxiliary_head=True,
         auxiliary_in_eval=False,
         initialize_aux_from_main=True,
+        query_group_init_std=0.02,
     ):
         super().__init__()
 
@@ -1226,6 +1343,9 @@ class VisionTextModel(nn.Module):
                 num_layers=num_layers,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
+                query_group_init_std=(
+                    query_group_init_std
+                ),
             )
         )
 
@@ -1317,6 +1437,20 @@ class VisionTextModel(nn.Module):
     ):
         prepared = state_dict.copy()
 
+        # Old checkpoints do not contain the query-group embedding because
+        # Main/Aux previously consumed the same Transformer output.
+        group_key = (
+            "transformer."
+            "query_group_embeddings"
+        )
+        if group_key not in prepared:
+            prepared[group_key] = (
+                self.transformer
+                .query_group_embeddings
+                .detach()
+                .clone()
+            )
+
         if self.aux_head is None:
             return {
                 key: value
@@ -1335,35 +1469,33 @@ class VisionTextModel(nn.Module):
             in prepared.keys()
         )
 
-        if has_auxiliary_weights:
-            return prepared
+        if not has_auxiliary_weights:
+            main_prefix = "head."
+            aux_prefix = "aux_head."
 
-        main_prefix = "head."
-        aux_prefix = "aux_head."
-
-        for key, value in list(
-            prepared.items()
-        ):
-            key_text = str(key)
-
-            if not key_text.startswith(
-                main_prefix
+            for key, value in list(
+                prepared.items()
             ):
-                continue
+                key_text = str(key)
 
-            suffix = key_text[
-                len(main_prefix):
-            ]
+                if not key_text.startswith(
+                    main_prefix
+                ):
+                    continue
 
-            aux_key = (
-                aux_prefix
-                + suffix
-            )
+                suffix = key_text[
+                    len(main_prefix):
+                ]
 
-            if aux_key not in prepared:
-                prepared[aux_key] = (
-                    value
+                aux_key = (
+                    aux_prefix
+                    + suffix
                 )
+
+                if aux_key not in prepared:
+                    prepared[aux_key] = (
+                        value
+                    )
 
         return prepared
 
@@ -1500,36 +1632,44 @@ class VisionTextModel(nn.Module):
                 f"text={text_token.shape[0]}"
             )
 
-        transformer_out = (
-            self.transformer(
-                img_token,
-                text_token,
-                text_mask,
-            )
-        )
-
-        (
-            main_bbox,
-            main_score_logit,
-        ) = self.head(
-            transformer_out
-        )
-
         compute_auxiliary = (
             self._resolve_return_aux(
                 return_aux
             )
         )
 
+        (
+            main_transformer_out,
+            aux_transformer_out,
+        ) = self.transformer(
+            img_token,
+            text_token,
+            text_mask,
+            return_aux=compute_auxiliary,
+        )
+
+        (
+            main_bbox,
+            main_score_logit,
+        ) = self.head(
+            main_transformer_out
+        )
+
         aux_bbox = None
         aux_score_logit = None
 
         if compute_auxiliary:
+            if aux_transformer_out is None:
+                raise RuntimeError(
+                    "Auxiliary output was requested "
+                    "but Transformer returned None."
+                )
+
             (
                 aux_bbox,
                 aux_score_logit,
             ) = self.aux_head(
-                transformer_out
+                aux_transformer_out
             )
 
         return {
@@ -1552,10 +1692,23 @@ class VisionTextModel(nn.Module):
                 compute_auxiliary
             ),
 
-            # Diagnostic outputs.
+            # Backward-compatible diagnostic alias points to Main.
             "transformer_out": (
-                transformer_out
+                main_transformer_out
             ),
+
+            # Explicit isolated-group diagnostics.
+            "main_transformer_out": (
+                main_transformer_out
+            ),
+            "aux_transformer_out": (
+                aux_transformer_out
+            ),
+            "query_groups_isolated": True,
+            "query_group_batching": (
+                "batch_axis"
+            ),
+
             "img_token": img_token,
             "text_token": text_token,
             "text_mask": text_mask,
@@ -1668,4 +1821,19 @@ if __name__ == "__main__":
         debug_out[
             "aux_score_logit"
         ].shape,
+    )
+
+    print(
+        "main bbox diff  :",
+        (
+            eval_out["bbox"]
+            - debug_out["bbox"]
+        ).abs().max().item(),
+    )
+    print(
+        "main score diff :",
+        (
+            eval_out["score_logit"]
+            - debug_out["score_logit"]
+        ).abs().max().item(),
     )

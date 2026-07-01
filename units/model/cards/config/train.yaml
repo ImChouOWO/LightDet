@@ -75,7 +75,7 @@ loss:
   score_sampling:
     hard_negative_ratio: 8
     positive_ratio: 1.0
-    max_positive_per_gt: 2
+    max_positive_per_gt: 3
     aux_positive_label: 0.7
     expand_cost_bbox: 5.0
     expand_cost_giou: 2.0

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -166,6 +167,158 @@ def batched_single_target_giou(
     return iou - (cover_area - union) / cover_area.clamp(min=1e-6)
 
 
+def batched_pairwise_iou(
+    boxes1: torch.Tensor,
+    boxes2: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Batched pairwise IoU.
+
+    boxes1: [B, N, 4]
+    boxes2: [B, M, 4]
+    returns: [B, N, M]
+    """
+    if boxes1.ndim != 3 or boxes2.ndim != 3:
+        raise ValueError(
+            "batched_pairwise_iou expects [B, N, 4] and [B, M, 4]"
+        )
+    if boxes1.shape[0] != boxes2.shape[0]:
+        raise ValueError("Batch size mismatch in batched_pairwise_iou")
+    if boxes1.shape[-1] != 4 or boxes2.shape[-1] != 4:
+        raise ValueError("Last dimension must be 4")
+
+    if boxes1.shape[1] == 0 or boxes2.shape[1] == 0:
+        return boxes1.new_zeros(
+            (
+                boxes1.shape[0],
+                boxes1.shape[1],
+                boxes2.shape[1],
+            )
+        )
+
+    area1 = box_area(boxes1)
+    area2 = box_area(boxes2)
+
+    lt = torch.maximum(
+        boxes1[:, :, None, :2],
+        boxes2[:, None, :, :2],
+    )
+    rb = torch.minimum(
+        boxes1[:, :, None, 2:],
+        boxes2[:, None, :, 2:],
+    )
+    wh = (rb - lt).clamp(min=0)
+    intersection = wh[..., 0] * wh[..., 1]
+    union = (
+        area1[:, :, None]
+        + area2[:, None, :]
+        - intersection
+    )
+    return intersection / union.clamp(min=1e-6)
+
+
+def batched_pairwise_giou(
+    boxes1: torch.Tensor,
+    boxes2: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Batched pairwise generalized IoU.
+
+    boxes1: [B, N, 4]
+    boxes2: [B, M, 4]
+    returns: [B, N, M]
+    """
+    if boxes1.ndim != 3 or boxes2.ndim != 3:
+        raise ValueError(
+            "batched_pairwise_giou expects [B, N, 4] and [B, M, 4]"
+        )
+    if boxes1.shape[0] != boxes2.shape[0]:
+        raise ValueError("Batch size mismatch in batched_pairwise_giou")
+    if boxes1.shape[-1] != 4 or boxes2.shape[-1] != 4:
+        raise ValueError("Last dimension must be 4")
+
+    if boxes1.shape[1] == 0 or boxes2.shape[1] == 0:
+        return boxes1.new_zeros(
+            (
+                boxes1.shape[0],
+                boxes1.shape[1],
+                boxes2.shape[1],
+            )
+        )
+
+    area1 = box_area(boxes1)
+    area2 = box_area(boxes2)
+
+    lt = torch.maximum(
+        boxes1[:, :, None, :2],
+        boxes2[:, None, :, :2],
+    )
+    rb = torch.minimum(
+        boxes1[:, :, None, 2:],
+        boxes2[:, None, :, 2:],
+    )
+    wh = (rb - lt).clamp(min=0)
+    intersection = wh[..., 0] * wh[..., 1]
+    union = (
+        area1[:, :, None]
+        + area2[:, None, :]
+        - intersection
+    )
+    iou = intersection / union.clamp(min=1e-6)
+
+    cover_lt = torch.minimum(
+        boxes1[:, :, None, :2],
+        boxes2[:, None, :, :2],
+    )
+    cover_rb = torch.maximum(
+        boxes1[:, :, None, 2:],
+        boxes2[:, None, :, 2:],
+    )
+    cover_wh = (cover_rb - cover_lt).clamp(min=0)
+    cover_area = cover_wh[..., 0] * cover_wh[..., 1]
+
+    return iou - (
+        cover_area - union
+    ) / cover_area.clamp(min=1e-6)
+
+
+def group_rows_by_target_count(
+    counts: Sequence[int],
+    *,
+    minimum_count: int = 2,
+) -> Dict[int, List[int]]:
+    """Group query rows that contain the same number of GT boxes."""
+    groups: Dict[int, List[int]] = {}
+    for batch_index, count in enumerate(counts):
+        count = int(count)
+        if count < int(minimum_count):
+            continue
+        groups.setdefault(count, []).append(batch_index)
+    return groups
+
+
+def gather_grouped_targets(
+    packed_targets: "PackedTargets",
+    batch_indices: torch.Tensor,
+    target_count: int,
+    *,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Gather equal-length target rows as [G, target_count, 4]."""
+    local_index = torch.arange(
+        int(target_count),
+        device=batch_indices.device,
+        dtype=torch.long,
+    )
+    global_index = (
+        packed_targets.offsets[batch_indices, None]
+        + local_index[None, :]
+    )
+    return packed_targets.boxes[
+        global_index
+    ].to(dtype=dtype)
+
+
 @dataclass(frozen=True)
 class PackedTargets:
     """All target boxes packed once for both main and auxiliary branches."""
@@ -295,8 +448,314 @@ class AssignmentResult:
 
 
 
+
+@dataclass(frozen=True)
+class ScoreAssignmentResult:
+    """
+    Score-only assignment that is independent from bbox/GIoU matching.
+
+    quality_target already contains IoU quality shaping and optional
+    multi-round decay. round_weight is used to apply the same decay during
+    quality warmup. Both tensors have shape [B, N, 1].
+    """
+
+    quality_target: torch.Tensor
+    round_weight: torch.Tensor
+    positive_mask: torch.Tensor
+    counts: Tuple[int, ...]
+    selected_ious: torch.Tensor
+    mode: str
+    rounds: int
+
+    @property
+    def num_matches(self) -> int:
+        return int(sum(self.counts))
+
+
+class IndependentIoUScoreAssigner:
+    """
+    Build score targets without using the bbox matcher or score logits.
+
+    Fast paths:
+      - 0/1 GT rows are fully vectorized.
+      - Multi-GT rows are grouped by equal GT count. IoU matrices are built
+        in batched GPU tensors and copied to CPU once per GT-count group.
+      - SciPy Hungarian itself remains per query because SciPy has no batched
+        API, but the expensive pairwise tensor construction is batched.
+
+    rounds=1:
+      IoU-only one-to-one assignment. Each GT supervises at most one score.
+
+    rounds>1:
+      Repeats IoU-only one-to-one assignment after removing previously
+      selected predictions. This becomes score one-to-many supervision.
+      Later rounds are reduced by round_decay ** round_index.
+    """
+
+    def __init__(
+        self,
+        rounds: int = 1,
+        quality_gamma: float = 1.0,
+        round_decay: float = 0.25,
+        min_iou: float = 0.0,
+    ) -> None:
+        self.rounds = max(1, int(rounds))
+        self.quality_gamma = max(0.0, float(quality_gamma))
+        self.round_decay = clamp01(round_decay)
+        self.min_iou = clamp01(min_iou)
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        pred_bbox: torch.Tensor,
+        packed_targets: PackedTargets,
+        *,
+        output_dtype: torch.dtype,
+    ) -> ScoreAssignmentResult:
+        if pred_bbox.ndim != 3 or pred_bbox.shape[-1] != 4:
+            raise ValueError(
+                "pred_bbox must have shape [B, N, 4], got "
+                f"{tuple(pred_bbox.shape)}"
+            )
+
+        batch_size, num_pred, _ = pred_bbox.shape
+        device = pred_bbox.device
+
+        quality_target = torch.zeros(
+            (batch_size, num_pred, 1),
+            device=device,
+            dtype=output_dtype,
+        )
+        round_weight = torch.zeros_like(quality_target)
+        positive_mask = torch.zeros(
+            (batch_size, num_pred, 1),
+            device=device,
+            dtype=torch.bool,
+        )
+        counts = [0] * batch_size
+        selected_iou_parts: List[torch.Tensor] = []
+
+        if num_pred == 0 or packed_targets.boxes.numel() == 0:
+            return ScoreAssignmentResult(
+                quality_target=quality_target,
+                round_weight=round_weight,
+                positive_mask=positive_mask,
+                counts=tuple(counts),
+                selected_ious=torch.empty(
+                    0,
+                    device=device,
+                    dtype=torch.float32,
+                ),
+                mode="empty",
+                rounds=self.rounds,
+            )
+
+        single_rows = [
+            index
+            for index, count in enumerate(packed_targets.counts)
+            if count == 1
+        ]
+
+        if single_rows:
+            batch_index = torch.tensor(
+                single_rows,
+                device=device,
+                dtype=torch.long,
+            )
+            global_gt_index = packed_targets.offsets[batch_index]
+            gt_bbox = packed_targets.boxes[global_gt_index].float()
+            boxes = pred_bbox.detach().float().index_select(0, batch_index)
+            iou = batched_single_target_iou(boxes, gt_bbox)
+
+            k = min(self.rounds, num_pred)
+            selected_iou, selected_pred = torch.topk(
+                iou,
+                k=k,
+                dim=1,
+                largest=True,
+                sorted=True,
+            )
+            decay = (
+                self.round_decay
+                ** torch.arange(
+                    k,
+                    device=device,
+                    dtype=torch.float32,
+                )
+            )
+            shaped_quality = (
+                selected_iou.clamp(0.0, 1.0)
+                .pow(self.quality_gamma)
+                * decay[None, :]
+            )
+            valid = selected_iou >= self.min_iou
+
+            row_index = batch_index[:, None].expand_as(selected_pred)
+            quality_target[
+                row_index[valid],
+                selected_pred[valid],
+                0,
+            ] = shaped_quality[valid].to(output_dtype)
+            round_weight[
+                row_index[valid],
+                selected_pred[valid],
+                0,
+            ] = decay[None, :].expand_as(selected_iou)[valid].to(output_dtype)
+            positive_mask[
+                row_index[valid],
+                selected_pred[valid],
+                0,
+            ] = True
+
+            valid_counts = valid.sum(dim=1).detach().cpu().tolist()
+            for row, original_batch_index in enumerate(single_rows):
+                counts[original_batch_index] = int(valid_counts[row])
+            if bool(valid.any()):
+                selected_iou_parts.append(selected_iou[valid])
+
+        multi_groups = group_rows_by_target_count(
+            packed_targets.counts,
+            minimum_count=2,
+        )
+
+        if multi_groups and linear_sum_assignment is None:
+            raise ImportError(
+                "Multi-GT score assignment requires scipy. "
+                "Install it with: pip install scipy"
+            )
+
+        for num_gt, rows in multi_groups.items():
+            row_tensor = torch.tensor(
+                rows,
+                device=device,
+                dtype=torch.long,
+            )
+            boxes = pred_bbox.detach().float().index_select(
+                0,
+                row_tensor,
+            )
+            gt_bbox = gather_grouped_targets(
+                packed_targets,
+                row_tensor,
+                num_gt,
+                dtype=torch.float32,
+            )
+            iou_group = batched_pairwise_iou(
+                boxes,
+                gt_bbox,
+            )
+            # One transfer/synchronization per equal-GT-count group.
+            iou_group_cpu = iou_group.detach().cpu().numpy()
+
+            for group_row, batch_index in enumerate(rows):
+                iou_np = iou_group_cpu[group_row]
+                available = np.ones(
+                    num_pred,
+                    dtype=np.bool_,
+                )
+                query_count = 0
+
+                for round_index in range(self.rounds):
+                    available_pred = np.flatnonzero(available)
+                    if available_pred.size == 0:
+                        break
+
+                    local_iou = iou_np[available_pred]
+                    pred_np, gt_np = linear_sum_assignment(
+                        -local_iou
+                    )
+                    if len(pred_np) == 0:
+                        break
+
+                    selected_pred_np = available_pred[pred_np]
+                    selected_iou_np = local_iou[pred_np, gt_np]
+                    available[selected_pred_np] = False
+
+                    valid_np = selected_iou_np >= self.min_iou
+                    if not bool(valid_np.any()):
+                        continue
+
+                    selected_pred_np = selected_pred_np[valid_np]
+                    selected_iou_np = selected_iou_np[valid_np]
+                    decay_value = float(
+                        self.round_decay ** round_index
+                    )
+
+                    selected_pred = torch.as_tensor(
+                        selected_pred_np,
+                        device=device,
+                        dtype=torch.long,
+                    )
+                    selected_iou = torch.as_tensor(
+                        selected_iou_np,
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    shaped_quality = (
+                        selected_iou.clamp(0.0, 1.0)
+                        .pow(self.quality_gamma)
+                        * decay_value
+                    )
+
+                    quality_target[
+                        batch_index,
+                        selected_pred,
+                        0,
+                    ] = shaped_quality.to(output_dtype)
+                    round_weight[
+                        batch_index,
+                        selected_pred,
+                        0,
+                    ] = decay_value
+                    positive_mask[
+                        batch_index,
+                        selected_pred,
+                        0,
+                    ] = True
+
+                    query_count += int(selected_pred.numel())
+                    selected_iou_parts.append(selected_iou)
+
+                counts[batch_index] = query_count
+
+        if selected_iou_parts:
+            selected_ious = torch.cat(selected_iou_parts).float()
+        else:
+            selected_ious = torch.empty(
+                0,
+                device=device,
+                dtype=torch.float32,
+            )
+
+        mode = (
+            "iou_one_to_one"
+            if self.rounds == 1
+            else "iou_multi_round"
+        )
+        if multi_groups:
+            mode += "_grouped_multi_gt"
+
+        return ScoreAssignmentResult(
+            quality_target=quality_target,
+            round_weight=round_weight,
+            positive_mask=positive_mask,
+            counts=tuple(counts),
+            selected_ious=selected_ious,
+            mode=mode,
+            rounds=self.rounds,
+        )
+
+
 class HungarianOneToOneMatcher:
-    """Main-branch Hungarian matcher with a batched 0/1-GT fast path."""
+    """
+    Main-branch Hungarian matcher.
+
+    Fast paths:
+      - 0/1 GT rows are fully vectorized.
+      - Multi-GT rows are grouped by equal GT count. Pairwise costs are built
+        in batched tensors and copied to CPU once per group. SciPy assignment
+        remains per query because SciPy has no batched Hungarian API.
+    """
 
     def __init__(
         self,
@@ -309,7 +768,9 @@ class HungarianOneToOneMatcher:
             and float(cost_giou) == 0.0
             and float(cost_score) == 0.0
         ):
-            raise ValueError("At least one Hungarian matching cost must be non-zero.")
+            raise ValueError(
+                "At least one Hungarian matching cost must be non-zero."
+            )
 
         self.cost_bbox = float(cost_bbox)
         self.cost_giou = float(cost_giou)
@@ -343,7 +804,9 @@ class HungarianOneToOneMatcher:
         if score_logit.shape != (batch_size, num_pred):
             raise ValueError("pred_bbox/pred_score_logit shape mismatch")
         if len(targets) != batch_size:
-            raise ValueError(f"targets batch size mismatch: {len(targets)} != {batch_size}")
+            raise ValueError(
+                f"targets batch size mismatch: {len(targets)} != {batch_size}"
+            )
 
         if packed_targets is None:
             packed_targets = PackedTargets.from_targets(
@@ -360,76 +823,179 @@ class HungarianOneToOneMatcher:
         pred_score = score_logit.detach().float().sigmoid()
 
         single_rows = [
-            index for index, count in enumerate(packed_targets.counts)
+            index
+            for index, count in enumerate(packed_targets.counts)
             if count == 1
         ]
 
         if num_pred > 0 and single_rows:
-            batch_index = torch.tensor(single_rows, device=device, dtype=torch.long)
+            batch_index = torch.tensor(
+                single_rows,
+                device=device,
+                dtype=torch.long,
+            )
             global_gt_index = packed_targets.offsets[batch_index]
             gt_bbox = packed_targets.boxes[global_gt_index].float()
-            boxes = pred_bbox.detach().float().index_select(0, batch_index)
+            boxes = pred_bbox.detach().float().index_select(
+                0,
+                batch_index,
+            )
 
-            cost_bbox = torch.abs(boxes - gt_bbox[:, None, :]).sum(dim=-1)
-            giou = batched_single_target_giou(boxes, gt_bbox)
-            cost = self.cost_bbox * cost_bbox - self.cost_giou * giou
+            cost_bbox = torch.abs(
+                boxes - gt_bbox[:, None, :]
+            ).sum(dim=-1)
+            giou = batched_single_target_giou(
+                boxes,
+                gt_bbox,
+            )
+            cost = (
+                self.cost_bbox * cost_bbox
+                - self.cost_giou * giou
+            )
             if self.cost_score != 0.0:
-                cost = cost - self.cost_score * pred_score.index_select(0, batch_index)
+                cost = (
+                    cost
+                    - self.cost_score
+                    * pred_score.index_select(
+                        0,
+                        batch_index,
+                    )
+                )
 
-            best_pred = torch.argmin(cost, dim=1)
+            best_pred = torch.argmin(
+                cost,
+                dim=1,
+            )
 
-            if all(count <= 1 for count in packed_targets.counts):
-                counts = tuple(1 if count == 1 else 0 for count in packed_targets.counts)
+            if all(
+                count <= 1
+                for count in packed_targets.counts
+            ):
+                counts = tuple(
+                    1 if count == 1 else 0
+                    for count in packed_targets.counts
+                )
                 return AssignmentResult(
                     batch_indices=batch_index,
-                    pred_indices=best_pred.to(dtype=torch.long),
-                    gt_indices=torch.zeros_like(best_pred, dtype=torch.long),
+                    pred_indices=best_pred.long(),
+                    gt_indices=torch.zeros_like(
+                        best_pred,
+                        dtype=torch.long,
+                    ),
                     counts=counts,
                     mode="batched_single_gt",
                 )
 
-            zero_gt = torch.zeros(1, dtype=torch.long, device=device)
+            zero_gt = torch.zeros(
+                1,
+                dtype=torch.long,
+                device=device,
+            )
             for row, original_batch_index in enumerate(single_rows):
                 per_batch[original_batch_index] = (
                     best_pred[row:row + 1],
                     zero_gt,
                 )
 
-        multi_rows = [
-            index for index, count in enumerate(packed_targets.counts)
-            if count > 1
-        ]
+        multi_groups = group_rows_by_target_count(
+            packed_targets.counts,
+            minimum_count=2,
+        )
 
-        if multi_rows and linear_sum_assignment is None:
+        if multi_groups and linear_sum_assignment is None:
             raise ImportError(
                 "Multi-GT Hungarian matching requires scipy. "
                 "Install it with: pip install scipy"
             )
 
-        for batch_index in multi_rows:
-            start = int(packed_targets.offsets[batch_index].item())
-            end = int(packed_targets.offsets[batch_index + 1].item())
-            gt_bbox = packed_targets.boxes[start:end].float()
-            boxes = pred_bbox[batch_index].detach().float()
-
-            cost_bbox = torch.cdist(boxes, gt_bbox, p=1)
-            giou = generalized_box_iou(boxes, gt_bbox)
-            cost = self.cost_bbox * cost_bbox - self.cost_giou * giou
-            if self.cost_score != 0.0:
-                cost = cost - self.cost_score * pred_score[batch_index, :, None]
-
-            pred_np, gt_np = linear_sum_assignment(cost.cpu().numpy())
-            per_batch[batch_index] = (
-                torch.as_tensor(pred_np, device=device, dtype=torch.long),
-                torch.as_tensor(gt_np, device=device, dtype=torch.long),
+        for num_gt, rows in multi_groups.items():
+            row_tensor = torch.tensor(
+                rows,
+                device=device,
+                dtype=torch.long,
+            )
+            boxes = pred_bbox.detach().float().index_select(
+                0,
+                row_tensor,
+            )
+            gt_bbox = gather_grouped_targets(
+                packed_targets,
+                row_tensor,
+                num_gt,
+                dtype=torch.float32,
             )
 
-        mode = "batched_single_gt" if not multi_rows else "mixed_fallback"
-        return AssignmentResult.from_per_batch(per_batch, device=device, mode=mode)
+            cost_bbox = torch.abs(
+                boxes[:, :, None, :]
+                - gt_bbox[:, None, :, :]
+            ).sum(dim=-1)
+            giou = batched_pairwise_giou(
+                boxes,
+                gt_bbox,
+            )
+            cost = (
+                self.cost_bbox * cost_bbox
+                - self.cost_giou * giou
+            )
+            if self.cost_score != 0.0:
+                cost = (
+                    cost
+                    - self.cost_score
+                    * pred_score.index_select(
+                        0,
+                        row_tensor,
+                    )[:, :, None]
+                )
+
+            # One GPU->CPU synchronization per equal-GT-count group.
+            cost_cpu = cost.detach().cpu().numpy()
+
+            for group_row, batch_index in enumerate(rows):
+                pred_np, gt_np = linear_sum_assignment(
+                    cost_cpu[group_row]
+                )
+                per_batch[batch_index] = (
+                    torch.as_tensor(
+                        pred_np,
+                        device=device,
+                        dtype=torch.long,
+                    ),
+                    torch.as_tensor(
+                        gt_np,
+                        device=device,
+                        dtype=torch.long,
+                    ),
+                )
+
+        mode = (
+            "batched_single_gt"
+            if not multi_groups
+            else "grouped_multi_gt_scipy"
+        )
+        return AssignmentResult.from_per_batch(
+            per_batch,
+            device=device,
+            mode=mode,
+        )
 
 
-class OneToManyMatcher:
-    """Auxiliary one-to-many matcher with a batched single-GT top-k path."""
+class HDETRRepeatedHungarianMatcher:
+    """
+    H-DETR-style auxiliary matcher.
+
+    Each GT is repeated K times, then a bipartite matching is performed
+    against the augmented target set. Score logits are intentionally excluded
+    from the cost so confidence learning cannot change regression assignment.
+
+    Fast paths:
+      - 0/1 GT rows are fully vectorized with batched Top-K.
+      - Multi-GT rows are grouped by equal GT count. Base costs are computed
+        in batched GPU tensors and copied to CPU once per group. SciPy
+        Hungarian remains per query because SciPy has no batched API.
+
+    max_positive_per_gt is the H-DETR repeat factor K. positive_ratio is kept
+    only for backward compatibility and is not used.
+    """
 
     def __init__(
         self,
@@ -440,37 +1006,47 @@ class OneToManyMatcher:
         max_positive_per_gt: int = 2,
         min_extra_positive_iou: float = 0.0,
     ) -> None:
+        if float(cost_bbox) == 0.0 and float(cost_giou) == 0.0:
+            raise ValueError(
+                "At least one H-DETR regression matching cost must be non-zero."
+            )
+
         self.cost_bbox = float(cost_bbox)
         self.cost_giou = float(cost_giou)
-        self.cost_score = float(cost_score)
-        self.positive_ratio = float(positive_ratio)
-        self.max_positive_per_gt = max(1, int(max_positive_per_gt))
-        self.min_extra_positive_iou = float(min_extra_positive_iou)
+        self.repeat_k = max(1, int(max_positive_per_gt))
+        self.min_extra_positive_iou = clamp01(min_extra_positive_iou)
+
+        # Retained for config compatibility. It is intentionally not used.
+        self.configured_cost_score = float(cost_score)
+        self.configured_positive_ratio = float(positive_ratio)
 
     @staticmethod
-    @torch.no_grad()
-    def _greedy_one_to_one(cost: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        num_pred, num_gt = cost.shape
-        device = cost.device
-        if num_pred == 0 or num_gt == 0:
-            empty = torch.empty(0, dtype=torch.long, device=device)
-            return empty, empty
+    def _filter_extra_matches(
+        pred_indices: torch.Tensor,
+        gt_indices: torch.Tensor,
+        pair_iou: torch.Tensor,
+        *,
+        threshold: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if pred_indices.numel() == 0 or threshold <= 0.0:
+            return pred_indices, gt_indices
 
-        work = cost.float().clone()
-        infinity = torch.finfo(work.dtype).max
-        pred_indices: List[torch.Tensor] = []
-        gt_indices: List[torch.Tensor] = []
+        keep = pair_iou >= float(threshold)
 
-        for _ in range(min(num_pred, num_gt)):
-            flat_index = torch.argmin(work.reshape(-1))
-            pred_index = torch.div(flat_index, num_gt, rounding_mode="floor")
-            gt_index = flat_index % num_gt
-            pred_indices.append(pred_index)
-            gt_indices.append(gt_index)
-            work[pred_index, :] = infinity
-            work[:, gt_index] = infinity
+        # Preserve at least the best repeated match for every represented GT.
+        for gt_index in torch.unique(gt_indices):
+            positions = torch.nonzero(
+                gt_indices == gt_index,
+                as_tuple=False,
+            ).squeeze(1)
+            if positions.numel() == 0:
+                continue
+            best_position = positions[
+                torch.argmax(pair_iou[positions])
+            ]
+            keep[best_position] = True
 
-        return torch.stack(pred_indices).long(), torch.stack(gt_indices).long()
+        return pred_indices[keep], gt_indices[keep]
 
     @torch.no_grad()
     def __call__(
@@ -480,11 +1056,17 @@ class OneToManyMatcher:
         targets: List[dict],
         packed_targets: Optional[PackedTargets] = None,
     ) -> AssignmentResult:
+        if pred_bbox.ndim != 3 or pred_bbox.shape[-1] != 4:
+            raise ValueError(
+                "pred_bbox must have shape [B, N, 4], got "
+                f"{tuple(pred_bbox.shape)}"
+            )
+
         batch_size, num_pred, _ = pred_bbox.shape
-        if pred_score_logit.ndim == 3:
-            pred_score = pred_score_logit.detach().sigmoid().squeeze(-1)
-        else:
-            pred_score = pred_score_logit.detach().sigmoid()
+        if len(targets) != batch_size:
+            raise ValueError(
+                f"targets batch size mismatch: {len(targets)} != {batch_size}"
+            )
 
         if packed_targets is None:
             packed_targets = PackedTargets.from_targets(
@@ -494,184 +1076,254 @@ class OneToManyMatcher:
             )
 
         device = pred_bbox.device
-        empty = torch.empty(0, dtype=torch.long, device=device)
+        empty = torch.empty(
+            0,
+            dtype=torch.long,
+            device=device,
+        )
         per_batch: List[Tuple[torch.Tensor, torch.Tensor]] = [
             (empty, empty) for _ in range(batch_size)
         ]
 
         single_rows = [
-            index for index, count in enumerate(packed_targets.counts)
+            index
+            for index, count in enumerate(packed_targets.counts)
             if count == 1
         ]
 
         if num_pred > 0 and single_rows:
-            batch_index = torch.tensor(single_rows, device=device, dtype=torch.long)
+            batch_index = torch.tensor(
+                single_rows,
+                device=device,
+                dtype=torch.long,
+            )
             global_gt_index = packed_targets.offsets[batch_index]
-            gt_bbox = packed_targets.boxes[global_gt_index]
-            boxes = pred_bbox.detach().index_select(0, batch_index)
-
-            cost_bbox = torch.abs(boxes - gt_bbox[:, None, :]).sum(dim=-1)
-            giou = batched_single_target_giou(boxes.float(), gt_bbox.float()).to(boxes.dtype)
-            iou = batched_single_target_iou(boxes.float(), gt_bbox.float()).to(boxes.dtype)
-            cost = self.cost_bbox * cost_bbox - self.cost_giou * giou
-            if self.cost_score != 0.0:
-                cost = cost - self.cost_score * pred_score.index_select(0, batch_index)
-
-            ratio_budget = max(1, int(round(num_pred * self.positive_ratio)))
-            target_count = min(
-                num_pred,
-                self.max_positive_per_gt,
-                max(1, ratio_budget),
+            gt_bbox = packed_targets.boxes[global_gt_index].float()
+            boxes = pred_bbox.detach().float().index_select(
+                0,
+                batch_index,
             )
 
-            if target_count == 1:
-                selected_pred = torch.argmin(cost, dim=1, keepdim=True)
-                keep = torch.ones_like(selected_pred, dtype=torch.bool)
-            elif self.min_extra_positive_iou <= 0.0:
-                selected_pred = torch.topk(
-                    cost,
-                    k=target_count,
-                    dim=1,
-                    largest=False,
-                    sorted=True,
-                ).indices
-                keep = torch.ones_like(selected_pred, dtype=torch.bool)
+            cost_bbox = torch.abs(
+                boxes - gt_bbox[:, None, :]
+            ).sum(dim=-1)
+            giou = batched_single_target_giou(
+                boxes,
+                gt_bbox,
+            )
+            iou = batched_single_target_iou(
+                boxes,
+                gt_bbox,
+            )
+            cost = (
+                self.cost_bbox * cost_bbox
+                - self.cost_giou * giou
+            )
+
+            k = min(self.repeat_k, num_pred)
+            _, selected_pred = torch.topk(
+                cost,
+                k=k,
+                dim=1,
+                largest=False,
+                sorted=True,
+            )
+            selected_iou = torch.gather(
+                iou,
+                1,
+                selected_pred,
+            )
+
+            if self.min_extra_positive_iou > 0.0 and k > 1:
+                keep = (
+                    selected_iou
+                    >= self.min_extra_positive_iou
+                )
+                keep[:, 0] = True
             else:
-                base_pred = torch.argmin(cost, dim=1, keepdim=True)
-                candidate_cost = cost.masked_fill(
-                    iou < self.min_extra_positive_iou,
-                    torch.finfo(cost.dtype).max,
-                )
-                candidate_cost.scatter_(1, base_pred, torch.finfo(cost.dtype).max)
-                extra_count = target_count - 1
-                extra_values, extra_pred = torch.topk(
-                    candidate_cost,
-                    k=extra_count,
-                    dim=1,
-                    largest=False,
-                    sorted=True,
-                )
-                selected_pred = torch.cat([base_pred, extra_pred], dim=1)
-                keep = torch.cat(
-                    [
-                        torch.ones_like(base_pred, dtype=torch.bool),
-                        torch.isfinite(extra_values)
-                        & (extra_values < torch.finfo(extra_values.dtype).max),
-                    ],
-                    dim=1,
+                keep = torch.ones_like(
+                    selected_pred,
+                    dtype=torch.bool,
                 )
 
-            if all(count <= 1 for count in packed_targets.counts):
-                selected_batch = batch_index[:, None].expand_as(selected_pred)
+            if all(
+                count <= 1
+                for count in packed_targets.counts
+            ):
+                selected_batch = (
+                    batch_index[:, None]
+                    .expand_as(selected_pred)
+                )
                 flat_batch = selected_batch[keep]
-                flat_pred = selected_pred[keep].to(dtype=torch.long)
-                single_counts = keep.sum(dim=1).detach().cpu().tolist()
+                flat_pred = selected_pred[keep].long()
+                single_counts = (
+                    keep.sum(dim=1)
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
                 counts_list = [0] * batch_size
                 for row, original_batch_index in enumerate(single_rows):
-                    counts_list[original_batch_index] = int(single_counts[row])
+                    counts_list[original_batch_index] = int(
+                        single_counts[row]
+                    )
                 return AssignmentResult(
-                    batch_indices=flat_batch.to(dtype=torch.long),
+                    batch_indices=flat_batch.long(),
                     pred_indices=flat_pred,
-                    gt_indices=torch.zeros_like(flat_pred, dtype=torch.long),
+                    gt_indices=torch.zeros_like(
+                        flat_pred
+                    ),
                     counts=tuple(counts_list),
-                    mode="batched_single_gt",
+                    mode="hdetr_repeated_gt_batched",
                 )
 
             for row, original_batch_index in enumerate(single_rows):
-                pred_row = selected_pred[row][keep[row]]
+                pred_row = (
+                    selected_pred[row][keep[row]]
+                    .long()
+                )
                 per_batch[original_batch_index] = (
-                    pred_row.to(dtype=torch.long),
-                    torch.zeros_like(pred_row, dtype=torch.long),
+                    pred_row,
+                    torch.zeros_like(pred_row),
                 )
 
-        multi_rows = [
-            index for index, count in enumerate(packed_targets.counts)
-            if count > 1
-        ]
+        multi_groups = group_rows_by_target_count(
+            packed_targets.counts,
+            minimum_count=2,
+        )
 
-        for batch_index in multi_rows:
-            start = int(packed_targets.offsets[batch_index].item())
-            end = int(packed_targets.offsets[batch_index + 1].item())
-            gt_bbox = packed_targets.boxes[start:end]
-            num_gt = int(gt_bbox.shape[0])
-            boxes = pred_bbox[batch_index].detach()
-            cost_bbox = torch.cdist(boxes, gt_bbox, p=1)
-            giou_matrix = generalized_box_iou(boxes, gt_bbox)
-            iou_matrix = box_iou(boxes, gt_bbox)
-            cost = self.cost_bbox * cost_bbox - self.cost_giou * giou_matrix
-            if self.cost_score != 0.0:
-                cost = cost - self.cost_score * pred_score[batch_index, :, None]
-
-            minimum_budget = min(num_pred, num_gt)
-            ratio_budget = max(1, int(round(num_pred * self.positive_ratio)))
-            maximum_budget = min(num_pred, num_gt * self.max_positive_per_gt)
-            positive_budget = min(max(minimum_budget, ratio_budget), maximum_budget)
-
-            base_pred, base_gt = self._greedy_one_to_one(cost)
-            selected_pred = [int(value) for value in base_pred.cpu().tolist()]
-            selected_gt = [int(value) for value in base_gt.cpu().tolist()]
-            used_pred = torch.zeros(num_pred, dtype=torch.bool, device=device)
-            gt_counts = torch.zeros(num_gt, dtype=torch.long, device=device)
-            if base_pred.numel() > 0:
-                used_pred[base_pred] = True
-                gt_counts.scatter_add_(0, base_gt, torch.ones_like(base_gt))
-
-            if len(selected_pred) < positive_budget and self.max_positive_per_gt > 1:
-                candidate_k = min(num_pred, self.max_positive_per_gt)
-                values, pred_indices = torch.topk(
-                    cost.transpose(0, 1),
-                    k=candidate_k,
-                    dim=1,
-                    largest=False,
-                    sorted=True,
-                )
-                gt_indices = torch.arange(num_gt, device=device)[:, None].expand_as(pred_indices)
-                order = torch.argsort(values.reshape(-1))
-                flat_pred = pred_indices.reshape(-1)
-                flat_gt = gt_indices.reshape(-1)
-
-                for order_index in order.cpu().tolist():
-                    if len(selected_pred) >= positive_budget:
-                        break
-                    pred_index = int(flat_pred[order_index].item())
-                    gt_index = int(flat_gt[order_index].item())
-                    if bool(used_pred[pred_index]):
-                        continue
-                    if int(gt_counts[gt_index]) >= self.max_positive_per_gt:
-                        continue
-                    if (
-                        self.min_extra_positive_iou > 0
-                        and float(iou_matrix[pred_index, gt_index]) < self.min_extra_positive_iou
-                    ):
-                        continue
-                    selected_pred.append(pred_index)
-                    selected_gt.append(gt_index)
-                    used_pred[pred_index] = True
-                    gt_counts[gt_index] += 1
-
-            per_batch[batch_index] = (
-                torch.tensor(selected_pred, device=device, dtype=torch.long),
-                torch.tensor(selected_gt, device=device, dtype=torch.long),
+        if multi_groups and linear_sum_assignment is None:
+            raise ImportError(
+                "Multi-GT H-DETR matching requires scipy. "
+                "Install it with: pip install scipy"
             )
 
-        mode = "batched_single_gt" if not multi_rows else "mixed_fallback"
-        return AssignmentResult.from_per_batch(per_batch, device=device, mode=mode)
+        for num_gt, rows in multi_groups.items():
+            row_tensor = torch.tensor(
+                rows,
+                device=device,
+                dtype=torch.long,
+            )
+            boxes = pred_bbox.detach().float().index_select(
+                0,
+                row_tensor,
+            )
+            gt_bbox = gather_grouped_targets(
+                packed_targets,
+                row_tensor,
+                num_gt,
+                dtype=torch.float32,
+            )
+
+            cost_bbox = torch.abs(
+                boxes[:, :, None, :]
+                - gt_bbox[:, None, :, :]
+            ).sum(dim=-1)
+            giou = batched_pairwise_giou(
+                boxes,
+                gt_bbox,
+            )
+            iou = batched_pairwise_iou(
+                boxes,
+                gt_bbox,
+            )
+            base_cost = (
+                self.cost_bbox * cost_bbox
+                - self.cost_giou * giou
+            )
+
+            repeated_gt = torch.arange(
+                num_gt,
+                device=device,
+                dtype=torch.long,
+            ).repeat(self.repeat_k)
+            expanded_cost = base_cost.index_select(
+                2,
+                repeated_gt,
+            )
+
+            # One GPU->CPU synchronization per equal-GT-count group.
+            expanded_cost_cpu = (
+                expanded_cost.detach().cpu().numpy()
+            )
+
+            for group_row, batch_index in enumerate(rows):
+                pred_np, repeated_column_np = (
+                    linear_sum_assignment(
+                        expanded_cost_cpu[group_row]
+                    )
+                )
+                pred_index = torch.as_tensor(
+                    pred_np,
+                    device=device,
+                    dtype=torch.long,
+                )
+                repeated_column = torch.as_tensor(
+                    repeated_column_np,
+                    device=device,
+                    dtype=torch.long,
+                )
+                gt_index = repeated_gt[
+                    repeated_column
+                ]
+                pair_iou = iou[
+                    group_row,
+                    pred_index,
+                    gt_index,
+                ]
+
+                pred_index, gt_index = (
+                    self._filter_extra_matches(
+                        pred_index,
+                        gt_index,
+                        pair_iou,
+                        threshold=(
+                            self.min_extra_positive_iou
+                        ),
+                    )
+                )
+                per_batch[batch_index] = (
+                    pred_index,
+                    gt_index,
+                )
+
+        mode = (
+            "hdetr_repeated_gt_batched"
+            if not multi_groups
+            else "hdetr_repeated_gt_grouped_scipy"
+        )
+        return AssignmentResult.from_per_batch(
+            per_batch,
+            device=device,
+            mode=mode,
+        )
+
+
+# Backward-compatible name used by older imports.
+OneToManyMatcher = HDETRRepeatedHungarianMatcher
 
 
 class GroundingLoss(nn.Module):
     """
-    Hybrid detection loss for LightDet.
+    H-DETR-inspired hybrid loss for LightDet.
 
-    Main branch:
-      - Hungarian one-to-one assignment.
-      - Used for final inference and mAP.
-      - Includes bbox, GIoU, QFL score and ranking loss.
+    Main regression branch:
+      - Score-free Hungarian one-to-one bbox/GIoU assignment.
+      - Used for validation and inference.
 
-    Auxiliary branch:
-      - Greedy one-to-many assignment.
+    Main score branch:
+      - Independent IoU-only score assignment.
+      - Default is one-to-one (score_match_rounds=1).
+      - Does not consume bbox matcher output or score logits.
+      - Negative text queries still receive all-zero QFL targets.
+
+    Auxiliary regression branch:
+      - H-DETR repeated-GT Hungarian one-to-many assignment.
       - Used only during training.
-      - Includes bbox, GIoU and QFL score loss.
-      - Does not contribute predictions to validation or inference.
+
+    Auxiliary score:
+      - Disabled by default so score remains a main one-to-one task.
+      - Can be enabled; if enabled it uses the same independent score assigner.
 
     Total loss:
         loss = main_loss + lambda_aux * auxiliary_loss
@@ -698,16 +1350,17 @@ class GroundingLoss(nn.Module):
         max_query_loss_weight: float = 10.0,
         aux_loss_weight: float = 0.5,
         aux_cost_score: Optional[float] = None,
+        score_match_rounds: int = 1,
+        score_quality_gamma: float = 1.0,
+        score_round_decay: float = 0.25,
+        score_min_iou: float = 0.0,
+        enable_pairwise_ranking: bool = False,
+        aux_score_enabled: bool = False,
     ) -> None:
         super().__init__()
 
-        self.hard_negative_ratio = max(
-            1,
-            int(hard_negative_ratio),
-        )
-        self.aux_positive_label = clamp01(
-            aux_positive_label
-        )
+        self.hard_negative_ratio = max(1, int(hard_negative_ratio))
+        self.aux_positive_label = clamp01(aux_positive_label)
         self.quality_min = clamp01(quality_min)
         self.quality_max = clamp01(quality_max)
 
@@ -717,20 +1370,26 @@ class GroundingLoss(nn.Module):
                 f"{self.quality_min} > {self.quality_max}"
             )
 
-        self.aux_loss_weight = max(
-            0.0,
-            float(aux_loss_weight),
+        self.aux_loss_weight = max(0.0, float(aux_loss_weight))
+        self.enable_pairwise_ranking = bool(enable_pairwise_ranking)
+        self.aux_score_enabled = bool(aux_score_enabled)
+
+        # Score is deliberately excluded from both regression matchers.
+        # cost_score/aux_cost_score are accepted only for old config files.
+        self.configured_cost_score = float(cost_score)
+        self.configured_aux_cost_score = (
+            float(cost_score)
+            if aux_cost_score is None
+            else float(aux_cost_score)
         )
 
-        # Main branch: exact Hungarian one-to-one assignment.
         self.main_matcher = HungarianOneToOneMatcher(
             cost_bbox=cost_bbox,
             cost_giou=cost_giou,
-            cost_score=cost_score,
+            cost_score=0.0,
         )
 
-        # Auxiliary branch: one-to-many positive expansion.
-        self.aux_matcher = OneToManyMatcher(
+        self.aux_matcher = HDETRRepeatedHungarianMatcher(
             cost_bbox=(
                 expand_cost_bbox
                 if expand_cost_bbox is not None
@@ -741,29 +1400,24 @@ class GroundingLoss(nn.Module):
                 if expand_cost_giou is not None
                 else cost_giou
             ),
-            cost_score=(
-                cost_score
-                if aux_cost_score is None
-                else float(aux_cost_score)
-            ),
+            cost_score=0.0,
             positive_ratio=positive_ratio,
             max_positive_per_gt=max_positive_per_gt,
             min_extra_positive_iou=iou_pos_thr,
         )
 
-        # Backward-compatible alias. Existing code that reads criterion.matcher
-        # will now see the main one-to-one matcher.
-        self.matcher = self.main_matcher
+        self.score_assigner = IndependentIoUScoreAssigner(
+            rounds=score_match_rounds,
+            quality_gamma=score_quality_gamma,
+            round_decay=score_round_decay,
+            min_iou=score_min_iou,
+        )
 
+        self.matcher = self.main_matcher
         self.qfl_beta = float(qfl_beta)
         self.rank_margin = float(rank_margin)
-        self.rank_min_quality_gap = float(
-            rank_min_quality_gap
-        )
-        self.rank_max_pairs = max(
-            1,
-            int(rank_max_pairs),
-        )
+        self.rank_min_quality_gap = float(rank_min_quality_gap)
+        self.rank_max_pairs = max(1, int(rank_max_pairs))
         self.max_query_loss_weight = max(
             1.0,
             float(max_query_loss_weight),
@@ -900,13 +1554,15 @@ class GroundingLoss(nn.Module):
         else:
             positive_counts = tuple(int(value) for value in positive_counts)
 
-        pred_prob = pred_score_logit.sigmoid()
+        score_logit_fp32 = pred_score_logit.float()
+        score_target_fp32 = score_target.float()
+        pred_prob = score_logit_fp32.sigmoid()
         bce = F.binary_cross_entropy_with_logits(
-            pred_score_logit,
-            score_target,
+            score_logit_fp32,
+            score_target_fp32,
             reduction="none",
         )
-        qfl_weight = (score_target - pred_prob).abs().pow(float(qfl_beta))
+        qfl_weight = (score_target_fp32 - pred_prob).abs().pow(float(qfl_beta))
         loss_flat = (bce * qfl_weight).squeeze(-1)
         positive_flat = positive_mask.squeeze(-1)
 
@@ -1181,7 +1837,8 @@ class GroundingLoss(nn.Module):
         pred_score_logit: torch.Tensor,
         targets: List[dict],
         packed_targets: PackedTargets,
-        assignments: AssignmentResult,
+        regression_assignments: AssignmentResult,
+        score_assignments: Optional[ScoreAssignmentResult],
         lambda_bbox: float,
         lambda_giou: float,
         lambda_score: float,
@@ -1190,6 +1847,7 @@ class GroundingLoss(nn.Module):
         query_loss_weights: Optional[torch.Tensor],
         text_negative_mask: Optional[torch.Tensor],
         warmup_positive_target: float,
+        score_enabled: bool,
         apply_ranking: bool,
         rank_alpha: float,
         lambda_rank: float,
@@ -1201,88 +1859,160 @@ class GroundingLoss(nn.Module):
             targets=targets,
         )
 
-        score_target = torch.zeros_like(pred_score_logit)
-        positive_mask = torch.zeros_like(pred_score_logit, dtype=torch.bool)
-        total_positive_pairs = assignments.num_matches
-        warmup_positive_target = clamp01(warmup_positive_target)
+        total_regression_pairs = regression_assignments.num_matches
 
-        if total_positive_pairs > 0:
-            batch_index = assignments.batch_indices
-            pred_index = assignments.pred_indices
+        if total_regression_pairs > 0:
+            batch_index = regression_assignments.batch_indices
+            pred_index = regression_assignments.pred_indices
             global_gt_index = packed_targets.global_gt_indices(
                 batch_index,
-                assignments.gt_indices,
+                regression_assignments.gt_indices,
             )
             positive_pred_boxes = pred_bbox[batch_index, pred_index]
-            positive_gt_boxes = packed_targets.boxes[global_gt_index].to(
-                dtype=pred_bbox.dtype
-            )
+            positive_gt_boxes = packed_targets.boxes[
+                global_gt_index
+            ].to(dtype=pred_bbox.dtype)
 
             loss_bbox = F.l1_loss(
                 positive_pred_boxes,
                 positive_gt_boxes,
                 reduction="sum",
-            ) / total_positive_pairs
+            ) / total_regression_pairs
 
             matched_giou = matched_generalized_box_iou(
                 positive_pred_boxes.float(),
                 positive_gt_boxes.float(),
             ).to(dtype=pred_bbox.dtype)
-            loss_giou = (1.0 - matched_giou).sum() / total_positive_pairs
+            loss_giou = (
+                1.0 - matched_giou
+            ).sum() / total_regression_pairs
 
             with torch.no_grad():
-                matched_iou = matched_box_iou(
+                regression_iou = matched_box_iou(
                     positive_pred_boxes.detach().float(),
                     positive_gt_boxes.float(),
-                ).clamp(0.0, 1.0).to(dtype=pred_score_logit.dtype)
-                final_quality_target = matched_iou.clamp(
-                    min=self.quality_min,
-                    max=self.quality_max,
-                )
-                quality_target = (
-                    (1.0 - float(quality_alpha)) * warmup_positive_target
-                    + float(quality_alpha) * final_quality_target
                 ).clamp(0.0, 1.0)
-
-            score_target[batch_index, pred_index, 0] = quality_target
-            positive_mask[batch_index, pred_index, 0] = True
-            matched_iou_mean = matched_iou.mean()
+                matched_iou_mean = regression_iou.mean()
         else:
             zero = pred_bbox.new_zeros(())
             loss_bbox = zero
             loss_giou = zero
             matched_iou_mean = zero
 
-        (
-            loss_score,
-            loss_score_pos,
-            loss_score_neg,
-            loss_score_neg_unweighted,
-            loss_text_negative,
-            score_pos_count,
-            hard_negative_count,
-            negative_count,
-            text_negative_count,
-            text_negative_weight_mean,
-        ) = self.score_loss_quality_balanced(
-            pred_score_logit=pred_score_logit,
-            score_target=score_target,
-            positive_mask=positive_mask,
-            pos_weight=pos_weight,
-            qfl_beta=self.qfl_beta,
-            query_loss_weights=query_loss_weights,
-            text_negative_mask=text_negative_mask,
-            positive_counts=assignments.counts,
-        )
+        if score_enabled:
+            if score_assignments is None:
+                raise ValueError(
+                    f"{branch_name}: score_assignments is required "
+                    "when score_enabled=True"
+                )
 
-        if bool(apply_ranking) and float(lambda_rank) > 0.0 and float(rank_alpha) > 0.0:
+            positive_mask = score_assignments.positive_mask
+            final_quality_target = (
+                score_assignments.quality_target.float()
+                .clamp(0.0, 1.0)
+            )
+            warmup_target = (
+                clamp01(warmup_positive_target)
+                * score_assignments.round_weight.float()
+            )
+            score_target = (
+                (1.0 - float(quality_alpha)) * warmup_target
+                + float(quality_alpha) * final_quality_target
+            ).clamp(0.0, 1.0).to(
+                dtype=pred_score_logit.dtype
+            )
+            score_target = torch.where(
+                positive_mask,
+                score_target,
+                torch.zeros_like(score_target),
+            )
+            positive_counts = score_assignments.counts
+
+            (
+                loss_score,
+                loss_score_pos,
+                loss_score_neg,
+                loss_score_neg_unweighted,
+                loss_text_negative,
+                score_pos_count,
+                hard_negative_count,
+                negative_count,
+                text_negative_count,
+                text_negative_weight_mean,
+            ) = self.score_loss_quality_balanced(
+                pred_score_logit=pred_score_logit,
+                score_target=score_target,
+                positive_mask=positive_mask,
+                pos_weight=pos_weight,
+                qfl_beta=self.qfl_beta,
+                query_loss_weights=query_loss_weights,
+                text_negative_mask=text_negative_mask,
+                positive_counts=positive_counts,
+            )
+
+            if score_assignments.selected_ious.numel() > 0:
+                score_iou_mean = (
+                    score_assignments.selected_ious.mean()
+                )
+            else:
+                score_iou_mean = pred_bbox.new_zeros(())
+
+            positive_targets = score_target[positive_mask]
+            if positive_targets.numel() > 0:
+                score_target_pos_mean = positive_targets.mean()
+                score_target_pos_min = positive_targets.min()
+                score_target_pos_max = positive_targets.max()
+            else:
+                zero = pred_bbox.new_zeros(())
+                score_target_pos_mean = zero
+                score_target_pos_min = zero
+                score_target_pos_max = zero
+
+            score_assignment_mode = score_assignments.mode
+            score_match_rounds = score_assignments.rounds
+        else:
+            score_target = torch.zeros_like(pred_score_logit)
+            positive_mask = torch.zeros_like(
+                pred_score_logit,
+                dtype=torch.bool,
+            )
+            zero = pred_bbox.new_zeros(())
+            loss_score = zero
+            loss_score_pos = zero
+            loss_score_neg = zero
+            loss_score_neg_unweighted = zero
+            loss_text_negative = zero
+            score_pos_count = 0.0
+            hard_negative_count = 0.0
+            negative_count = float(
+                pred_score_logit.shape[0]
+                * pred_score_logit.shape[1]
+            )
+            text_negative_count = 0.0
+            text_negative_weight_mean = zero
+            score_iou_mean = zero
+            score_target_pos_mean = zero
+            score_target_pos_min = zero
+            score_target_pos_max = zero
+            positive_counts = tuple(
+                0 for _ in range(pred_score_logit.shape[0])
+            )
+            score_assignment_mode = "disabled"
+            score_match_rounds = 0
+
+        if (
+            score_enabled
+            and bool(apply_ranking)
+            and float(lambda_rank) > 0.0
+            and float(rank_alpha) > 0.0
+        ):
             loss_rank_raw = self.pairwise_quality_rank_loss(
                 pred_score_logit=pred_score_logit,
                 score_target=score_target,
                 positive_mask=positive_mask,
                 margin=self.rank_margin,
                 min_quality_gap=self.rank_min_quality_gap,
-                positive_counts=assignments.counts,
+                positive_counts=positive_counts,
             )
             loss_rank = float(rank_alpha) * loss_rank_raw
             loss_rank_contrib = float(lambda_rank) * loss_rank
@@ -1298,19 +2028,9 @@ class GroundingLoss(nn.Module):
         )
         loss_total = loss_base + loss_rank_contrib
 
-        if total_positive_pairs > 0:
-            positive_targets = score_target[positive_mask]
-            score_target_pos_mean = positive_targets.mean()
-            score_target_pos_min = positive_targets.min()
-            score_target_pos_max = positive_targets.max()
-        else:
-            zero = pred_bbox.new_zeros(())
-            score_target_pos_mean = zero
-            score_target_pos_min = zero
-            score_target_pos_max = zero
-
         selected_negative_fraction = (
-            float(hard_negative_count) / max(float(negative_count), 1.0)
+            float(hard_negative_count)
+            / max(float(negative_count), 1.0)
         )
 
         metrics: Dict[str, Any] = {
@@ -1326,26 +2046,40 @@ class GroundingLoss(nn.Module):
             "loss_rank": loss_rank,
             "loss_rank_raw": loss_rank_raw,
             "loss_rank_contrib": loss_rank_contrib,
-            "matched": float(total_positive_pairs),
+            "matched": float(total_regression_pairs),
             "score_pos_count": float(score_pos_count),
             "hard_neg_count": float(hard_negative_count),
             "negative_count": float(negative_count),
-            "selected_negative_fraction": float(selected_negative_fraction),
+            "selected_negative_fraction": float(
+                selected_negative_fraction
+            ),
             "text_negative_count": float(text_negative_count),
             "text_negative_weight_mean": text_negative_weight_mean,
             "matched_iou_mean": matched_iou_mean,
+            "score_iou_mean": score_iou_mean,
             "score_target_pos_mean": score_target_pos_mean,
             "score_target_pos_min": score_target_pos_min,
             "score_target_pos_max": score_target_pos_max,
             "lambda_bbox": float(lambda_bbox),
             "lambda_giou": float(lambda_giou),
             "lambda_score": float(lambda_score),
-            "lambda_rank": float(lambda_rank if apply_ranking else 0.0),
-            "lambda_rank_eff": float(lambda_rank * rank_alpha if apply_ranking else 0.0),
+            "lambda_rank": float(
+                lambda_rank if apply_ranking else 0.0
+            ),
+            "lambda_rank_eff": float(
+                lambda_rank * rank_alpha
+                if apply_ranking
+                else 0.0
+            ),
             "pos_weight": float(pos_weight),
             "quality_alpha": float(quality_alpha),
-            "rank_alpha": float(rank_alpha if apply_ranking else 0.0),
-            "assignment_mode": assignments.mode,
+            "rank_alpha": float(
+                rank_alpha if apply_ranking else 0.0
+            ),
+            "assignment_mode": regression_assignments.mode,
+            "score_assignment_mode": score_assignment_mode,
+            "score_match_rounds": int(score_match_rounds),
+            "score_enabled": bool(score_enabled),
         }
         return loss_total, metrics
 
@@ -1386,26 +2120,24 @@ class GroundingLoss(nn.Module):
         aux_pos_weight: Optional[float] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
-        Compute hybrid main one-to-one and auxiliary one-to-many losses.
+        Main:
+          - bbox/GIoU: score-free Hungarian one-to-one.
+          - score: independent IoU-only one-to-one by default.
 
-        The existing pred_bbox/pred_score_logit arguments are treated as the
-        main branch, preserving compatibility with the current train.py.
+        Auxiliary:
+          - bbox/GIoU: H-DETR repeated-GT Hungarian one-to-many.
+          - score: disabled by default.
 
-        Auxiliary loss is enabled only when both aux_pred_bbox and
-        aux_pred_score_logit are supplied.
+        The public signature remains compatible with the existing train.py.
         """
-        quality_alpha, rank_alpha = (
-            self.resolve_epoch_alpha(
-                current_epoch=current_epoch,
-                quality_alpha=quality_alpha,
-                rank_alpha=rank_alpha,
-                quality_warmup_epoch=(
-                    quality_warmup_epoch
-                ),
-                rank_start_epoch=rank_start_epoch,
-                rank_warmup_epoch=rank_warmup_epoch,
-                rank_alpha_min=rank_alpha_min,
-            )
+        quality_alpha, rank_alpha = self.resolve_epoch_alpha(
+            current_epoch=current_epoch,
+            quality_alpha=quality_alpha,
+            rank_alpha=rank_alpha,
+            quality_warmup_epoch=quality_warmup_epoch,
+            rank_start_epoch=rank_start_epoch,
+            rank_warmup_epoch=rank_warmup_epoch,
+            rank_alpha_min=rank_alpha_min,
         )
 
         packed_targets = PackedTargets.from_targets(
@@ -1414,57 +2146,49 @@ class GroundingLoss(nn.Module):
             dtype=pred_bbox.dtype,
         )
 
-        main_assignments = self.main_matcher(
+        main_regression_assignments = self.main_matcher(
             pred_bbox=pred_bbox,
             pred_score_logit=pred_score_logit,
             targets=targets,
             packed_targets=packed_targets,
         )
+        main_score_assignments = self.score_assigner(
+            pred_bbox=pred_bbox,
+            packed_targets=packed_targets,
+            output_dtype=pred_score_logit.dtype,
+        )
 
-        main_loss, main_metrics = (
-            self._compute_branch_loss(
-                branch_name="main",
-                pred_bbox=pred_bbox,
-                pred_score_logit=(
-                    pred_score_logit
-                ),
-                targets=targets,
-                packed_targets=packed_targets,
-                assignments=main_assignments,
-                lambda_bbox=lambda_bbox,
-                lambda_giou=lambda_giou,
-                lambda_score=lambda_score,
-                pos_weight=pos_weight,
-                quality_alpha=quality_alpha,
-                query_loss_weights=(
-                    query_loss_weights
-                ),
-                text_negative_mask=(
-                    text_negative_mask
-                ),
-                warmup_positive_target=(
-                    self.quality_max
-                ),
-                apply_ranking=True,
-                rank_alpha=rank_alpha,
-                lambda_rank=lambda_rank,
-            )
+        main_loss, main_metrics = self._compute_branch_loss(
+            branch_name="main",
+            pred_bbox=pred_bbox,
+            pred_score_logit=pred_score_logit,
+            targets=targets,
+            packed_targets=packed_targets,
+            regression_assignments=main_regression_assignments,
+            score_assignments=main_score_assignments,
+            lambda_bbox=lambda_bbox,
+            lambda_giou=lambda_giou,
+            lambda_score=lambda_score,
+            pos_weight=pos_weight,
+            quality_alpha=quality_alpha,
+            query_loss_weights=query_loss_weights,
+            text_negative_mask=text_negative_mask,
+            warmup_positive_target=self.quality_max,
+            score_enabled=True,
+            apply_ranking=self.enable_pairwise_ranking,
+            rank_alpha=rank_alpha,
+            lambda_rank=lambda_rank,
         )
 
         has_aux_bbox = aux_pred_bbox is not None
-        has_aux_score = (
-            aux_pred_score_logit is not None
-        )
-
+        has_aux_score = aux_pred_score_logit is not None
         if has_aux_bbox != has_aux_score:
             raise ValueError(
-                "aux_pred_bbox and aux_pred_score_logit "
-                "must either both be provided or both be None."
+                "aux_pred_bbox and aux_pred_score_logit must either "
+                "both be provided or both be None."
             )
 
-        aux_enabled = (
-            has_aux_bbox and has_aux_score
-        )
+        aux_enabled = has_aux_bbox and has_aux_score
         lambda_aux_eff = (
             self.aux_loss_weight
             if lambda_aux is None
@@ -1487,64 +2211,54 @@ class GroundingLoss(nn.Module):
                 if aux_lambda_score is None
                 else float(aux_lambda_score)
             )
+            if not self.aux_score_enabled:
+                aux_lambda_score_eff = 0.0
+
             aux_pos_weight_eff = (
                 float(pos_weight)
                 if aux_pos_weight is None
                 else float(aux_pos_weight)
             )
 
-            aux_assignments = self.aux_matcher(
+            aux_regression_assignments = self.aux_matcher(
                 pred_bbox=aux_pred_bbox,
-                pred_score_logit=(
-                    aux_pred_score_logit
-                ),
+                pred_score_logit=aux_pred_score_logit,
                 targets=targets,
                 packed_targets=packed_targets,
             )
 
-            aux_loss, aux_metrics = (
-                self._compute_branch_loss(
-                    branch_name="aux",
+            aux_score_assignments = None
+            if self.aux_score_enabled:
+                aux_score_assignments = self.score_assigner(
                     pred_bbox=aux_pred_bbox,
-                    pred_score_logit=(
-                        aux_pred_score_logit
-                    ),
-                    targets=targets,
                     packed_targets=packed_targets,
-                    assignments=aux_assignments,
-                    lambda_bbox=(
-                        aux_lambda_bbox_eff
-                    ),
-                    lambda_giou=(
-                        aux_lambda_giou_eff
-                    ),
-                    lambda_score=(
-                        aux_lambda_score_eff
-                    ),
-                    pos_weight=(
-                        aux_pos_weight_eff
-                    ),
-                    quality_alpha=(
-                        quality_alpha
-                    ),
-                    query_loss_weights=(
-                        query_loss_weights
-                    ),
-                    text_negative_mask=(
-                        text_negative_mask
-                    ),
-                    warmup_positive_target=(
-                        self.aux_positive_label
-                    ),
-                    apply_ranking=False,
-                    rank_alpha=0.0,
-                    lambda_rank=0.0,
+                    output_dtype=aux_pred_score_logit.dtype,
                 )
+
+            aux_loss, aux_metrics = self._compute_branch_loss(
+                branch_name="aux",
+                pred_bbox=aux_pred_bbox,
+                pred_score_logit=aux_pred_score_logit,
+                targets=targets,
+                packed_targets=packed_targets,
+                regression_assignments=aux_regression_assignments,
+                score_assignments=aux_score_assignments,
+                lambda_bbox=aux_lambda_bbox_eff,
+                lambda_giou=aux_lambda_giou_eff,
+                lambda_score=aux_lambda_score_eff,
+                pos_weight=aux_pos_weight_eff,
+                quality_alpha=quality_alpha,
+                query_loss_weights=query_loss_weights,
+                text_negative_mask=text_negative_mask,
+                warmup_positive_target=self.aux_positive_label,
+                score_enabled=self.aux_score_enabled,
+                apply_ranking=False,
+                rank_alpha=0.0,
+                lambda_rank=0.0,
             )
         else:
-            aux_loss = pred_bbox.new_tensor(0.0)
-            zero = pred_bbox.new_tensor(0.0)
-
+            aux_loss = pred_bbox.new_zeros(())
+            zero = pred_bbox.new_zeros(())
             aux_metrics = {
                 "loss_total": zero,
                 "loss_base": zero,
@@ -1566,53 +2280,50 @@ class GroundingLoss(nn.Module):
                 "text_negative_count": 0.0,
                 "text_negative_weight_mean": zero,
                 "matched_iou_mean": zero,
+                "score_iou_mean": zero,
                 "score_target_pos_mean": zero,
                 "score_target_pos_min": zero,
                 "score_target_pos_max": zero,
-                "lambda_bbox": float(
-                    lambda_bbox
-                ),
-                "lambda_giou": float(
-                    lambda_giou
-                ),
-                "lambda_score": float(
-                    lambda_score
-                ),
+                "lambda_bbox": float(lambda_bbox),
+                "lambda_giou": float(lambda_giou),
+                "lambda_score": 0.0,
                 "lambda_rank": 0.0,
                 "lambda_rank_eff": 0.0,
-                "pos_weight": float(
-                    pos_weight
-                ),
-                "quality_alpha": float(
-                    quality_alpha
-                ),
+                "pos_weight": float(pos_weight),
+                "quality_alpha": float(quality_alpha),
                 "rank_alpha": 0.0,
+                "assignment_mode": "disabled",
+                "score_assignment_mode": "disabled",
+                "score_match_rounds": 0,
+                "score_enabled": False,
             }
 
-        aux_loss_contrib = (
-            float(lambda_aux_eff) * aux_loss
-        )
+        aux_loss_contrib = float(lambda_aux_eff) * aux_loss
         loss = main_loss + aux_loss_contrib
 
         loss_dict: Dict[str, Any] = {
             "loss": loss.detach(),
-            "loss_main_total": (
-                main_loss.detach()
+            "loss_main_total": main_loss.detach(),
+            "loss_aux_total": aux_loss.detach(),
+            "loss_aux_contrib": aux_loss_contrib.detach(),
+            "lambda_aux": float(lambda_aux_eff),
+            "aux_enabled": bool(aux_enabled),
+            "aux_score_enabled": bool(self.aux_score_enabled),
+            "hdetr_repeat_k": int(self.aux_matcher.repeat_k),
+            "score_match_rounds": int(
+                self.score_assigner.rounds
             ),
-            "loss_aux_total": (
-                aux_loss.detach()
+            "score_quality_gamma": float(
+                self.score_assigner.quality_gamma
             ),
-            "loss_aux_contrib": (
-                aux_loss_contrib.detach()
+            "score_round_decay": float(
+                self.score_assigner.round_decay
             ),
-            "lambda_aux": float(
-                lambda_aux_eff
-            ),
-            "aux_enabled": bool(
-                aux_enabled
+            "pairwise_ranking_enabled": bool(
+                self.enable_pairwise_ranking
             ),
 
-            # Backward-compatible main-branch aliases.
+            # Backward-compatible main aliases.
             "loss_main": self._detach_metric(
                 main_metrics["loss_base"]
             ),
@@ -1631,19 +2342,11 @@ class GroundingLoss(nn.Module):
             "loss_score_neg": self._detach_metric(
                 main_metrics["loss_score_neg"]
             ),
-            "loss_score_neg_unweighted": (
-                self._detach_metric(
-                    main_metrics[
-                        "loss_score_neg_unweighted"
-                    ]
-                )
+            "loss_score_neg_unweighted": self._detach_metric(
+                main_metrics["loss_score_neg_unweighted"]
             ),
-            "loss_text_negative": (
-                self._detach_metric(
-                    main_metrics[
-                        "loss_text_negative"
-                    ]
-                )
+            "loss_text_negative": self._detach_metric(
+                main_metrics["loss_text_negative"]
             ),
             "loss_rank": self._detach_metric(
                 main_metrics["loss_rank"]
@@ -1651,103 +2354,51 @@ class GroundingLoss(nn.Module):
             "loss_rank_raw": self._detach_metric(
                 main_metrics["loss_rank_raw"]
             ),
-            "loss_rank_contrib": (
-                self._detach_metric(
-                    main_metrics[
-                        "loss_rank_contrib"
-                    ]
-                )
+            "loss_rank_contrib": self._detach_metric(
+                main_metrics["loss_rank_contrib"]
             ),
             "matched": main_metrics["matched"],
-            "score_pos_count": (
-                main_metrics["score_pos_count"]
+            "score_pos_count": main_metrics["score_pos_count"],
+            "hard_neg_count": main_metrics["hard_neg_count"],
+            "negative_count": main_metrics["negative_count"],
+            "selected_negative_fraction": main_metrics[
+                "selected_negative_fraction"
+            ],
+            "text_negative_count": main_metrics[
+                "text_negative_count"
+            ],
+            "text_negative_weight_mean": self._detach_metric(
+                main_metrics["text_negative_weight_mean"]
             ),
-            "hard_neg_count": (
-                main_metrics["hard_neg_count"]
+            "matched_iou_mean": self._detach_metric(
+                main_metrics["matched_iou_mean"]
             ),
-            "negative_count": (
-                main_metrics["negative_count"]
+            "score_iou_mean": self._detach_metric(
+                main_metrics["score_iou_mean"]
             ),
-            "selected_negative_fraction": (
-                main_metrics[
-                    "selected_negative_fraction"
-                ]
+            "score_target_pos_mean": self._detach_metric(
+                main_metrics["score_target_pos_mean"]
             ),
-            "text_negative_count": (
-                main_metrics[
-                    "text_negative_count"
-                ]
+            "score_target_pos_min": self._detach_metric(
+                main_metrics["score_target_pos_min"]
             ),
-            "text_negative_weight_mean": (
-                self._detach_metric(
-                    main_metrics[
-                        "text_negative_weight_mean"
-                    ]
-                )
+            "score_target_pos_max": self._detach_metric(
+                main_metrics["score_target_pos_max"]
             ),
-            "matched_iou_mean": (
-                self._detach_metric(
-                    main_metrics[
-                        "matched_iou_mean"
-                    ]
-                )
-            ),
-            "score_target_pos_mean": (
-                self._detach_metric(
-                    main_metrics[
-                        "score_target_pos_mean"
-                    ]
-                )
-            ),
-            "score_target_pos_min": (
-                self._detach_metric(
-                    main_metrics[
-                        "score_target_pos_min"
-                    ]
-                )
-            ),
-            "score_target_pos_max": (
-                self._detach_metric(
-                    main_metrics[
-                        "score_target_pos_max"
-                    ]
-                )
-            ),
-            "lambda_bbox": (
-                main_metrics["lambda_bbox"]
-            ),
-            "lambda_giou": (
-                main_metrics["lambda_giou"]
-            ),
-            "lambda_score": (
-                main_metrics["lambda_score"]
-            ),
-            "lambda_rank": (
-                main_metrics["lambda_rank"]
-            ),
-            "lambda_rank_eff": (
-                main_metrics["lambda_rank_eff"]
-            ),
-            "pos_weight": (
-                main_metrics["pos_weight"]
-            ),
-            "quality_alpha": (
-                main_metrics["quality_alpha"]
-            ),
-            "rank_alpha": (
-                main_metrics["rank_alpha"]
-            ),
+            "lambda_bbox": main_metrics["lambda_bbox"],
+            "lambda_giou": main_metrics["lambda_giou"],
+            "lambda_score": main_metrics["lambda_score"],
+            "lambda_rank": main_metrics["lambda_rank"],
+            "lambda_rank_eff": main_metrics["lambda_rank_eff"],
+            "pos_weight": main_metrics["pos_weight"],
+            "quality_alpha": main_metrics["quality_alpha"],
+            "rank_alpha": main_metrics["rank_alpha"],
         }
 
         for key, value in main_metrics.items():
-            loss_dict[f"main_{key}"] = (
-                self._detach_metric(value)
-            )
+            loss_dict[f"main_{key}"] = self._detach_metric(value)
 
         for key, value in aux_metrics.items():
-            loss_dict[f"aux_{key}"] = (
-                self._detach_metric(value)
-            )
+            loss_dict[f"aux_{key}"] = self._detach_metric(value)
 
         return loss, loss_dict
-

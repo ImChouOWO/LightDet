@@ -4667,7 +4667,7 @@ def main() -> None:
         resume=None,
         prefer_ema=True,
         project="runs/train",
-        name="lightdet_Decouple_head_2",
+        name="lightdet_Decouple_HDETR",
     )
 
 
