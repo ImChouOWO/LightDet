@@ -4992,7 +4992,7 @@ def main() -> None:
         resume=None,
         prefer_ema=True,
         project="runs/train",
-        name="lightdet_HDETR_textaware_dynamic",
+        name="lightdet_HDETR_textaware_dynamic_2",
     )
 
 

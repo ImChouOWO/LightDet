@@ -19,13 +19,13 @@ data:
 
 
 train:
-  epochs: 100
+  epochs: 60
   batch_size: 48
   warmup_epochs: 3
   num_workers: 16
 
   device: cuda:1
-  seed: 49
+  seed: 50
   deterministic: false
 
   use_amp: true
@@ -47,12 +47,10 @@ train:
 
 
 optim:
-  lr_vision: 0.000100
-  lr_text: 0.000075
-  lr_transformer: 0.000150
-
-  
-  lr_head: 0.000200
+  lr_vision: 0.000150
+  lr_text: 0.000060
+  lr_transformer: 0.000220
+  lr_head: 0.000380
 
   weight_decay: 0.0001
   min_lr_ratio: 0.05
@@ -62,60 +60,86 @@ optim:
 
 loss:
   hybrid:
-    aux_loss_weight: 0.35
+    # Auxiliary one-to-many 分支約占總 loss 18%～22%。
+    aux_loss_weight: 0.28
     aux_cost_score: 0.0
 
   matcher:
+    # 維持 DETR 系列常見的定位匹配比例。
     cost_bbox: 5.0
     cost_giou: 2.0
     cost_score: 0.0
 
   score_sampling:
-    hard_negative_ratio: 5
+    # QFL 每個 query 選擇的高損失負樣本數。
+    hard_negative_ratio: 8
     positive_ratio: 1.0
+
+    # Auxiliary regression 每個 GT 重複匹配 2 次。
     max_positive_per_gt: 2
+
     aux_positive_label: 0.7
     expand_cost_bbox: 5.0
     expand_cost_giou: 2.0
 
   quality:
-    iou_pos_thr: 0.10
+    # Auxiliary extra match 的最低 IoU。
+    iou_pos_thr: 0.1
+
+    # quality_min 在目前 loss.py 中尚未真正套用，
+    # 保留此值供後續程式修正。
     quality_min: 0.15
     quality_max: 1.0
+
     qfl_beta: 2.0
     quality_warmup_epoch: 10
-    score_match_rounds: 1
-    score_quality_gamma: 1.0
-    score_round_decay: 0.25
-    score_min_iou: 0.05
 
-    # 動態 score-negative ignore threshold。
-    # Epoch 1~5 固定 0.50；Epoch 5~25 以 cosine 降至 0.45；
-    # Epoch 25 後固定 0.45。
-    score_negative_iou_ignore_start: 0.10
-    score_negative_iou_ignore_end: 0.5
-    score_negative_iou_ignore_start_epoch: 5
-    score_negative_iou_ignore_end_epoch: 50
-    score_negative_iou_ignore_schedule: cosine
+    # Main score 每個 GT 最多建立兩輪正樣本。
+    score_match_rounds: 2
+    score_quality_gamma: 1.5
+    score_round_decay: 0.30
+    score_min_iou: 0.30
 
+    # Auxiliary 分支只做 bbox/GIoU，不學 score。
     aux_score_enabled: false
+
+    # 保護具有一定定位品質但未被 score assigner 選中的框。
+    score_negative_iou_ignore_start: 0.30
+    score_negative_iou_ignore_end: 0.50
+    score_negative_iou_ignore_start_epoch: 1
+    score_negative_iou_ignore_end_epoch: 25
+    score_negative_iou_ignore_schedule: cosine
 
   ranking:
     enabled: true
-    lambda_rank: 0.03
-    rank_margin: 0.10
+
+    # 完成 warmup 後，預期約占總 loss 8%～12%。
+    lambda_rank: 0.25
+
+    # 要求高品質框的 logit 至少比低品質框高 0.15。
+    rank_margin: 0.15
+
+    # 只有品質差距至少 0.15 的 pair 才參與排序。
     rank_min_quality_gap: 0.15
+
+    # 增加 pair 數，降低少數極端 hardest pair 主導梯度。
     rank_max_pairs: 512
 
-    rank_start_epoch: 3
-    rank_warmup_epoch: 50
-    rank_alpha_min: 0.02
+    # 先讓 bbox 定位穩定，再開始排序。
+    rank_start_epoch: 5
 
-    
+    # Epoch 5 起啟動，約 Epoch 17 達到完整權重。
+    rank_warmup_epoch: 12
+    rank_alpha_min: 0.10
+
+    # 只有 IoU <= 0.20 的未匹配框可作為明確 ranking negative。
     rank_negative_iou_max: 0.20
 
   text_negative:
-    max_query_loss_weight: 2.0
+    # Text-negative query 最多放大四倍。
+    max_query_loss_weight: 4.0
+
+    # 保持原權重；目前已能有效壓低錯誤文字 query 分數。
     lambda_text_negative: 0.50
     text_negative_topk: 20
     text_negative_hard_mix: 0.50
@@ -123,18 +147,21 @@ loss:
   weight:
     dynamic: true
 
+    # BBox L1 維持主要定位監督，但後期稍微下降。
     bbox_start: 5.0
     bbox_end: 4.5
     bbox_decay_until: 0.5
 
     giou: 2.0
 
+    # QFL 採中等權重，負責 score calibration，
+    # 不再單獨承擔候選框排序。
     score_start: 1.5
     score_end: 2.0
     score_warm_until: 0.5
 
   pos_weight:
-    value: 2.0
+    value: 1.5
 
 
 eval:
@@ -142,6 +169,7 @@ eval:
   eval_interval: 1
   max_val_batches: null
 
+  # AP 計算保留低 threshold，避免過早截斷 prediction。
   score_thr: 0.001
   top_k: 20
 
@@ -160,7 +188,8 @@ eval:
 
 
 log:
-  save_dir: runs/train/lightdet_HDETR_textaware_dynamic
+  # 使用新的目錄，避免與舊實驗的 JSONL 紀錄混合。
+  save_dir: runs/train/lightdet_qfl_medium_rank10_seed50
   resume_path: null
 
   save_latest_interval: 1
