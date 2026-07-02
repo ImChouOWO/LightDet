@@ -111,17 +111,12 @@ loss:
     rank_warmup_epoch: 50
     rank_alpha_min: 0.02
 
-    # 只有 max IoU <= 0.20 的候選可作為 ranking negative。
+    
     rank_negative_iou_max: 0.20
 
   text_negative:
-    # query_loss_weights 的上限；獨立負文字 loss 已另外加權，因此降為 2。
     max_query_loss_weight: 2.0
-
-    # 對負文字 query 的全部 100 個 score 施加 target=0 QFL。
     lambda_text_negative: 0.50
-
-    # 同時強化最難壓低的 Top-20 prediction。
     text_negative_topk: 20
     text_negative_hard_mix: 0.50
 
@@ -148,8 +143,6 @@ eval:
   max_val_batches: null
 
   score_thr: 0.001
-
-  # 100 會保留所有 prediction，無法觀察 score 排序與負文字抑制。
   top_k: 20
 
   nms_iou_thr: 0.5
