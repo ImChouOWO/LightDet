@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# LightDet optimized train.py v6: EMA + QFL + scheduled ranking + Raw Oracle Recall
+# LightDet optimized train.py v7: DETR-native IA-BCE + scheduled score-aware Hungarian matching
 
 from collections import defaultdict
 from types import SimpleNamespace
@@ -42,7 +42,10 @@ from units.model.pipeline.data import (
     build_dataloaders,
     grounding_collate_fn,
 )
-from units.model.cards.loss import GroundingLoss
+from units.model.cards.loss import (
+    GroundingLoss,
+    build_grounding_loss_from_config,
+)
 
 
 # 此資料集的每批資料包含多個 query target。file_descriptor 會為每個
@@ -418,6 +421,66 @@ def forward_model_batch(
     )
 
 
+
+def build_text_conditioning_probe(
+    query_texts: Sequence[str],
+    text_negative_mask: Optional[torch.Tensor],
+) -> Tuple[Optional[List[str]], List[int], str]:
+    """
+    Build a second text ordering while keeping every image tensor and
+    image_indices entry unchanged.
+
+    Priority is given to swapping one positive and one negative description,
+    because this directly checks that positive/negative wording can alter the
+    predicted localization. If such a pair is unavailable, use the rotation
+    that changes the largest number of query strings.
+    """
+    texts = [str(value) for value in query_texts]
+    count = len(texts)
+    if count < 2 or len(set(texts)) < 2:
+        return None, [], "insufficient_distinct_texts"
+
+    if text_negative_mask is not None:
+        if not torch.is_tensor(text_negative_mask):
+            mask = torch.as_tensor(text_negative_mask, dtype=torch.bool)
+        else:
+            mask = text_negative_mask.detach().to(device="cpu", dtype=torch.bool)
+        mask = mask.reshape(-1)
+        if mask.numel() == count:
+            negative_indices = torch.nonzero(mask, as_tuple=False).flatten().tolist()
+            positive_indices = torch.nonzero(~mask, as_tuple=False).flatten().tolist()
+            for positive_index in positive_indices:
+                for negative_index in negative_indices:
+                    if texts[positive_index] == texts[negative_index]:
+                        continue
+                    permuted = list(texts)
+                    permuted[positive_index], permuted[negative_index] = (
+                        permuted[negative_index],
+                        permuted[positive_index],
+                    )
+                    return (
+                        permuted,
+                        [positive_index, negative_index],
+                        "positive_negative_swap",
+                    )
+
+    best_permuted: Optional[List[str]] = None
+    best_changed: List[int] = []
+    for shift in range(1, count):
+        candidate = texts[shift:] + texts[:shift]
+        changed = [
+            index
+            for index, (source, target) in enumerate(zip(texts, candidate))
+            if source != target
+        ]
+        if len(changed) > len(best_changed):
+            best_permuted = candidate
+            best_changed = changed
+
+    if not best_changed:
+        return None, [], "no_changed_rows"
+    return best_permuted, best_changed, "text_rotation"
+
 def run_startup_smoke_test(
     model: torch.nn.Module,
     criterion: Any,
@@ -513,14 +576,14 @@ def run_startup_smoke_test(
                         "bbox and score outputs."
                     )
 
-                loss, _ = criterion(
+                loss, loss_dict = criterion(
                     pred_bbox=pred_bbox,
                     pred_score_logit=pred_score_logit,
                     targets=targets,
                     lambda_bbox=lambda_bbox,
                     lambda_giou=lambda_giou,
                     lambda_score=lambda_score,
-                    lambda_rank=args.lambda_rank,
+                    lambda_rank=0.0,
                     pos_weight=float(args.pos_weight),
                     current_epoch=1,
                     quality_warmup_epoch=args.quality_warmup_epoch,
@@ -532,6 +595,65 @@ def run_startup_smoke_test(
                     aux_pred_bbox=aux_pred_bbox,
                     aux_pred_score_logit=aux_pred_score_logit,
                 )
+
+                negative_text_matches = int(
+                    float(loss_dict.get(
+                        "negative_text_regression_matches",
+                        0.0,
+                    ))
+                )
+                if negative_text_matches != 0:
+                    raise RuntimeError(
+                        "Negative-text descriptions received bbox/GIoU "
+                        "matches. DETR empty-target supervision is broken."
+                    )
+
+                (
+                    probe_texts,
+                    probe_changed_rows,
+                    probe_mode,
+                ) = build_text_conditioning_probe(
+                    query_texts=query_texts,
+                    text_negative_mask=batch.get("text_negative_mask"),
+                )
+
+                localization_text_delta = None
+                score_text_delta = None
+                if probe_texts is not None and probe_changed_rows:
+                    probe_outputs = forward_model_batch(
+                        model=model,
+                        images=images,
+                        query_texts=probe_texts,
+                        image_indices=image_indices,
+                        return_aux=False,
+                    )
+                    probe_bbox = probe_outputs["bbox"]
+                    probe_score_logit = get_score_logit(probe_outputs)
+                    changed_index = torch.as_tensor(
+                        probe_changed_rows,
+                        device=pred_bbox.device,
+                        dtype=torch.long,
+                    )
+                    localization_text_delta = (
+                        pred_bbox.index_select(0, changed_index).float()
+                        - probe_bbox.index_select(0, changed_index).float()
+                    ).abs().mean()
+                    score_text_delta = (
+                        pred_score_logit.index_select(0, changed_index).float()
+                        - probe_score_logit.index_select(0, changed_index).float()
+                    ).abs().mean()
+
+                    if not bool(torch.isfinite(localization_text_delta).item()):
+                        raise FloatingPointError(
+                            "Text-conditioning bbox probe produced NaN/Inf"
+                        )
+                    if float(localization_text_delta.item()) <= 1e-8:
+                        raise RuntimeError(
+                            "Changing only the text description did not change "
+                            "pred_bbox. The bbox path is not text-conditioned, "
+                            "so positive/negative text cannot influence "
+                            "localization."
+                        )
 
         expected_queries = len(query_texts)
         if pred_bbox.shape[0] != expected_queries:
@@ -579,7 +701,12 @@ def run_startup_smoke_test(
             f"score={tuple(pred_score_logit.shape)}, "
             f"aux_bbox={tuple(aux_pred_bbox.shape)}, "
             f"aux_score={tuple(aux_pred_score_logit.shape)}, "
-            f"loss={loss.item():.6f}"
+            f"loss={loss.item():.6f}, "
+            f"class={loss_dict.get('classification_type', 'unknown')}, "
+            f"matcher_alpha={float(loss_dict.get('matcher_score_alpha', 0.0)):.4f}, "
+            f"text_probe={probe_mode}, "
+            f"bbox_text_delta="
+            f"{'skip' if localization_text_delta is None else f'{float(localization_text_delta.item()):.8e}'}"
         )
     finally:
         model.train(was_training)
@@ -1268,7 +1395,7 @@ def train_one_epoch(
     lambda_bbox: float = 5.0,
     lambda_giou: float = 2.0,
     lambda_score: float = 1.0,
-    lambda_rank: float = 0.10,
+    lambda_rank: float = 0.0,
     pos_weight: float = 1.0,
     quality_warmup_epoch: int = 20,
     rank_start_epoch: int = 15,
@@ -1394,7 +1521,7 @@ def train_one_epoch(
                 lambda_bbox=lambda_bbox,
                 lambda_giou=lambda_giou,
                 lambda_score=lambda_score,
-                lambda_rank=lambda_rank,
+                lambda_rank=0.0,
                 pos_weight=pos_weight,
                 current_epoch=epoch,
                 quality_warmup_epoch=quality_warmup_epoch,
@@ -1536,12 +1663,23 @@ def train_one_epoch(
                 loss_dict.get("lambda_rank_eff", 0.0)
             )
             quality_alpha_item = float(loss_dict.get("quality_alpha", 1.0))
-            score_ignore_thr_item = float(
-                loss_dict.get(
-                    "score_negative_iou_ignore_thr",
-                    0.0,
-                )
+            score_ignore_thr_item = 0.0
+            matcher_score_alpha_item = float(
+                loss_dict.get("matcher_score_alpha", rank_alpha_item)
             )
+            matcher_score_cost_item = float(
+                loss_dict.get("matcher_cost_score_effective", 0.0)
+            )
+            negative_text_match_item = int(
+                float(loss_dict.get(
+                    "negative_text_regression_matches",
+                    0.0,
+                ))
+            )
+            if negative_text_match_item != 0:
+                raise RuntimeError(
+                    "Negative-text sample received a regression match."
+                )
 
             score_target_pos_mean = loss_dict.get(
                 "score_target_pos_mean",
@@ -1564,14 +1702,12 @@ def train_one_epoch(
                 "bbox": f"{bbox_item:.4f}",
                 "giou": f"{giou_item:.4f}",
                 "score": f"{score_item:.4f}",
-                "rank": f"{rank_contrib_item:.4f}",
-                "raw": f"{rank_raw_item:.4f}",
-                "ra": f"{rank_alpha_item:.4f}",
-                "lrk": f"{lambda_rank_eff_item:.4f}",
+                "msa": f"{matcher_score_alpha_item:.4f}",
+                "msc": f"{matcher_score_cost_item:.4f}",
                 "txtneg": f"{text_negative_item:.4f}",
                 "tnc": f"{text_negative_contrib_item:.4f}",
                 "pm": f"{query_score_margin_item:.3f}",
-                "sniou": f"{score_ignore_thr_item:.3f}",
+                "ntm": negative_text_match_item,
                 "nq": text_negative_queries,
             })
 
@@ -1617,8 +1753,29 @@ def train_one_epoch(
                     "quality_alpha": quality_alpha_item,
                     "rank_alpha": rank_alpha_item,
                     "rank_alpha_min": float(rank_alpha_min),
-                    "score_negative_iou_ignore_thr": (
-                        score_ignore_thr_item
+                    "score_negative_iou_ignore_thr": 0.0,
+                    "matcher_score_alpha": matcher_score_alpha_item,
+                    "matcher_cost_score_effective": (
+                        matcher_score_cost_item
+                    ),
+                    "negative_text_regression_matches": (
+                        negative_text_match_item
+                    ),
+                    "classification_type": loss_dict.get(
+                        "classification_type",
+                        "unknown",
+                    ),
+                    "dense_score_assignment_enabled": bool(
+                        loss_dict.get(
+                            "dense_score_assignment_enabled",
+                            False,
+                        )
+                    ),
+                    "hard_negative_mining_enabled": bool(
+                        loss_dict.get(
+                            "hard_negative_mining_enabled",
+                            False,
+                        )
                     ),
                     "score_target_pos_mean": score_target_pos_mean,
                 })
@@ -1650,9 +1807,27 @@ def train_one_epoch(
             (total_text_negative_contrib_sum / num_batches).item()
         ),
         "train_text_negative_queries": int(total_text_negative_queries),
-        "score_negative_iou_ignore_thr": float(
-            criterion.resolve_score_negative_iou_ignore_thr(epoch)
+        "score_negative_iou_ignore_thr": 0.0,
+        "matcher_score_alpha": float(
+            criterion.resolve_epoch_alpha(
+                current_epoch=epoch,
+                quality_warmup_epoch=quality_warmup_epoch,
+                rank_start_epoch=rank_start_epoch,
+                rank_warmup_epoch=rank_warmup_epoch,
+                rank_alpha_min=rank_alpha_min,
+            )[1]
         ),
+        "matcher_cost_score_effective": float(
+            criterion.main_matcher.cost_score
+            * criterion.resolve_epoch_alpha(
+                current_epoch=epoch,
+                quality_warmup_epoch=quality_warmup_epoch,
+                rank_start_epoch=rank_start_epoch,
+                rank_warmup_epoch=rank_warmup_epoch,
+                rank_alpha_min=rank_alpha_min,
+            )[1]
+        ),
+        "train_negative_text_regression_matches": 0,
     }
 
 
@@ -2190,7 +2365,7 @@ def validate_one_epoch(
     lambda_bbox: float = 5.0,
     lambda_giou: float = 2.0,
     lambda_score: float = 1.0,
-    lambda_rank: float = 0.10,
+    lambda_rank: float = 0.0,
     pos_weight: float = 1.0,
     quality_warmup_epoch: int = 20,
     rank_start_epoch: int = 15,
@@ -2318,7 +2493,7 @@ def validate_one_epoch(
                     lambda_bbox=lambda_bbox,
                     lambda_giou=lambda_giou,
                     lambda_score=lambda_score,
-                    lambda_rank=lambda_rank,
+                    lambda_rank=0.0,
                     pos_weight=pos_weight,
                     current_epoch=epoch,
                     quality_warmup_epoch=quality_warmup_epoch,
@@ -2466,8 +2641,25 @@ def validate_one_epoch(
                 (total_text_negative_contrib_sum / denominator).item()
             ),
             "val_text_negative_queries": int(total_text_negative_queries),
-            "val_score_negative_iou_ignore_thr": float(
-                criterion.resolve_score_negative_iou_ignore_thr(epoch)
+            "val_score_negative_iou_ignore_thr": 0.0,
+            "val_matcher_score_alpha": float(
+                criterion.resolve_epoch_alpha(
+                    current_epoch=epoch,
+                    quality_warmup_epoch=quality_warmup_epoch,
+                    rank_start_epoch=rank_start_epoch,
+                    rank_warmup_epoch=rank_warmup_epoch,
+                    rank_alpha_min=rank_alpha_min,
+                )[1]
+            ),
+            "val_matcher_cost_score_effective": float(
+                criterion.main_matcher.cost_score
+                * criterion.resolve_epoch_alpha(
+                    current_epoch=epoch,
+                    quality_warmup_epoch=quality_warmup_epoch,
+                    rank_start_epoch=rank_start_epoch,
+                    rank_warmup_epoch=rank_warmup_epoch,
+                    rank_alpha_min=rank_alpha_min,
+                )[1]
             ),
         }
 
@@ -3430,86 +3622,51 @@ def train(args: SimpleNamespace) -> None:
             ),
         )
 
-    criterion = GroundingLoss(
-        cost_bbox=args.cost_bbox,
-        cost_giou=args.cost_giou,
-        cost_score=args.cost_score,
-        hard_negative_ratio=args.hard_negative_ratio,
-        positive_ratio=args.positive_ratio,
-        max_positive_per_gt=args.max_positive_per_gt,
-        aux_positive_label=args.aux_positive_label,
-        expand_cost_bbox=args.expand_cost_bbox,
-        expand_cost_giou=args.expand_cost_giou,
-        iou_pos_thr=args.iou_pos_thr,
-        quality_min=args.quality_min,
-        quality_max=args.quality_max,
-        qfl_beta=args.qfl_beta,
-        rank_margin=args.rank_margin,
-        rank_min_quality_gap=args.rank_min_quality_gap,
-        rank_max_pairs=args.rank_max_pairs,
-        max_query_loss_weight=args.max_query_loss_weight,
+    # Build once from the complete YAML so every DETR-native parameter is
+    # imported. The module remains units.model.cards.loss (loss.py).
+    criterion = build_grounding_loss_from_config(
+        args.train_cfg
+    ).to(device)
 
-        # Do not treat high-IoU unmatched candidates as ordinary negatives.
-        score_negative_iou_ignore_start=(
-            args.score_negative_iou_ignore_start
-        ),
-        score_negative_iou_ignore_end=(
-            args.score_negative_iou_ignore_end
-        ),
-        score_negative_iou_ignore_start_epoch=(
-            args.score_negative_iou_ignore_start_epoch
-        ),
-        score_negative_iou_ignore_end_epoch=(
-            args.score_negative_iou_ignore_end_epoch
-        ),
-        score_negative_iou_ignore_schedule=(
-            args.score_negative_iou_ignore_schedule
-        ),
-        rank_negative_iou_max=args.rank_negative_iou_max,
-
-        # Explicit all-prediction suppression for negative text queries.
-        text_negative_loss_weight=args.lambda_text_negative,
-        text_negative_topk=args.text_negative_topk,
-        text_negative_hard_mix=args.text_negative_hard_mix,
-
-        aux_loss_weight=args.aux_loss_weight,
-        aux_cost_score=args.aux_cost_score,
-
-        # Main score remains independent from the regression matcher.
-        score_match_rounds=args.score_match_rounds,
-        score_quality_gamma=args.score_quality_gamma,
-        score_round_decay=args.score_round_decay,
-        score_min_iou=args.score_min_iou,
-
-        # Explicit switch. Without this argument, the new loss defaults to
-        # False and rank/raw/ra/lrk remain zero for the entire run.
-        enable_pairwise_ranking=args.ranking_enabled,
-
-        # Aux one-to-many branch only supplies bbox/GIoU supervision by default.
-        aux_score_enabled=args.aux_score_enabled,
-    )
-
-    if (
-        bool(getattr(criterion, "enable_pairwise_ranking", False))
-        != bool(args.ranking_enabled)
-    ):
+    expected_classification = str(args.classification_type).strip().lower()
+    if criterion.classification_type != expected_classification:
         raise RuntimeError(
-            "GroundingLoss ranking configuration mismatch: "
-            f"requested={args.ranking_enabled}, "
-            f"effective={getattr(criterion, 'enable_pairwise_ranking', None)}"
+            "GroundingLoss classification configuration mismatch: "
+            f"requested={expected_classification}, "
+            f"effective={criterion.classification_type}"
         )
 
-    if (
-        abs(
-            float(getattr(criterion, "text_negative_loss_weight", -1.0))
-            - float(args.lambda_text_negative)
+    if abs(float(criterion.main_matcher.cost_score) - float(args.cost_score)) > 1e-12:
+        raise RuntimeError(
+            "GroundingLoss matcher score-cost mismatch: "
+            f"requested={args.cost_score}, "
+            f"effective={criterion.main_matcher.cost_score}"
         )
-        > 1e-12
+    if float(criterion.main_matcher.cost_score) <= 0.0:
+        raise ValueError(
+            "loss.matcher.cost_score must be > 0 for text-aware DETR "
+            "matching. Use the official-style value 2.0."
+        )
+
+    if bool(criterion.negative_text_as_empty_target) != bool(
+        args.negative_text_as_empty_target
     ):
         raise RuntimeError(
-            "GroundingLoss text-negative configuration mismatch: "
-            f"requested={args.lambda_text_negative}, "
-            f"effective={getattr(criterion, 'text_negative_loss_weight', None)}"
+            "GroundingLoss negative-text policy mismatch: "
+            f"requested={args.negative_text_as_empty_target}, "
+            f"effective={criterion.negative_text_as_empty_target}"
+        )
+    if not bool(criterion.negative_text_as_empty_target):
+        raise ValueError(
+            "loss.text_negative.as_empty_target must be true so negative "
+            "descriptions cannot receive bbox/GIoU positive supervision."
+        )
+
+    if args.ranking_enabled or abs(float(args.lambda_rank)) > 1e-12:
+        print(
+            "[Warning] Explicit dense pairwise ranking is disabled by the "
+            "DETR-native loss. ranking.enabled/lambda_rank are ignored; "
+            "the preserved schedule controls score-aware Hungarian matching."
         )
 
     if args.startup_smoke_test:
@@ -3660,33 +3817,33 @@ def train(args: SimpleNamespace) -> None:
         f"aux_eval={args.auxiliary_in_eval}"
     )
     print(
-        f"[Info] Score assignment: independent IoU one-to-one, "
-        f"rounds={args.score_match_rounds}, "
-        f"gamma={args.score_quality_gamma:.3f}, "
-        f"min_iou={args.score_min_iou:.3f}, "
-        f"aux_score={args.aux_score_enabled}"
+        f"[Info] DETR classification: type={args.classification_type}, "
+        f"ia_alpha={args.ia_bce_alpha:.3f}, "
+        f"focal_alpha={args.classification_focal_alpha:.3f}, "
+        f"focal_gamma={args.classification_focal_gamma:.3f}, "
+        f"normalize_by_num_gt={args.normalize_classification_by_num_gt}"
+    )
+    print(
+        f"[Info] Hungarian matcher: score:bbox:giou="
+        f"{args.cost_score:.2f}:{args.cost_bbox:.2f}:{args.cost_giou:.2f}, "
+        f"score_cost={args.matcher_score_cost_type}"
+    )
+    print(
+        f"[Info] Matcher score schedule: start_epoch="
+        f"{args.rank_start_epoch}, warmup_epochs={args.rank_warmup_epoch}, "
+        f"alpha_min={args.rank_alpha_min:.4f}"
     )
     print(
         "[Info] Text negative: "
+        f"as_empty_target={args.negative_text_as_empty_target}, "
         f"lambda={args.lambda_text_negative:.4f}, "
         f"topk={args.text_negative_topk}, "
         f"hard_mix={args.text_negative_hard_mix:.3f}"
     )
     print(
-        "[Info] Score negative filtering: "
-        f"qfl_ignore_iou={args.score_negative_iou_ignore_start:.3f}"
-        f"->{args.score_negative_iou_ignore_end:.3f}, "
-        f"epochs={args.score_negative_iou_ignore_start_epoch}"
-        f"->{args.score_negative_iou_ignore_end_epoch}, "
-        f"schedule={args.score_negative_iou_ignore_schedule}, "
-        f"rank_negative_iou<={args.rank_negative_iou_max:.3f}"
-    )
-    print(
-        f"[Info] Ranking: enabled={args.ranking_enabled}, "
-        f"lambda_max={args.lambda_rank:.4f}, "
-        f"start_epoch={args.rank_start_epoch}, "
-        f"warmup_epochs={args.rank_warmup_epoch}, "
-        f"alpha_min={args.rank_alpha_min:.4f}"
+        "[Info] Removed dense objectives: "
+        "independent_score_assigner=False, hard_negative_mining=False, "
+        "pairwise_ranking=False"
     )
 
     if args.resume_path is not None:
@@ -3785,7 +3942,7 @@ def train(args: SimpleNamespace) -> None:
             lambda_bbox=lambda_bbox,
             lambda_giou=lambda_giou,
             lambda_score=lambda_score,
-            lambda_rank=args.lambda_rank,
+            lambda_rank=0.0,
             pos_weight=pos_weight,
             quality_warmup_epoch=args.quality_warmup_epoch,
             rank_start_epoch=args.rank_start_epoch,
@@ -3824,7 +3981,7 @@ def train(args: SimpleNamespace) -> None:
             lambda_bbox=lambda_bbox,
             lambda_giou=lambda_giou,
             lambda_score=lambda_score,
-            lambda_rank=args.lambda_rank,
+            lambda_rank=0.0,
             pos_weight=pos_weight,
             quality_warmup_epoch=args.quality_warmup_epoch,
             rank_start_epoch=args.rank_start_epoch,
@@ -3850,19 +4007,28 @@ def train(args: SimpleNamespace) -> None:
             "lambda_bbox": lambda_bbox,
             "lambda_giou": lambda_giou,
             "lambda_score": lambda_score,
-            "ranking_enabled": bool(args.ranking_enabled),
-            "lambda_rank_max": float(args.lambda_rank),
+            "classification_type": args.classification_type,
+            "ia_bce_alpha": float(args.ia_bce_alpha),
+            "classification_focal_alpha": float(
+                args.classification_focal_alpha
+            ),
+            "classification_focal_gamma": float(
+                args.classification_focal_gamma
+            ),
+            "normalize_classification_by_num_gt": bool(
+                args.normalize_classification_by_num_gt
+            ),
+            "dense_score_assignment_enabled": False,
+            "hard_negative_mining_enabled": False,
+            "pairwise_ranking_enabled": False,
+            "lambda_rank_max": 0.0,
             "lambda_aux": float(args.aux_loss_weight),
-            "pos_weight": pos_weight,
+            "pos_weight": 1.0,
             "quality_warmup_epoch": int(args.quality_warmup_epoch),
-            "score_match_rounds": int(args.score_match_rounds),
-            "score_quality_gamma": float(args.score_quality_gamma),
-            "score_round_decay": float(args.score_round_decay),
-            "score_min_iou": float(args.score_min_iou),
             "aux_score_enabled": bool(args.aux_score_enabled),
-            "rank_start_epoch": int(args.rank_start_epoch),
-            "rank_warmup_epoch": int(args.rank_warmup_epoch),
-            "rank_alpha_min": float(args.rank_alpha_min),
+            "matcher_score_start_epoch": int(args.rank_start_epoch),
+            "matcher_score_warmup_epoch": int(args.rank_warmup_epoch),
+            "matcher_score_alpha_min": float(args.rank_alpha_min),
             "negative_sample_ratio": float(args.negative_sample_ratio),
             "max_query_loss_weight": float(args.max_query_loss_weight),
             "lambda_text_negative": float(args.lambda_text_negative),
@@ -3870,26 +4036,28 @@ def train(args: SimpleNamespace) -> None:
             "text_negative_hard_mix": float(
                 args.text_negative_hard_mix
             ),
-            "score_negative_iou_ignore_thr": float(
-                criterion.resolve_score_negative_iou_ignore_thr(epoch)
+            "score_negative_iou_ignore_thr": 0.0,
+            "matcher_score_alpha": float(
+                criterion.resolve_epoch_alpha(
+                    current_epoch=epoch,
+                    quality_warmup_epoch=args.quality_warmup_epoch,
+                    rank_start_epoch=args.rank_start_epoch,
+                    rank_warmup_epoch=args.rank_warmup_epoch,
+                    rank_alpha_min=args.rank_alpha_min,
+                )[1]
             ),
-            "score_negative_iou_ignore_start": float(
-                args.score_negative_iou_ignore_start
+            "matcher_cost_score_effective": float(
+                criterion.main_matcher.cost_score
+                * criterion.resolve_epoch_alpha(
+                    current_epoch=epoch,
+                    quality_warmup_epoch=args.quality_warmup_epoch,
+                    rank_start_epoch=args.rank_start_epoch,
+                    rank_warmup_epoch=args.rank_warmup_epoch,
+                    rank_alpha_min=args.rank_alpha_min,
+                )[1]
             ),
-            "score_negative_iou_ignore_end": float(
-                args.score_negative_iou_ignore_end
-            ),
-            "score_negative_iou_ignore_start_epoch": int(
-                args.score_negative_iou_ignore_start_epoch
-            ),
-            "score_negative_iou_ignore_end_epoch": int(
-                args.score_negative_iou_ignore_end_epoch
-            ),
-            "score_negative_iou_ignore_schedule": (
-                args.score_negative_iou_ignore_schedule
-            ),
-            "rank_negative_iou_max": float(
-                args.rank_negative_iou_max
+            "negative_text_as_empty_target": bool(
+                args.negative_text_as_empty_target
             ),
             "use_negative_queries_in_val": bool(
                 args.use_negative_queries_in_val
@@ -4009,7 +4177,8 @@ def train(args: SimpleNamespace) -> None:
             f"lb={lambda_bbox:.2f} "
             f"lg={lambda_giou:.2f} "
             f"ls={lambda_score:.2f} "
-            f"lrk_max={args.lambda_rank:.2f} "
+            f"matcher_alpha="
+            f"{dynamic_config.get('matcher_score_alpha', 0.0):.2f} "
             f"pw={pos_weight:.2f} "
             f"epoch_time={epoch_time:.2f}s"
         )
@@ -4100,62 +4269,61 @@ DEFAULT_TRAIN_CFG = {
     },
     "loss": {
         "hybrid": {
-            "aux_loss_weight": 0.5,
+            "aux_loss_weight": 0.28,
             "aux_cost_score": 0.0,
         },
         "matcher": {
             "cost_bbox": 5.0,
             "cost_giou": 2.0,
-            "cost_score": 0.0,
+            "cost_score": 2.0,
+            "score_cost_type": "focal",
+            "focal_alpha": 0.25,
+            "focal_gamma": 2.0,
+        },
+        "matcher_schedule": {
+            # Preserves the previous ranking schedule, but now controls how
+            # strongly text-aware score participates in Hungarian matching.
+            "start_epoch": 5,
+            "warmup_epoch": 12,
+            "alpha_min": 0.10,
         },
         "score_sampling": {
-            "hard_negative_ratio": 5,
-            "positive_ratio": 0.05,
+            # Only the H-DETR auxiliary repeated-GT matcher uses these fields.
+            "positive_ratio": 1.0,
             "max_positive_per_gt": 2,
             "aux_positive_label": 0.7,
             "expand_cost_bbox": 5.0,
             "expand_cost_giou": 2.0,
         },
         "quality": {
-            "iou_pos_thr": 0.15,
-            "quality_min": 0.25,
+            "iou_pos_thr": 0.10,
+            "quality_min": 0.10,
             "quality_max": 1.0,
-            "qfl_beta": 2.0,
-            "quality_warmup_epoch": 20,
-
-            # Independent Main score assignment.
-            "score_match_rounds": 1,
-            "score_quality_gamma": 1.0,
-            "score_round_decay": 0.25,
-            "score_min_iou": 0.0,
-
-            # Dynamic score-negative ignore threshold. Lower values ignore
-            # more medium/high-IoU unmatched candidates.
-            "score_negative_iou_ignore_start": 0.50,
-            "score_negative_iou_ignore_end": 0.45,
-            "score_negative_iou_ignore_start_epoch": 5,
-            "score_negative_iou_ignore_end_epoch": 25,
-            "score_negative_iou_ignore_schedule": "cosine",
-
-            # Aux remains a localization-only one-to-many branch.
+            "quality_warmup_epoch": 10,
             "aux_score_enabled": False,
         },
-        "ranking": {
-            "enabled": False,
-            "lambda_rank": 0.10,
-            "rank_margin": 0.1,
-            "rank_min_quality_gap": 0.1,
-            "rank_max_pairs": 512,
-            "rank_start_epoch": 15,
-            "rank_warmup_epoch": 30,
-            "rank_alpha_min": 0.0,
-            "rank_negative_iou_max": 0.20,
+        "classification": {
+            "type": "ia_bce",
+            "ia_bce_alpha": 0.25,
+            "focal_alpha": 0.25,
+            "focal_gamma": 2.0,
+            "normalize_by_num_gt": True,
         },
         "text_negative": {
-            "max_query_loss_weight": 10.0,
-            "lambda_text_negative": 0.50,
+            "as_empty_target": True,
+            "max_query_loss_weight": 4.0,
+            "lambda_text_negative": 0.20,
             "text_negative_topk": 20,
             "text_negative_hard_mix": 0.50,
+        },
+        "ranking": {
+            # Explicit dense pairwise ranking has been removed.
+            "enabled": False,
+            "lambda_rank": 0.0,
+            # Backward-compatible aliases for older YAML readers.
+            "rank_start_epoch": 5,
+            "rank_warmup_epoch": 12,
+            "rank_alpha_min": 0.10,
         },
         "weight": {
             "dynamic": True,
@@ -4163,13 +4331,14 @@ DEFAULT_TRAIN_CFG = {
             "giou": 2.0,
             "score": 2.0,
             "bbox_start": 5.0,
-            "bbox_end": 3.0,
+            "bbox_end": 4.5,
             "bbox_decay_until": 0.5,
             "score_start": 2.0,
-            "score_end": 4.0,
-            "score_warm_until": 0.4,
+            "score_end": 2.0,
+            "score_warm_until": 0.5,
         },
         "pos_weight": {
+            # Retained only for forward compatibility.
             "value": 1.0,
         },
     },
@@ -4287,6 +4456,8 @@ def cfg_to_args(
     score_sampling_cfg = loss_cfg.get("score_sampling", {})
     quality_cfg = loss_cfg.get("quality", {})
     ranking_cfg = loss_cfg.get("ranking", {})
+    classification_cfg = loss_cfg.get("classification", {})
+    matcher_schedule_cfg = loss_cfg.get("matcher_schedule", {})
     text_negative_cfg = loss_cfg.get("text_negative", {})
 
     # Backward compatibility: an old fixed threshold becomes a constant
@@ -4425,7 +4596,16 @@ def cfg_to_args(
         # matcher
         cost_bbox=matcher_cfg.get("cost_bbox", 5.0),
         cost_giou=matcher_cfg.get("cost_giou", 2.0),
-        cost_score=matcher_cfg.get("cost_score", 1.0),
+        cost_score=float(matcher_cfg.get("cost_score", 2.0)),
+        matcher_score_cost_type=str(
+            matcher_cfg.get("score_cost_type", "focal")
+        ),
+        matcher_focal_alpha=float(
+            matcher_cfg.get("focal_alpha", 0.25)
+        ),
+        matcher_focal_gamma=float(
+            matcher_cfg.get("focal_gamma", 2.0)
+        ),
 
         # score sampling
         hard_negative_ratio=score_sampling_cfg.get("hard_negative_ratio", 5),
@@ -4453,9 +4633,29 @@ def cfg_to_args(
         quality_min=quality_cfg.get("quality_min", 0.25),
         quality_max=quality_cfg.get("quality_max", 1.0),
         qfl_beta=quality_cfg.get("qfl_beta", 2.0),
-        quality_warmup_epoch=quality_cfg.get("quality_warmup_epoch", 20),
+        quality_warmup_epoch=quality_cfg.get("quality_warmup_epoch", 10),
 
-        # Independent Main score assignment.
+        # DETR-native matched-query classification.
+        classification_type=str(
+            classification_cfg.get("type", "ia_bce")
+        ).strip().lower(),
+        ia_bce_alpha=float(
+            classification_cfg.get("ia_bce_alpha", 0.25)
+        ),
+        classification_focal_alpha=float(
+            classification_cfg.get("focal_alpha", 0.25)
+        ),
+        classification_focal_gamma=float(
+            classification_cfg.get("focal_gamma", 2.0)
+        ),
+        normalize_classification_by_num_gt=bool(
+            classification_cfg.get("normalize_by_num_gt", True)
+        ),
+        negative_text_as_empty_target=bool(
+            text_negative_cfg.get("as_empty_target", True)
+        ),
+
+        # Legacy dense-score fields are retained only for old YAML parsing.
         score_match_rounds=int(
             quality_cfg.get("score_match_rounds", 1)
         ),
@@ -4491,9 +4691,24 @@ def cfg_to_args(
         rank_margin=ranking_cfg.get("rank_margin", 0.1),
         rank_min_quality_gap=ranking_cfg.get("rank_min_quality_gap", 0.1),
         rank_max_pairs=ranking_cfg.get("rank_max_pairs", 512),
-        rank_start_epoch=ranking_cfg.get("rank_start_epoch", 15),
-        rank_warmup_epoch=ranking_cfg.get("rank_warmup_epoch", 30),
-        rank_alpha_min=ranking_cfg.get("rank_alpha_min", 0.0),
+        rank_start_epoch=int(
+            matcher_schedule_cfg.get(
+                "start_epoch",
+                ranking_cfg.get("rank_start_epoch", 5),
+            )
+        ),
+        rank_warmup_epoch=int(
+            matcher_schedule_cfg.get(
+                "warmup_epoch",
+                ranking_cfg.get("rank_warmup_epoch", 12),
+            )
+        ),
+        rank_alpha_min=float(
+            matcher_schedule_cfg.get(
+                "alpha_min",
+                ranking_cfg.get("rank_alpha_min", 0.10),
+            )
+        ),
         rank_negative_iou_max=float(
             ranking_cfg.get("rank_negative_iou_max", 0.20)
         ),
@@ -4563,6 +4778,8 @@ def print_config_summary(
     pos_weight = loss.get("pos_weight", {})
     quality = loss.get("quality", {})
     ranking = loss.get("ranking", {})
+    classification = loss.get("classification", {})
+    matcher_schedule = loss.get("matcher_schedule", {})
     score_sampling = loss.get("score_sampling", {})
     text_negative = loss.get("text_negative", {})
 
@@ -4588,7 +4805,8 @@ def print_config_summary(
         f"val={data.get('use_negative_queries_in_val', False)}, "
         f"max_weight={text_negative.get('max_query_loss_weight', 10.0)}, "
         f"lambda={text_negative.get('lambda_text_negative', 0.50)}, "
-        f"topk={text_negative.get('text_negative_topk', 20)}"
+        f"topk={text_negative.get('text_negative_topk', 20)}, "
+        f"empty_target={text_negative.get('as_empty_target', True)}"
     )
     print(f"  epochs       : {training['epochs']}")
     print(f"  batch        : {training['batch_size']}")
@@ -4639,7 +4857,7 @@ def print_config_summary(
     print(
         f"  matcher      : bbox={matcher.get('cost_bbox', 5.0)}, "
         f"giou={matcher.get('cost_giou', 2.0)}, "
-        f"score={matcher.get('cost_score', 1.0)}"
+        f"score={matcher.get('cost_score', 2.0)}"
     )
     print(
         f"  loss weight  : dynamic={weight.get('dynamic', True)}, "
@@ -4650,35 +4868,30 @@ def print_config_summary(
         f"->{weight.get('score_end', weight.get('score', 1.0))}"
     )
     print(
-        f"  score sample : pos_ratio="
-        f"{score_sampling.get('positive_ratio', 0.05)}, "
-        f"max_pos/gt={score_sampling.get('max_positive_per_gt', 2)}, "
-        f"neg:pos={score_sampling.get('hard_negative_ratio', 5)}:1"
+        f"  aux matching : repeat_k="
+        f"{score_sampling.get('max_positive_per_gt', 2)}, "
+        f"iou_thr={quality.get('iou_pos_thr', 0.10)}, "
+        f"aux_score={quality.get('aux_score_enabled', False)}"
     )
     print(
-        f"  quality      : iou_thr={quality.get('iou_pos_thr', 0.15)}, "
-        f"q=[{quality.get('quality_min', 0.25)}, "
-        f"{quality.get('quality_max', 1.0)}], "
-        f"warmup={quality.get('quality_warmup_epoch', 20)}, "
-        f"score_rounds={quality.get('score_match_rounds', 1)}, "
-        f"score_gamma={quality.get('score_quality_gamma', 1.0)}, "
-        f"aux_score={quality.get('aux_score_enabled', False)}, "
-        f"neg_ignore_iou="
-        f"{quality.get('score_negative_iou_ignore_start', 0.50)}"
-        f"->{quality.get('score_negative_iou_ignore_end', 0.45)}, "
-        f"ignore_epoch="
-        f"{quality.get('score_negative_iou_ignore_start_epoch', 5)}"
-        f"->{quality.get('score_negative_iou_ignore_end_epoch', 25)}, "
-        f"ignore_schedule="
-        f"{quality.get('score_negative_iou_ignore_schedule', 'cosine')}"
+        f"  class loss   : type={classification.get('type', 'ia_bce')}, "
+        f"ia_alpha={classification.get('ia_bce_alpha', 0.25)}, "
+        f"focal_alpha={classification.get('focal_alpha', 0.25)}, "
+        f"focal_gamma={classification.get('focal_gamma', 2.0)}, "
+        f"norm_gt={classification.get('normalize_by_num_gt', True)}, "
+        f"quality_warmup={quality.get('quality_warmup_epoch', 10)}"
     )
     print(
-        f"  ranking      : enabled={ranking.get('enabled', False)}, "
-        f"lambda_max={ranking.get('lambda_rank', 0.10)}, "
-        f"start={ranking.get('rank_start_epoch', 15)}, "
-        f"warmup={ranking.get('rank_warmup_epoch', 30)}, "
-        f"alpha_min={ranking.get('rank_alpha_min', 0.0)}, "
-        f"neg_iou_max={ranking.get('rank_negative_iou_max', 0.20)}"
+        f"  matcher sched: start="
+        f"{matcher_schedule.get('start_epoch', ranking.get('rank_start_epoch', 5))}, "
+        f"warmup="
+        f"{matcher_schedule.get('warmup_epoch', ranking.get('rank_warmup_epoch', 12))}, "
+        f"alpha_min="
+        f"{matcher_schedule.get('alpha_min', ranking.get('rank_alpha_min', 0.10))}"
+    )
+    print(
+        f"  dense losses : pairwise_rank=False, "
+        f"dense_score_assignment=False, hard_negative_mining=False"
     )
     print(f"  pos weight   : {pos_weight.get('value', 1.0)}")
     print(

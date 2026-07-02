@@ -25,7 +25,7 @@ train:
   num_workers: 16
 
   device: cuda:1
-  seed: 50
+  seed: 51
   deterministic: false
 
   use_amp: true
@@ -60,108 +60,98 @@ optim:
 
 loss:
   hybrid:
-    # Auxiliary one-to-many 分支約占總 loss 18%～22%。
+    # H-DETR-style one-to-many auxiliary regression.
     aux_loss_weight: 0.28
     aux_cost_score: 0.0
 
   matcher:
-    # 維持 DETR 系列常見的定位匹配比例。
+    # DETR/Rank-DETR-style 2:5:2 matching cost.
+    cost_score: 2.0
     cost_bbox: 5.0
     cost_giou: 2.0
-    cost_score: 0.0
+
+    # Focal matching cost used by DETR-family implementations.
+    score_cost_type: focal
+    focal_alpha: 0.25
+    focal_gamma: 2.0
+
+  matcher_schedule:
+    # Reuses the previous ranking schedule concept.
+    # The schedule now increases the score term in Hungarian matching.
+    start_epoch: 1
+    warmup_epoch: 12
+    alpha_min: 0.10
 
   score_sampling:
-    # QFL 每個 query 選擇的高損失負樣本數。
-    hard_negative_ratio: 8
+    # Only H-DETR auxiliary matching still uses these fields.
     positive_ratio: 1.0
-
-    # Auxiliary regression 每個 GT 重複匹配 2 次。
     max_positive_per_gt: 2
-
     aux_positive_label: 0.7
     expand_cost_bbox: 5.0
     expand_cost_giou: 2.0
 
   quality:
-    # Auxiliary extra match 的最低 IoU。
-    iou_pos_thr: 0.1
+    # Minimum IoU for additional H-DETR repeated matches.
+    iou_pos_thr: 0.10
 
-    # quality_min 在目前 loss.py 中尚未真正套用，
-    # 保留此值供後續程式修正。
-    quality_min: 0.15
+    # Matched one-to-one quality target range.
+    quality_min: 0.10
     quality_max: 1.0
-
-    qfl_beta: 2.0
     quality_warmup_epoch: 10
 
-    # Main score 每個 GT 最多建立兩輪正樣本。
-    score_match_rounds: 2
-    score_quality_gamma: 1.5
-    score_round_decay: 0.30
-    score_min_iou: 0.30
-
-    # Auxiliary 分支只做 bbox/GIoU，不學 score。
+    # Auxiliary branch remains regression-only.
     aux_score_enabled: false
 
-    # 保護具有一定定位品質但未被 score assigner 選中的框。
-    score_negative_iou_ignore_start: 0.30
-    score_negative_iou_ignore_end: 0.50
-    score_negative_iou_ignore_start_epoch: 1
-    score_negative_iou_ignore_end_epoch: 25
-    score_negative_iou_ignore_schedule: cosine
+  classification:
+    # Align-DETR-style IoU-aware BCE target for matched queries.
+    type: ia_bce
+    ia_bce_alpha: 0.25
 
-  ranking:
-    enabled: true
+    focal_alpha: 0.25
+    focal_gamma: 2.0
 
-    # 完成 warmup 後，預期約占總 loss 8%～12%。
-    lambda_rank: 0.25
-
-    # 要求高品質框的 logit 至少比低品質框高 0.15。
-    rank_margin: 0.15
-
-    # 只有品質差距至少 0.15 的 pair 才參與排序。
-    rank_min_quality_gap: 0.15
-
-    # 增加 pair 數，降低少數極端 hardest pair 主導梯度。
-    rank_max_pairs: 512
-
-    # 先讓 bbox 定位穩定，再開始排序。
-    rank_start_epoch: 5
-
-    # Epoch 5 起啟動，約 Epoch 17 達到完整權重。
-    rank_warmup_epoch: 12
-    rank_alpha_min: 0.10
-
-    # 只有 IoU <= 0.20 的未匹配框可作為明確 ranking negative。
-    rank_negative_iou_max: 0.20
+    # DETR-style normalization by the number of matched GT boxes.
+    normalize_by_num_gt: true
 
   text_negative:
-    # Text-negative query 最多放大四倍。
-    max_query_loss_weight: 4.0
+    # Negative captions become empty-target DETR samples:
+    # no positive matching and no bbox/GIoU regression.
+    as_empty_target: true
 
-    # 保持原權重；目前已能有效壓低錯誤文字 query 分數。
-    lambda_text_negative: 0.50
+    # Main classification already supervises every query as no-object.
+    # This term only reinforces the highest-scoring negative queries.
+    lambda_text_negative: 0.20
     text_negative_topk: 20
     text_negative_hard_mix: 0.50
+    max_query_loss_weight: 4.0
+
+  ranking:
+    # Explicit dense pairwise ranking is removed.
+    enabled: false
+    lambda_rank: 0.0
+
+    # Kept as aliases for older train.py parameter readers.
+    rank_start_epoch: 5
+    rank_warmup_epoch: 12
+    rank_alpha_min: 0.10
 
   weight:
     dynamic: true
 
-    # BBox L1 維持主要定位監督，但後期稍微下降。
     bbox_start: 5.0
     bbox_end: 4.5
     bbox_decay_until: 0.5
 
     giou: 2.0
 
-    # QFL 採中等權重，負責 score calibration，
-    # 不再單獨承擔候選框排序。
-    score_start: 1.5
+    # Official Rank-DETR classification weight scale.
+    score_start: 2.0
     score_end: 2.0
     score_warm_until: 0.5
 
   pos_weight:
-    value: 1.5
+    # Retained only for old train.py compatibility; DETR-native loss ignores it.
+    value: 1.0
 
 
 eval:
@@ -169,7 +159,6 @@ eval:
   eval_interval: 1
   max_val_batches: null
 
-  # AP 計算保留低 threshold，避免過早截斷 prediction。
   score_thr: 0.001
   top_k: 20
 
@@ -188,8 +177,7 @@ eval:
 
 
 log:
-  # 使用新的目錄，避免與舊實驗的 JSONL 紀錄混合。
-  save_dir: runs/train/lightdet_qfl_medium_rank10_seed50
+  save_dir: runs/train/lightdet_detr_native_iabce_seed51
   resume_path: null
 
   save_latest_interval: 1
