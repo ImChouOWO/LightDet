@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -462,6 +463,9 @@ class ScoreAssignmentResult:
     quality_target: torch.Tensor
     round_weight: torch.Tensor
     positive_mask: torch.Tensor
+    # Dense localization quality for every prediction. Unlike quality_target,
+    # this is not sparse and is not determined by a one-to-one matcher.
+    max_iou_per_pred: torch.Tensor
     counts: Tuple[int, ...]
     selected_ious: torch.Tensor
     mode: str
@@ -532,6 +536,11 @@ class IndependentIoUScoreAssigner:
             device=device,
             dtype=torch.bool,
         )
+        max_iou_per_pred = torch.zeros(
+            (batch_size, num_pred, 1),
+            device=device,
+            dtype=torch.float32,
+        )
         counts = [0] * batch_size
         selected_iou_parts: List[torch.Tensor] = []
 
@@ -540,6 +549,7 @@ class IndependentIoUScoreAssigner:
                 quality_target=quality_target,
                 round_weight=round_weight,
                 positive_mask=positive_mask,
+                max_iou_per_pred=max_iou_per_pred,
                 counts=tuple(counts),
                 selected_ious=torch.empty(
                     0,
@@ -566,6 +576,11 @@ class IndependentIoUScoreAssigner:
             gt_bbox = packed_targets.boxes[global_gt_index].float()
             boxes = pred_bbox.detach().float().index_select(0, batch_index)
             iou = batched_single_target_iou(boxes, gt_bbox)
+            max_iou_per_pred[
+                batch_index,
+                :,
+                0,
+            ] = iou.clamp(0.0, 1.0)
 
             k = min(self.rounds, num_pred)
             selected_iou, selected_pred = torch.topk(
@@ -643,6 +658,12 @@ class IndependentIoUScoreAssigner:
             iou_group = batched_pairwise_iou(
                 boxes,
                 gt_bbox,
+            )
+            max_iou_group = iou_group.max(dim=2).values
+            max_iou_per_pred.index_copy_(
+                0,
+                row_tensor,
+                max_iou_group.unsqueeze(-1),
             )
             # One transfer/synchronization per equal-GT-count group.
             iou_group_cpu = iou_group.detach().cpu().numpy()
@@ -739,6 +760,7 @@ class IndependentIoUScoreAssigner:
             quality_target=quality_target,
             round_weight=round_weight,
             positive_mask=positive_mask,
+            max_iou_per_pred=max_iou_per_pred,
             counts=tuple(counts),
             selected_ious=selected_ious,
             mode=mode,
@@ -1348,6 +1370,18 @@ class GroundingLoss(nn.Module):
         rank_min_quality_gap: float = 0.1,
         rank_max_pairs: int = 512,
         max_query_loss_weight: float = 10.0,
+        # Legacy fixed threshold. When provided, it overrides the dynamic
+        # schedule and keeps the threshold constant for backward compatibility.
+        score_negative_iou_ignore_thr: Optional[float] = None,
+        score_negative_iou_ignore_start: float = 0.50,
+        score_negative_iou_ignore_end: float = 0.45,
+        score_negative_iou_ignore_start_epoch: int = 5,
+        score_negative_iou_ignore_end_epoch: int = 25,
+        score_negative_iou_ignore_schedule: str = "cosine",
+        rank_negative_iou_max: float = 0.20,
+        text_negative_loss_weight: float = 0.50,
+        text_negative_topk: int = 20,
+        text_negative_hard_mix: float = 0.50,
         aux_loss_weight: float = 0.5,
         aux_cost_score: Optional[float] = None,
         score_match_rounds: int = 1,
@@ -1422,6 +1456,113 @@ class GroundingLoss(nn.Module):
             1.0,
             float(max_query_loss_weight),
         )
+        # Dynamic threshold used to protect high-IoU unmatched candidates
+        # from being treated as score negatives. A legacy fixed threshold
+        # forces a constant schedule so older callers remain valid.
+        if score_negative_iou_ignore_thr is not None:
+            fixed_threshold = clamp01(score_negative_iou_ignore_thr)
+            score_negative_iou_ignore_start = fixed_threshold
+            score_negative_iou_ignore_end = fixed_threshold
+            score_negative_iou_ignore_start_epoch = 1
+            score_negative_iou_ignore_end_epoch = 1
+            score_negative_iou_ignore_schedule = "constant"
+
+        self.score_negative_iou_ignore_start = clamp01(
+            score_negative_iou_ignore_start
+        )
+        self.score_negative_iou_ignore_end = clamp01(
+            score_negative_iou_ignore_end
+        )
+        self.score_negative_iou_ignore_start_epoch = max(
+            1,
+            int(score_negative_iou_ignore_start_epoch),
+        )
+        self.score_negative_iou_ignore_end_epoch = max(
+            self.score_negative_iou_ignore_start_epoch,
+            int(score_negative_iou_ignore_end_epoch),
+        )
+        self.score_negative_iou_ignore_schedule = str(
+            score_negative_iou_ignore_schedule
+        ).strip().lower()
+
+        schedule_aliases = {
+            "cos": "cosine",
+            "cosine": "cosine",
+            "linear": "linear",
+            "smooth": "smoothstep",
+            "smoothstep": "smoothstep",
+            "constant": "constant",
+        }
+        if self.score_negative_iou_ignore_schedule not in schedule_aliases:
+            raise ValueError(
+                "score_negative_iou_ignore_schedule must be one of "
+                "['constant', 'cosine', 'linear', 'smoothstep'], got "
+                f"{self.score_negative_iou_ignore_schedule!r}"
+            )
+        self.score_negative_iou_ignore_schedule = schedule_aliases[
+            self.score_negative_iou_ignore_schedule
+        ]
+
+        self.rank_negative_iou_max = clamp01(
+            rank_negative_iou_max
+        )
+        self.text_negative_loss_weight = max(
+            0.0,
+            float(text_negative_loss_weight),
+        )
+        self.text_negative_topk = max(1, int(text_negative_topk))
+        self.text_negative_hard_mix = clamp01(
+            text_negative_hard_mix
+        )
+
+    def resolve_score_negative_iou_ignore_thr(
+        self,
+        current_epoch: Optional[int],
+    ) -> float:
+        """
+        Resolve the per-epoch IoU threshold used to ignore unmatched score
+        negatives that already overlap a GT well.
+
+        A prediction is ignored from QFL negative mining when:
+            not score-positive and max_iou_to_any_gt >= resolved threshold
+
+        Lowering the threshold over training protects more medium/high-IoU
+        candidates after localization becomes stable. The value is constant
+        before start_epoch and after end_epoch.
+        """
+        start = float(self.score_negative_iou_ignore_start)
+        end = float(self.score_negative_iou_ignore_end)
+        start_epoch = int(self.score_negative_iou_ignore_start_epoch)
+        end_epoch = int(self.score_negative_iou_ignore_end_epoch)
+        schedule = self.score_negative_iou_ignore_schedule
+
+        if current_epoch is None:
+            return start
+
+        epoch = int(current_epoch)
+        if schedule == "constant" or end_epoch <= start_epoch:
+            return start
+        if epoch <= start_epoch:
+            return start
+        if epoch >= end_epoch:
+            return end
+
+        progress = clamp01(
+            float(epoch - start_epoch)
+            / float(end_epoch - start_epoch)
+        )
+
+        if schedule == "linear":
+            alpha = progress
+        elif schedule == "cosine":
+            alpha = 0.5 * (1.0 - math.cos(math.pi * progress))
+        elif schedule == "smoothstep":
+            alpha = smoothstep(progress)
+        else:
+            alpha = 0.0
+
+        return clamp01(start + (end - start) * alpha)
+
 
     def resolve_epoch_alpha(
         self,
@@ -1531,6 +1672,101 @@ class GroundingLoss(nn.Module):
 
         return text_negative_mask
 
+    def text_negative_suppression_loss(
+        self,
+        pred_score_logit: torch.Tensor,
+        text_negative_mask: torch.Tensor,
+        query_loss_weights: Optional[torch.Tensor],
+        positive_query_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Suppress every prediction emitted for a negative text query.
+
+        The existing QFL path performs hard-negative mining and therefore only
+        supervises a few predictions when a query has no positive target. This
+        dedicated term keeps a mean over all predictions and mixes it with the
+        hardest Top-K predictions, preventing a flat high-confidence score
+        platform on semantically incorrect queries.
+        """
+        zero = pred_score_logit.new_zeros(())
+        mask = self._prepare_text_negative_mask(
+            pred_score_logit,
+            text_negative_mask,
+        )
+
+        if not bool(mask.any()):
+            return zero, {
+                "all_mean": zero,
+                "hard_mean": zero,
+                "negative_top1_score": zero,
+                "positive_top1_score": zero,
+                "positive_negative_margin": zero,
+            }
+
+        logits = pred_score_logit.float().squeeze(-1)
+        negative_logits = logits[mask]
+        negative_prob = negative_logits.sigmoid()
+
+        # QFL-style target=0 loss for every prediction.
+        element_loss = (
+            F.softplus(negative_logits)
+            * negative_prob.pow(float(self.qfl_beta))
+        )
+        all_per_query = element_loss.mean(dim=1)
+
+        k = min(self.text_negative_topk, int(element_loss.shape[1]))
+        hard_per_query = torch.topk(
+            element_loss,
+            k=k,
+            dim=1,
+            largest=True,
+            sorted=False,
+        ).values.mean(dim=1)
+
+        hard_mix = float(self.text_negative_hard_mix)
+        per_query = (
+            (1.0 - hard_mix) * all_per_query
+            + hard_mix * hard_per_query
+        )
+
+        query_weight = self._prepare_query_loss_weights(
+            pred_score_logit,
+            query_loss_weights,
+        ).reshape(-1)[mask].float()
+        loss = (per_query * query_weight).mean()
+
+        negative_top1_score = negative_prob.max(dim=1).values.mean()
+        positive_top1_score = zero.float()
+
+        if positive_query_mask is not None:
+            positive_query_mask = positive_query_mask.to(
+                device=logits.device,
+                dtype=torch.bool,
+            ).reshape(-1)
+            if bool(positive_query_mask.any()):
+                positive_top1_score = (
+                    logits[positive_query_mask]
+                    .sigmoid()
+                    .max(dim=1)
+                    .values
+                    .mean()
+                )
+
+        margin = positive_top1_score - negative_top1_score
+        return loss.to(dtype=pred_score_logit.dtype), {
+            "all_mean": all_per_query.mean().to(pred_score_logit.dtype),
+            "hard_mean": hard_per_query.mean().to(pred_score_logit.dtype),
+            "negative_top1_score": negative_top1_score.to(
+                pred_score_logit.dtype
+            ),
+            "positive_top1_score": positive_top1_score.to(
+                pred_score_logit.dtype
+            ),
+            "positive_negative_margin": margin.to(
+                pred_score_logit.dtype
+            ),
+        }
+
     def score_loss_quality_balanced(
         self,
         pred_score_logit: torch.Tensor,
@@ -1541,6 +1777,7 @@ class GroundingLoss(nn.Module):
         query_loss_weights: Optional[torch.Tensor] = None,
         text_negative_mask: Optional[torch.Tensor] = None,
         positive_counts: Optional[Sequence[int]] = None,
+        negative_ignore_mask: Optional[torch.Tensor] = None,
     ):
         """Vectorized QFL and per-query hard-negative mining."""
         if qfl_beta is None:
@@ -1566,6 +1803,22 @@ class GroundingLoss(nn.Module):
         loss_flat = (bce * qfl_weight).squeeze(-1)
         positive_flat = positive_mask.squeeze(-1)
 
+        if negative_ignore_mask is None:
+            ignore_flat = torch.zeros_like(positive_flat)
+        else:
+            ignore_flat = negative_ignore_mask.to(
+                device=positive_flat.device,
+                dtype=torch.bool,
+            ).squeeze(-1)
+            if ignore_flat.shape != positive_flat.shape:
+                raise ValueError(
+                    "negative_ignore_mask/positive_mask shape mismatch: "
+                    f"{tuple(ignore_flat.shape)} != "
+                    f"{tuple(positive_flat.shape)}"
+                )
+
+        valid_negative_flat = (~positive_flat) & (~ignore_flat)
+
         query_weight = self._prepare_query_loss_weights(
             pred_score_logit,
             query_loss_weights,
@@ -1581,7 +1834,11 @@ class GroundingLoss(nn.Module):
         else:
             loss_pos = pred_score_logit.new_zeros(())
 
-        negative_counts = tuple(num_pred - count for count in positive_counts)
+        negative_counts = tuple(
+            int(value)
+            for value in valid_negative_flat.sum(dim=1).detach().cpu().tolist()
+        )
+        ignored_negative_count = float(ignore_flat.sum().detach().cpu().item())
         selected_counts = tuple(
             min(negative_count, max(positive_count, 1) * self.hard_negative_ratio)
             for positive_count, negative_count in zip(positive_counts, negative_counts)
@@ -1589,7 +1846,10 @@ class GroundingLoss(nn.Module):
         max_selected = max(selected_counts, default=0)
 
         if max_selected > 0:
-            negative_loss = loss_flat.masked_fill(positive_flat, float("-inf"))
+            negative_loss = loss_flat.masked_fill(
+                ~valid_negative_flat,
+                float("-inf"),
+            )
             selected_values = torch.topk(
                 negative_loss,
                 k=max_selected,
@@ -1661,6 +1921,7 @@ class GroundingLoss(nn.Module):
             float(total_positive_count),
             float(selected_negative_count),
             float(sum(negative_counts)),
+            float(ignored_negative_count),
             float(text_negative_count_tensor.detach().cpu().item()),
             text_negative_weight_mean,
         )
@@ -1673,6 +1934,8 @@ class GroundingLoss(nn.Module):
         margin=None,
         min_quality_gap=None,
         positive_counts: Optional[Sequence[int]] = None,
+        dense_quality: Optional[torch.Tensor] = None,
+        negative_valid_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Vectorized within-query quality ranking loss."""
         if margin is None:
@@ -1684,6 +1947,26 @@ class GroundingLoss(nn.Module):
         logits = pred_score_logit.squeeze(-1)
         quality = score_target.squeeze(-1)
         positive = positive_mask.squeeze(-1)
+
+        if dense_quality is None:
+            dense_quality_flat = quality
+        else:
+            dense_quality_flat = dense_quality.to(
+                device=quality.device,
+                dtype=quality.dtype,
+            ).squeeze(-1)
+
+        if negative_valid_mask is None:
+            valid_negative = ~positive
+        else:
+            valid_negative = negative_valid_mask.to(
+                device=positive.device,
+                dtype=torch.bool,
+            ).squeeze(-1)
+            if valid_negative.shape != positive.shape:
+                raise ValueError(
+                    "negative_valid_mask/positive_mask shape mismatch"
+                )
 
         if positive_counts is None:
             positive_counts = tuple(
@@ -1734,23 +2017,37 @@ class GroundingLoss(nn.Module):
             )
             pair_loss_parts.append(positive_pair_loss[rank_mask])
 
-        negative_counts = tuple(num_pred - count for count in positive_counts)
+        negative_counts = tuple(
+            int(value)
+            for value in valid_negative.sum(dim=1).detach().cpu().tolist()
+        )
         selected_negative_counts = tuple(
-            min(negative_count, max(positive_count * self.hard_negative_ratio, 1))
+            min(
+                negative_count,
+                max(positive_count * self.hard_negative_ratio, 1),
+            )
             if positive_count > 0
             else 0
-            for positive_count, negative_count in zip(positive_counts, negative_counts)
+            for positive_count, negative_count in zip(
+                positive_counts,
+                negative_counts,
+            )
         )
         max_negative = max(selected_negative_counts, default=0)
 
         if max_negative > 0:
-            negative_values = torch.topk(
-                logits.masked_fill(positive, float("-inf")),
+            negative_values, negative_indices = torch.topk(
+                logits.masked_fill(~valid_negative, float("-inf")),
                 k=max_negative,
                 dim=1,
                 largest=True,
                 sorted=True,
-            ).values
+            )
+            negative_quality = torch.gather(
+                dense_quality_flat,
+                1,
+                negative_indices,
+            )
             selected_negative_count_tensor = torch.tensor(
                 selected_negative_counts,
                 device=logits.device,
@@ -1761,7 +2058,13 @@ class GroundingLoss(nn.Module):
                 < selected_negative_count_tensor[:, None]
             )
             positive_negative_mask = (
-                positive_valid[:, :, None] & negative_valid[:, None, :]
+                positive_valid[:, :, None]
+                & negative_valid[:, None, :]
+                & (
+                    positive_quality[:, :, None]
+                    > negative_quality[:, None, :]
+                    + float(min_quality_gap)
+                )
             )
             logit_difference = (
                 positive_values[:, :, None] - negative_values[:, None, :]
@@ -1851,6 +2154,7 @@ class GroundingLoss(nn.Module):
         apply_ranking: bool,
         rank_alpha: float,
         lambda_rank: float,
+        score_negative_iou_ignore_thr: float,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         self._validate_branch_inputs(
             branch_name=branch_name,
@@ -1927,6 +2231,24 @@ class GroundingLoss(nn.Module):
                 torch.zeros_like(score_target),
             )
             positive_counts = score_assignments.counts
+            max_iou_per_pred = score_assignments.max_iou_per_pred.to(
+                device=pred_score_logit.device,
+                dtype=torch.float32,
+            )
+
+            if float(score_negative_iou_ignore_thr) > 0.0:
+                negative_ignore_mask = (
+                    (~positive_mask)
+                    & (
+                        max_iou_per_pred
+                        >= float(score_negative_iou_ignore_thr)
+                    )
+                )
+            else:
+                negative_ignore_mask = torch.zeros_like(
+                    positive_mask,
+                    dtype=torch.bool,
+                )
 
             (
                 loss_score,
@@ -1937,6 +2259,7 @@ class GroundingLoss(nn.Module):
                 score_pos_count,
                 hard_negative_count,
                 negative_count,
+                ignored_negative_count,
                 text_negative_count,
                 text_negative_weight_mean,
             ) = self.score_loss_quality_balanced(
@@ -1948,6 +2271,30 @@ class GroundingLoss(nn.Module):
                 query_loss_weights=query_loss_weights,
                 text_negative_mask=text_negative_mask,
                 positive_counts=positive_counts,
+                negative_ignore_mask=negative_ignore_mask,
+            )
+
+            positive_query_mask = torch.tensor(
+                [count > 0 for count in packed_targets.counts],
+                device=pred_score_logit.device,
+                dtype=torch.bool,
+            )
+            text_negative_mask_prepared = self._prepare_text_negative_mask(
+                pred_score_logit,
+                text_negative_mask,
+            )
+            (
+                loss_text_negative_all,
+                text_negative_metrics,
+            ) = self.text_negative_suppression_loss(
+                pred_score_logit=pred_score_logit,
+                text_negative_mask=text_negative_mask_prepared,
+                query_loss_weights=query_loss_weights,
+                positive_query_mask=positive_query_mask,
+            )
+            loss_text_negative_contrib = (
+                float(self.text_negative_loss_weight)
+                * loss_text_negative_all
             )
 
             if score_assignments.selected_ious.numel() > 0:
@@ -1982,6 +2329,24 @@ class GroundingLoss(nn.Module):
             loss_score_neg = zero
             loss_score_neg_unweighted = zero
             loss_text_negative = zero
+            loss_text_negative_all = zero
+            loss_text_negative_contrib = zero
+            text_negative_metrics = {
+                "all_mean": zero,
+                "hard_mean": zero,
+                "negative_top1_score": zero,
+                "positive_top1_score": zero,
+                "positive_negative_margin": zero,
+            }
+            ignored_negative_count = 0.0
+            max_iou_per_pred = torch.zeros_like(
+                pred_score_logit,
+                dtype=torch.float32,
+            )
+            negative_ignore_mask = torch.zeros_like(
+                pred_score_logit,
+                dtype=torch.bool,
+            )
             score_pos_count = 0.0
             hard_negative_count = 0.0
             negative_count = float(
@@ -2013,6 +2378,14 @@ class GroundingLoss(nn.Module):
                 margin=self.rank_margin,
                 min_quality_gap=self.rank_min_quality_gap,
                 positive_counts=positive_counts,
+                dense_quality=max_iou_per_pred,
+                negative_valid_mask=(
+                    (~positive_mask)
+                    & (
+                        max_iou_per_pred
+                        <= self.rank_negative_iou_max
+                    )
+                ),
             )
             loss_rank = float(rank_alpha) * loss_rank_raw
             loss_rank_contrib = float(lambda_rank) * loss_rank
@@ -2026,7 +2399,11 @@ class GroundingLoss(nn.Module):
             + float(lambda_giou) * loss_giou
             + float(lambda_score) * loss_score
         )
-        loss_total = loss_base + loss_rank_contrib
+        loss_total = (
+            loss_base
+            + loss_rank_contrib
+            + loss_text_negative_contrib
+        )
 
         selected_negative_fraction = (
             float(hard_negative_count)
@@ -2042,7 +2419,26 @@ class GroundingLoss(nn.Module):
             "loss_score_pos": loss_score_pos,
             "loss_score_neg": loss_score_neg,
             "loss_score_neg_unweighted": loss_score_neg_unweighted,
-            "loss_text_negative": loss_text_negative,
+            # Dedicated all-prediction negative-text suppression.
+            "loss_text_negative": loss_text_negative_all,
+            "loss_text_negative_contrib": loss_text_negative_contrib,
+            # Legacy hard-mined QFL diagnostic for negative text rows.
+            "loss_text_negative_hard_qfl": loss_text_negative,
+            "loss_text_negative_all_mean": text_negative_metrics[
+                "all_mean"
+            ],
+            "loss_text_negative_hard_mean": text_negative_metrics[
+                "hard_mean"
+            ],
+            "negative_query_top1_score": text_negative_metrics[
+                "negative_top1_score"
+            ],
+            "positive_query_top1_score": text_negative_metrics[
+                "positive_top1_score"
+            ],
+            "positive_negative_score_margin": text_negative_metrics[
+                "positive_negative_margin"
+            ],
             "loss_rank": loss_rank,
             "loss_rank_raw": loss_rank_raw,
             "loss_rank_contrib": loss_rank_contrib,
@@ -2050,6 +2446,7 @@ class GroundingLoss(nn.Module):
             "score_pos_count": float(score_pos_count),
             "hard_neg_count": float(hard_negative_count),
             "negative_count": float(negative_count),
+            "ignored_negative_count": float(ignored_negative_count),
             "selected_negative_fraction": float(
                 selected_negative_fraction
             ),
@@ -2063,6 +2460,15 @@ class GroundingLoss(nn.Module):
             "lambda_bbox": float(lambda_bbox),
             "lambda_giou": float(lambda_giou),
             "lambda_score": float(lambda_score),
+            "lambda_text_negative": float(
+                self.text_negative_loss_weight
+            ),
+            "score_negative_iou_ignore_thr": float(
+                score_negative_iou_ignore_thr
+            ),
+            "rank_negative_iou_max": float(
+                self.rank_negative_iou_max
+            ),
             "lambda_rank": float(
                 lambda_rank if apply_ranking else 0.0
             ),
@@ -2139,6 +2545,11 @@ class GroundingLoss(nn.Module):
             rank_warmup_epoch=rank_warmup_epoch,
             rank_alpha_min=rank_alpha_min,
         )
+        score_negative_iou_ignore_thr = (
+            self.resolve_score_negative_iou_ignore_thr(
+                current_epoch=current_epoch,
+            )
+        )
 
         packed_targets = PackedTargets.from_targets(
             targets,
@@ -2178,6 +2589,9 @@ class GroundingLoss(nn.Module):
             apply_ranking=self.enable_pairwise_ranking,
             rank_alpha=rank_alpha,
             lambda_rank=lambda_rank,
+            score_negative_iou_ignore_thr=(
+                score_negative_iou_ignore_thr
+            ),
         )
 
         has_aux_bbox = aux_pred_bbox is not None
@@ -2255,6 +2669,9 @@ class GroundingLoss(nn.Module):
                 apply_ranking=False,
                 rank_alpha=0.0,
                 lambda_rank=0.0,
+                score_negative_iou_ignore_thr=(
+                    score_negative_iou_ignore_thr
+                ),
             )
         else:
             aux_loss = pred_bbox.new_zeros(())
@@ -2269,6 +2686,13 @@ class GroundingLoss(nn.Module):
                 "loss_score_neg": zero,
                 "loss_score_neg_unweighted": zero,
                 "loss_text_negative": zero,
+                "loss_text_negative_contrib": zero,
+                "loss_text_negative_hard_qfl": zero,
+                "loss_text_negative_all_mean": zero,
+                "loss_text_negative_hard_mean": zero,
+                "negative_query_top1_score": zero,
+                "positive_query_top1_score": zero,
+                "positive_negative_score_margin": zero,
                 "loss_rank": zero,
                 "loss_rank_raw": zero,
                 "loss_rank_contrib": zero,
@@ -2276,6 +2700,7 @@ class GroundingLoss(nn.Module):
                 "score_pos_count": 0.0,
                 "hard_neg_count": 0.0,
                 "negative_count": 0.0,
+                "ignored_negative_count": 0.0,
                 "selected_negative_fraction": 0.0,
                 "text_negative_count": 0.0,
                 "text_negative_weight_mean": zero,
@@ -2287,6 +2712,13 @@ class GroundingLoss(nn.Module):
                 "lambda_bbox": float(lambda_bbox),
                 "lambda_giou": float(lambda_giou),
                 "lambda_score": 0.0,
+                "lambda_text_negative": 0.0,
+                "score_negative_iou_ignore_thr": float(
+                    score_negative_iou_ignore_thr
+                ),
+                "rank_negative_iou_max": float(
+                    self.rank_negative_iou_max
+                ),
                 "lambda_rank": 0.0,
                 "lambda_rank_eff": 0.0,
                 "pos_weight": float(pos_weight),
@@ -2322,6 +2754,24 @@ class GroundingLoss(nn.Module):
             "pairwise_ranking_enabled": bool(
                 self.enable_pairwise_ranking
             ),
+            "score_negative_iou_ignore_thr": float(
+                score_negative_iou_ignore_thr
+            ),
+            "score_negative_iou_ignore_start": float(
+                self.score_negative_iou_ignore_start
+            ),
+            "score_negative_iou_ignore_end": float(
+                self.score_negative_iou_ignore_end
+            ),
+            "score_negative_iou_ignore_start_epoch": int(
+                self.score_negative_iou_ignore_start_epoch
+            ),
+            "score_negative_iou_ignore_end_epoch": int(
+                self.score_negative_iou_ignore_end_epoch
+            ),
+            "score_negative_iou_ignore_schedule": (
+                self.score_negative_iou_ignore_schedule
+            ),
 
             # Backward-compatible main aliases.
             "loss_main": self._detach_metric(
@@ -2348,6 +2798,21 @@ class GroundingLoss(nn.Module):
             "loss_text_negative": self._detach_metric(
                 main_metrics["loss_text_negative"]
             ),
+            "loss_text_negative_contrib": self._detach_metric(
+                main_metrics["loss_text_negative_contrib"]
+            ),
+            "loss_text_negative_hard_qfl": self._detach_metric(
+                main_metrics["loss_text_negative_hard_qfl"]
+            ),
+            "negative_query_top1_score": self._detach_metric(
+                main_metrics["negative_query_top1_score"]
+            ),
+            "positive_query_top1_score": self._detach_metric(
+                main_metrics["positive_query_top1_score"]
+            ),
+            "positive_negative_score_margin": self._detach_metric(
+                main_metrics["positive_negative_score_margin"]
+            ),
             "loss_rank": self._detach_metric(
                 main_metrics["loss_rank"]
             ),
@@ -2361,6 +2826,9 @@ class GroundingLoss(nn.Module):
             "score_pos_count": main_metrics["score_pos_count"],
             "hard_neg_count": main_metrics["hard_neg_count"],
             "negative_count": main_metrics["negative_count"],
+            "ignored_negative_count": main_metrics[
+                "ignored_negative_count"
+            ],
             "selected_negative_fraction": main_metrics[
                 "selected_negative_fraction"
             ],

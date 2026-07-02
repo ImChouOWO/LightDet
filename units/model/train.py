@@ -1295,6 +1295,7 @@ def train_one_epoch(
     total_rank_contrib_sum = torch.zeros((), device=device)
     total_rank_raw_sum = torch.zeros((), device=device)
     total_text_negative_sum = torch.zeros((), device=device)
+    total_text_negative_contrib_sum = torch.zeros((), device=device)
     total_text_negative_queries = 0
 
     amp_enabled = get_amp_enabled(device, use_amp)
@@ -1460,6 +1461,22 @@ def train_one_epoch(
             "loss_text_negative",
             zero,
         ).detach()
+        text_negative_contrib_det = loss_dict.get(
+            "loss_text_negative_contrib",
+            zero,
+        ).detach()
+        negative_query_top1_det = loss_dict.get(
+            "negative_query_top1_score",
+            zero,
+        ).detach()
+        positive_query_top1_det = loss_dict.get(
+            "positive_query_top1_score",
+            zero,
+        ).detach()
+        query_score_margin_det = loss_dict.get(
+            "positive_negative_score_margin",
+            zero,
+        ).detach()
         text_negative_queries = int(
             batch.get(
                 "text_negative_mask",
@@ -1477,6 +1494,9 @@ def train_one_epoch(
         total_rank_contrib_sum.add_(rank_contrib_det)
         total_rank_raw_sum.add_(rank_raw_det)
         total_text_negative_sum.add_(text_negative_det)
+        total_text_negative_contrib_sum.add_(
+            text_negative_contrib_det
+        )
         total_text_negative_queries += text_negative_queries
 
         should_log = (
@@ -1497,6 +1517,18 @@ def train_one_epoch(
             rank_item = float(rank_det.item())
             rank_contrib_item = float(rank_contrib_det.item())
             text_negative_item = float(text_negative_det.item())
+            text_negative_contrib_item = float(
+                text_negative_contrib_det.item()
+            )
+            negative_query_top1_item = float(
+                negative_query_top1_det.item()
+            )
+            positive_query_top1_item = float(
+                positive_query_top1_det.item()
+            )
+            query_score_margin_item = float(
+                query_score_margin_det.item()
+            )
             avg_loss = float((total_loss_sum / (step + 1)).item())
 
             rank_alpha_item = float(loss_dict.get("rank_alpha", 0.0))
@@ -1504,6 +1536,12 @@ def train_one_epoch(
                 loss_dict.get("lambda_rank_eff", 0.0)
             )
             quality_alpha_item = float(loss_dict.get("quality_alpha", 1.0))
+            score_ignore_thr_item = float(
+                loss_dict.get(
+                    "score_negative_iou_ignore_thr",
+                    0.0,
+                )
+            )
 
             score_target_pos_mean = loss_dict.get(
                 "score_target_pos_mean",
@@ -1531,6 +1569,9 @@ def train_one_epoch(
                 "ra": f"{rank_alpha_item:.4f}",
                 "lrk": f"{lambda_rank_eff_item:.4f}",
                 "txtneg": f"{text_negative_item:.4f}",
+                "tnc": f"{text_negative_contrib_item:.4f}",
+                "pm": f"{query_score_margin_item:.3f}",
+                "sniou": f"{score_ignore_thr_item:.3f}",
                 "nq": text_negative_queries,
             })
 
@@ -1554,6 +1595,18 @@ def train_one_epoch(
                     "loss_rank": rank_item,
                     "loss_rank_contrib": rank_contrib_item,
                     "loss_text_negative": text_negative_item,
+                    "loss_text_negative_contrib": (
+                        text_negative_contrib_item
+                    ),
+                    "negative_query_top1_score": (
+                        negative_query_top1_item
+                    ),
+                    "positive_query_top1_score": (
+                        positive_query_top1_item
+                    ),
+                    "positive_negative_score_margin": (
+                        query_score_margin_item
+                    ),
                     "text_negative_queries": text_negative_queries,
                     "lambda_bbox": lambda_bbox,
                     "lambda_giou": lambda_giou,
@@ -1564,6 +1617,9 @@ def train_one_epoch(
                     "quality_alpha": quality_alpha_item,
                     "rank_alpha": rank_alpha_item,
                     "rank_alpha_min": float(rank_alpha_min),
+                    "score_negative_iou_ignore_thr": (
+                        score_ignore_thr_item
+                    ),
                     "score_target_pos_mean": score_target_pos_mean,
                 })
     pbar.refresh()
@@ -1590,7 +1646,13 @@ def train_one_epoch(
         "train_loss_text_negative": float(
             (total_text_negative_sum / num_batches).item()
         ),
+        "train_loss_text_negative_contrib": float(
+            (total_text_negative_contrib_sum / num_batches).item()
+        ),
         "train_text_negative_queries": int(total_text_negative_queries),
+        "score_negative_iou_ignore_thr": float(
+            criterion.resolve_score_negative_iou_ignore_thr(epoch)
+        ),
     }
 
 
@@ -2164,6 +2226,7 @@ def validate_one_epoch(
     total_rank_contrib_sum = torch.zeros((), device=device)
     total_rank_raw_sum = torch.zeros((), device=device)
     total_text_negative_sum = torch.zeros((), device=device)
+    total_text_negative_contrib_sum = torch.zeros((), device=device)
     total_text_negative_queries = 0
 
     metric = (
@@ -2285,6 +2348,12 @@ def validate_one_epoch(
             total_text_negative_sum.add_(
                 loss_dict.get("loss_text_negative", zero).detach()
             )
+            total_text_negative_contrib_sum.add_(
+                loss_dict.get(
+                    "loss_text_negative_contrib",
+                    zero,
+                ).detach()
+            )
             total_text_negative_queries += int(
                 batch.get(
                     "text_negative_mask",
@@ -2393,7 +2462,13 @@ def validate_one_epoch(
             "val_loss_text_negative": float(
                 (total_text_negative_sum / denominator).item()
             ),
+            "val_loss_text_negative_contrib": float(
+                (total_text_negative_contrib_sum / denominator).item()
+            ),
             "val_text_negative_queries": int(total_text_negative_queries),
+            "val_score_negative_iou_ignore_thr": float(
+                criterion.resolve_score_negative_iou_ignore_thr(epoch)
+            ),
         }
 
     if compute_metrics and metric is not None:
@@ -3373,6 +3448,30 @@ def train(args: SimpleNamespace) -> None:
         rank_min_quality_gap=args.rank_min_quality_gap,
         rank_max_pairs=args.rank_max_pairs,
         max_query_loss_weight=args.max_query_loss_weight,
+
+        # Do not treat high-IoU unmatched candidates as ordinary negatives.
+        score_negative_iou_ignore_start=(
+            args.score_negative_iou_ignore_start
+        ),
+        score_negative_iou_ignore_end=(
+            args.score_negative_iou_ignore_end
+        ),
+        score_negative_iou_ignore_start_epoch=(
+            args.score_negative_iou_ignore_start_epoch
+        ),
+        score_negative_iou_ignore_end_epoch=(
+            args.score_negative_iou_ignore_end_epoch
+        ),
+        score_negative_iou_ignore_schedule=(
+            args.score_negative_iou_ignore_schedule
+        ),
+        rank_negative_iou_max=args.rank_negative_iou_max,
+
+        # Explicit all-prediction suppression for negative text queries.
+        text_negative_loss_weight=args.lambda_text_negative,
+        text_negative_topk=args.text_negative_topk,
+        text_negative_hard_mix=args.text_negative_hard_mix,
+
         aux_loss_weight=args.aux_loss_weight,
         aux_cost_score=args.aux_cost_score,
 
@@ -3398,6 +3497,19 @@ def train(args: SimpleNamespace) -> None:
             "GroundingLoss ranking configuration mismatch: "
             f"requested={args.ranking_enabled}, "
             f"effective={getattr(criterion, 'enable_pairwise_ranking', None)}"
+        )
+
+    if (
+        abs(
+            float(getattr(criterion, "text_negative_loss_weight", -1.0))
+            - float(args.lambda_text_negative)
+        )
+        > 1e-12
+    ):
+        raise RuntimeError(
+            "GroundingLoss text-negative configuration mismatch: "
+            f"requested={args.lambda_text_negative}, "
+            f"effective={getattr(criterion, 'text_negative_loss_weight', None)}"
         )
 
     if args.startup_smoke_test:
@@ -3553,6 +3665,21 @@ def train(args: SimpleNamespace) -> None:
         f"gamma={args.score_quality_gamma:.3f}, "
         f"min_iou={args.score_min_iou:.3f}, "
         f"aux_score={args.aux_score_enabled}"
+    )
+    print(
+        "[Info] Text negative: "
+        f"lambda={args.lambda_text_negative:.4f}, "
+        f"topk={args.text_negative_topk}, "
+        f"hard_mix={args.text_negative_hard_mix:.3f}"
+    )
+    print(
+        "[Info] Score negative filtering: "
+        f"qfl_ignore_iou={args.score_negative_iou_ignore_start:.3f}"
+        f"->{args.score_negative_iou_ignore_end:.3f}, "
+        f"epochs={args.score_negative_iou_ignore_start_epoch}"
+        f"->{args.score_negative_iou_ignore_end_epoch}, "
+        f"schedule={args.score_negative_iou_ignore_schedule}, "
+        f"rank_negative_iou<={args.rank_negative_iou_max:.3f}"
     )
     print(
         f"[Info] Ranking: enabled={args.ranking_enabled}, "
@@ -3738,6 +3865,32 @@ def train(args: SimpleNamespace) -> None:
             "rank_alpha_min": float(args.rank_alpha_min),
             "negative_sample_ratio": float(args.negative_sample_ratio),
             "max_query_loss_weight": float(args.max_query_loss_weight),
+            "lambda_text_negative": float(args.lambda_text_negative),
+            "text_negative_topk": int(args.text_negative_topk),
+            "text_negative_hard_mix": float(
+                args.text_negative_hard_mix
+            ),
+            "score_negative_iou_ignore_thr": float(
+                criterion.resolve_score_negative_iou_ignore_thr(epoch)
+            ),
+            "score_negative_iou_ignore_start": float(
+                args.score_negative_iou_ignore_start
+            ),
+            "score_negative_iou_ignore_end": float(
+                args.score_negative_iou_ignore_end
+            ),
+            "score_negative_iou_ignore_start_epoch": int(
+                args.score_negative_iou_ignore_start_epoch
+            ),
+            "score_negative_iou_ignore_end_epoch": int(
+                args.score_negative_iou_ignore_end_epoch
+            ),
+            "score_negative_iou_ignore_schedule": (
+                args.score_negative_iou_ignore_schedule
+            ),
+            "rank_negative_iou_max": float(
+                args.rank_negative_iou_max
+            ),
             "use_negative_queries_in_val": bool(
                 args.use_negative_queries_in_val
             ),
@@ -3976,6 +4129,14 @@ DEFAULT_TRAIN_CFG = {
             "score_round_decay": 0.25,
             "score_min_iou": 0.0,
 
+            # Dynamic score-negative ignore threshold. Lower values ignore
+            # more medium/high-IoU unmatched candidates.
+            "score_negative_iou_ignore_start": 0.50,
+            "score_negative_iou_ignore_end": 0.45,
+            "score_negative_iou_ignore_start_epoch": 5,
+            "score_negative_iou_ignore_end_epoch": 25,
+            "score_negative_iou_ignore_schedule": "cosine",
+
             # Aux remains a localization-only one-to-many branch.
             "aux_score_enabled": False,
         },
@@ -3988,9 +4149,13 @@ DEFAULT_TRAIN_CFG = {
             "rank_start_epoch": 15,
             "rank_warmup_epoch": 30,
             "rank_alpha_min": 0.0,
+            "rank_negative_iou_max": 0.20,
         },
         "text_negative": {
             "max_query_loss_weight": 10.0,
+            "lambda_text_negative": 0.50,
+            "text_negative_topk": 20,
+            "text_negative_hard_mix": 0.50,
         },
         "weight": {
             "dynamic": True,
@@ -4124,6 +4289,53 @@ def cfg_to_args(
     ranking_cfg = loss_cfg.get("ranking", {})
     text_negative_cfg = loss_cfg.get("text_negative", {})
 
+    # Backward compatibility: an old fixed threshold becomes a constant
+    # schedule unless any dynamic key is explicitly present.
+    legacy_score_ignore = quality_cfg.get(
+        "score_negative_iou_ignore_thr"
+    )
+    has_dynamic_score_ignore = any(
+        key in quality_cfg
+        for key in (
+            "score_negative_iou_ignore_start",
+            "score_negative_iou_ignore_end",
+            "score_negative_iou_ignore_start_epoch",
+            "score_negative_iou_ignore_end_epoch",
+            "score_negative_iou_ignore_schedule",
+        )
+    )
+    if legacy_score_ignore is not None and not has_dynamic_score_ignore:
+        score_ignore_start = float(legacy_score_ignore)
+        score_ignore_end = float(legacy_score_ignore)
+        score_ignore_start_epoch = 1
+        score_ignore_end_epoch = 1
+        score_ignore_schedule = "constant"
+    else:
+        score_ignore_start = float(
+            quality_cfg.get("score_negative_iou_ignore_start", 0.50)
+        )
+        score_ignore_end = float(
+            quality_cfg.get("score_negative_iou_ignore_end", 0.45)
+        )
+        score_ignore_start_epoch = int(
+            quality_cfg.get(
+                "score_negative_iou_ignore_start_epoch",
+                5,
+            )
+        )
+        score_ignore_end_epoch = int(
+            quality_cfg.get(
+                "score_negative_iou_ignore_end_epoch",
+                25,
+            )
+        )
+        score_ignore_schedule = str(
+            quality_cfg.get(
+                "score_negative_iou_ignore_schedule",
+                "cosine",
+            )
+        ).strip().lower()
+
     return SimpleNamespace(
         # data
         dir=data_cfg["dataset_dir"],
@@ -4256,6 +4468,17 @@ def cfg_to_args(
         score_min_iou=float(
             quality_cfg.get("score_min_iou", 0.0)
         ),
+        score_negative_iou_ignore_start=score_ignore_start,
+        score_negative_iou_ignore_end=score_ignore_end,
+        score_negative_iou_ignore_start_epoch=(
+            score_ignore_start_epoch
+        ),
+        score_negative_iou_ignore_end_epoch=(
+            score_ignore_end_epoch
+        ),
+        score_negative_iou_ignore_schedule=(
+            score_ignore_schedule
+        ),
         aux_score_enabled=bool(
             quality_cfg.get("aux_score_enabled", False)
         ),
@@ -4271,9 +4494,21 @@ def cfg_to_args(
         rank_start_epoch=ranking_cfg.get("rank_start_epoch", 15),
         rank_warmup_epoch=ranking_cfg.get("rank_warmup_epoch", 30),
         rank_alpha_min=ranking_cfg.get("rank_alpha_min", 0.0),
+        rank_negative_iou_max=float(
+            ranking_cfg.get("rank_negative_iou_max", 0.20)
+        ),
         max_query_loss_weight=text_negative_cfg.get(
             "max_query_loss_weight",
             10.0,
+        ),
+        lambda_text_negative=float(
+            text_negative_cfg.get("lambda_text_negative", 0.50)
+        ),
+        text_negative_topk=int(
+            text_negative_cfg.get("text_negative_topk", 20)
+        ),
+        text_negative_hard_mix=float(
+            text_negative_cfg.get("text_negative_hard_mix", 0.50)
         ),
 
         # eval
@@ -4351,7 +4586,9 @@ def print_config_summary(
         f"  text negative: path={data.get('negative_query_path')}, "
         f"ratio={data.get('negative_sample_ratio', 0.05)}, "
         f"val={data.get('use_negative_queries_in_val', False)}, "
-        f"max_weight={text_negative.get('max_query_loss_weight', 10.0)}"
+        f"max_weight={text_negative.get('max_query_loss_weight', 10.0)}, "
+        f"lambda={text_negative.get('lambda_text_negative', 0.50)}, "
+        f"topk={text_negative.get('text_negative_topk', 20)}"
     )
     print(f"  epochs       : {training['epochs']}")
     print(f"  batch        : {training['batch_size']}")
@@ -4425,14 +4662,23 @@ def print_config_summary(
         f"warmup={quality.get('quality_warmup_epoch', 20)}, "
         f"score_rounds={quality.get('score_match_rounds', 1)}, "
         f"score_gamma={quality.get('score_quality_gamma', 1.0)}, "
-        f"aux_score={quality.get('aux_score_enabled', False)}"
+        f"aux_score={quality.get('aux_score_enabled', False)}, "
+        f"neg_ignore_iou="
+        f"{quality.get('score_negative_iou_ignore_start', 0.50)}"
+        f"->{quality.get('score_negative_iou_ignore_end', 0.45)}, "
+        f"ignore_epoch="
+        f"{quality.get('score_negative_iou_ignore_start_epoch', 5)}"
+        f"->{quality.get('score_negative_iou_ignore_end_epoch', 25)}, "
+        f"ignore_schedule="
+        f"{quality.get('score_negative_iou_ignore_schedule', 'cosine')}"
     )
     print(
         f"  ranking      : enabled={ranking.get('enabled', False)}, "
         f"lambda_max={ranking.get('lambda_rank', 0.10)}, "
         f"start={ranking.get('rank_start_epoch', 15)}, "
         f"warmup={ranking.get('rank_warmup_epoch', 30)}, "
-        f"alpha_min={ranking.get('rank_alpha_min', 0.0)}"
+        f"alpha_min={ranking.get('rank_alpha_min', 0.0)}, "
+        f"neg_iou_max={ranking.get('rank_negative_iou_max', 0.20)}"
     )
     print(f"  pos weight   : {pos_weight.get('value', 1.0)}")
     print(
@@ -4741,12 +4987,12 @@ def main() -> None:
         batch=48,
         device=1,
         workers=16,
-        seed=47,
+        seed=49,
         weights=None,
         resume=None,
         prefer_ema=True,
         project="runs/train",
-        name="lightdet_Decouple_HDETR_rank_epoch5",
+        name="lightdet_HDETR_textaware_dynamic",
     )
 
 
