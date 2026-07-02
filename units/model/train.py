@@ -3375,7 +3375,30 @@ def train(args: SimpleNamespace) -> None:
         max_query_loss_weight=args.max_query_loss_weight,
         aux_loss_weight=args.aux_loss_weight,
         aux_cost_score=args.aux_cost_score,
+
+        # Main score remains independent from the regression matcher.
+        score_match_rounds=args.score_match_rounds,
+        score_quality_gamma=args.score_quality_gamma,
+        score_round_decay=args.score_round_decay,
+        score_min_iou=args.score_min_iou,
+
+        # Explicit switch. Without this argument, the new loss defaults to
+        # False and rank/raw/ra/lrk remain zero for the entire run.
+        enable_pairwise_ranking=args.ranking_enabled,
+
+        # Aux one-to-many branch only supplies bbox/GIoU supervision by default.
+        aux_score_enabled=args.aux_score_enabled,
     )
+
+    if (
+        bool(getattr(criterion, "enable_pairwise_ranking", False))
+        != bool(args.ranking_enabled)
+    ):
+        raise RuntimeError(
+            "GroundingLoss ranking configuration mismatch: "
+            f"requested={args.ranking_enabled}, "
+            f"effective={getattr(criterion, 'enable_pairwise_ranking', None)}"
+        )
 
     if args.startup_smoke_test:
         run_startup_smoke_test(
@@ -3523,6 +3546,20 @@ def train(args: SimpleNamespace) -> None:
         f"[Info] Hybrid: main=Hungarian one-to-one, "
         f"aux=one-to-many, aux_weight={args.aux_loss_weight:.3f}, "
         f"aux_eval={args.auxiliary_in_eval}"
+    )
+    print(
+        f"[Info] Score assignment: independent IoU one-to-one, "
+        f"rounds={args.score_match_rounds}, "
+        f"gamma={args.score_quality_gamma:.3f}, "
+        f"min_iou={args.score_min_iou:.3f}, "
+        f"aux_score={args.aux_score_enabled}"
+    )
+    print(
+        f"[Info] Ranking: enabled={args.ranking_enabled}, "
+        f"lambda_max={args.lambda_rank:.4f}, "
+        f"start_epoch={args.rank_start_epoch}, "
+        f"warmup_epochs={args.rank_warmup_epoch}, "
+        f"alpha_min={args.rank_alpha_min:.4f}"
     )
 
     if args.resume_path is not None:
@@ -3686,10 +3723,16 @@ def train(args: SimpleNamespace) -> None:
             "lambda_bbox": lambda_bbox,
             "lambda_giou": lambda_giou,
             "lambda_score": lambda_score,
+            "ranking_enabled": bool(args.ranking_enabled),
             "lambda_rank_max": float(args.lambda_rank),
             "lambda_aux": float(args.aux_loss_weight),
             "pos_weight": pos_weight,
             "quality_warmup_epoch": int(args.quality_warmup_epoch),
+            "score_match_rounds": int(args.score_match_rounds),
+            "score_quality_gamma": float(args.score_quality_gamma),
+            "score_round_decay": float(args.score_round_decay),
+            "score_min_iou": float(args.score_min_iou),
+            "aux_score_enabled": bool(args.aux_score_enabled),
             "rank_start_epoch": int(args.rank_start_epoch),
             "rank_warmup_epoch": int(args.rank_warmup_epoch),
             "rank_alpha_min": float(args.rank_alpha_min),
@@ -3926,8 +3969,18 @@ DEFAULT_TRAIN_CFG = {
             "quality_max": 1.0,
             "qfl_beta": 2.0,
             "quality_warmup_epoch": 20,
+
+            # Independent Main score assignment.
+            "score_match_rounds": 1,
+            "score_quality_gamma": 1.0,
+            "score_round_decay": 0.25,
+            "score_min_iou": 0.0,
+
+            # Aux remains a localization-only one-to-many branch.
+            "aux_score_enabled": False,
         },
         "ranking": {
+            "enabled": False,
             "lambda_rank": 0.10,
             "rank_margin": 0.1,
             "rank_min_quality_gap": 0.1,
@@ -4189,6 +4242,28 @@ def cfg_to_args(
         quality_max=quality_cfg.get("quality_max", 1.0),
         qfl_beta=quality_cfg.get("qfl_beta", 2.0),
         quality_warmup_epoch=quality_cfg.get("quality_warmup_epoch", 20),
+
+        # Independent Main score assignment.
+        score_match_rounds=int(
+            quality_cfg.get("score_match_rounds", 1)
+        ),
+        score_quality_gamma=float(
+            quality_cfg.get("score_quality_gamma", 1.0)
+        ),
+        score_round_decay=float(
+            quality_cfg.get("score_round_decay", 0.25)
+        ),
+        score_min_iou=float(
+            quality_cfg.get("score_min_iou", 0.0)
+        ),
+        aux_score_enabled=bool(
+            quality_cfg.get("aux_score_enabled", False)
+        ),
+
+        # Pairwise score ranking is opt-in.
+        ranking_enabled=bool(
+            ranking_cfg.get("enabled", False)
+        ),
         lambda_rank=ranking_cfg.get("lambda_rank", 0.10),
         rank_margin=ranking_cfg.get("rank_margin", 0.1),
         rank_min_quality_gap=ranking_cfg.get("rank_min_quality_gap", 0.1),
@@ -4347,10 +4422,14 @@ def print_config_summary(
         f"  quality      : iou_thr={quality.get('iou_pos_thr', 0.15)}, "
         f"q=[{quality.get('quality_min', 0.25)}, "
         f"{quality.get('quality_max', 1.0)}], "
-        f"warmup={quality.get('quality_warmup_epoch', 20)}"
+        f"warmup={quality.get('quality_warmup_epoch', 20)}, "
+        f"score_rounds={quality.get('score_match_rounds', 1)}, "
+        f"score_gamma={quality.get('score_quality_gamma', 1.0)}, "
+        f"aux_score={quality.get('aux_score_enabled', False)}"
     )
     print(
-        f"  ranking      : lambda_max={ranking.get('lambda_rank', 0.10)}, "
+        f"  ranking      : enabled={ranking.get('enabled', False)}, "
+        f"lambda_max={ranking.get('lambda_rank', 0.10)}, "
         f"start={ranking.get('rank_start_epoch', 15)}, "
         f"warmup={ranking.get('rank_warmup_epoch', 30)}, "
         f"alpha_min={ranking.get('rank_alpha_min', 0.0)}"
@@ -4667,7 +4746,7 @@ def main() -> None:
         resume=None,
         prefer_ema=True,
         project="runs/train",
-        name="lightdet_Decouple_HDETR",
+        name="lightdet_Decouple_HDETR_rank_epoch5",
     )
 
 

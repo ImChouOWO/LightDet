@@ -25,7 +25,7 @@ train:
   num_workers: 16
 
   device: cuda:1
-  seed: 47
+  seed: 48
   deterministic: false
 
   use_amp: true
@@ -59,24 +59,31 @@ optim:
 
 
 loss:
-  # Main branch 使用 Hungarian One-to-One。
-  # Auxiliary branch 使用 One-to-Many。
   hybrid:
-    aux_loss_weight: 0.5
+    # Aux 只負責增加定位正樣本。
+    aux_loss_weight: 0.35
     aux_cost_score: 0.0
 
-  # Main One-to-One matcher
   matcher:
+    # Main regression Hungarian cost。
     cost_bbox: 5.0
     cost_giou: 2.0
     cost_score: 0.0
 
-  # Auxiliary One-to-Many assignment / score sampling
   score_sampling:
-    hard_negative_ratio: 8
+    # QFL hard-negative mining。
+    hard_negative_ratio: 5
+
+    # H-DETR repeated-GT matcher 不實際依賴 positive_ratio，
+    # 保留此欄位只為了相容既有 train.py。
     positive_ratio: 1.0
-    max_positive_per_gt: 3
+
+    # H-DETR One-to-Many 的 K。
+    max_positive_per_gt: 2
+
+    # Aux score目前關閉，此參數僅保留相容性。
     aux_positive_label: 0.7
+
     expand_cost_bbox: 5.0
     expand_cost_giou: 2.0
 
@@ -85,28 +92,54 @@ loss:
     quality_min: 0.0
     quality_max: 1.0
     qfl_beta: 2.0
-    quality_warmup_epoch: 15
+
+    # 讓 quality target 在 Epoch 5 前完成 warmup。
+    quality_warmup_epoch: 5
+
+    # Main score使用獨立 IoU-only One-to-One assignment。
+    score_match_rounds: 1
+    score_quality_gamma: 1.0
+    score_round_decay: 0.25
+    score_min_iou: 0.0
+
+    # Aux只做 bbox/GIoU，不直接訓練 score。
+    aux_score_enabled: false
 
   ranking:
-    lambda_rank: 0.1
+    enabled: true
+
+    # Ranking最大貢獻權重。
+    lambda_rank: 0.05
+
     rank_margin: 0.1
     rank_min_quality_gap: 0.1
     rank_max_pairs: 512
-    rank_start_epoch: 30
-    rank_warmup_epoch: 50
-    rank_alpha_min: 0.0
+
+    # 從 Epoch 5 開始。
+    rank_start_epoch: 5
+
+    # 從 Epoch 5 起，經過25個epoch逐漸升到完整權重。
+    rank_warmup_epoch: 25
+
+    # 確保 Epoch 5 就有非零 ranking：
+    # effective lambda = 0.05 × 0.05 = 0.0025
+    rank_alpha_min: 0.05
 
   text_negative:
     max_query_loss_weight: 4.0
 
   weight:
     dynamic: true
+
     bbox_start: 5.0
     bbox_end: 4.5
     bbox_decay_until: 0.5
+
     giou: 2.0
+
+    # 已加入 ranking，因此 QFL不再提高至2.5。
     score_start: 1.5
-    score_end: 2.5
+    score_end: 2.0
     score_warm_until: 0.5
 
   pos_weight:
@@ -121,6 +154,7 @@ eval:
   # 僅評估 Main One-to-One branch。
   score_thr: 0.001
   top_k: 100
+
   nms_iou_thr: 0.5
   use_nms: false
   use_topk_fallback: false
@@ -136,7 +170,7 @@ eval:
 
 
 log:
-  save_dir: runs/train/lightdet_hybrid_grid10_seed47
+  save_dir: runs/train/lightdet_Decouple_HDETR_rank_epoch5
   resume_path: null
 
   save_latest_interval: 1
