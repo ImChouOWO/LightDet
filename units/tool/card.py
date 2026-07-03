@@ -140,19 +140,27 @@ class FusionBlock(nn.Module):
 
 class TransformerBlock(nn.Module):
     """
-    Shared Transformer with isolated Main/Aux query groups.
+    Unified decoder-only Transformer for multimodal object queries.
 
-    Isolation is implemented by stacking the two groups on the batch
-    dimension before a single TransformerEncoder call:
+    Context sequence:
+        [Fusion Tokens, Image Tokens, Text Tokens]
 
-        [B, T, C] main
-        [B, T, C] aux
-            -> cat(dim=0)
-        [2B, T, C]
+    Prediction sequence:
+        [Context Tokens, Object Queries]
 
-    Self-attention never crosses batch elements, so Main and Aux cannot read
-    each other's token states. The Transformer weights remain shared and the
-    two groups are still processed in one batched GPU call.
+    Main and auxiliary branches:
+      - share Transformer weights;
+      - use different learnable object-query embeddings;
+      - are stacked along the batch dimension;
+      - cannot attend to each other because self-attention never crosses
+        different batch elements.
+
+    Prefix-style attention:
+      - context tokens may attend only to context tokens;
+      - object queries may attend to all context tokens and all object queries.
+
+    This preserves a single self-attention stack while giving object queries
+    decoder-like access to image, text, and fusion information.
     """
 
     MAIN_GROUP = 0
@@ -177,9 +185,8 @@ class TransformerBlock(nn.Module):
             fusion_token_num=fusion_token_num,
         )
 
-        # Distinguishes the duplicated prediction-token groups while keeping
-        # all Transformer weights shared. Main starts as the legacy path;
-        # Aux receives a small learned offset to break symmetry.
+        # The group embedding is applied only to object queries. Context
+        # tokens remain identical between Main and Aux branches.
         self.query_group_embeddings = nn.Parameter(
             torch.zeros(
                 2,
@@ -187,6 +194,7 @@ class TransformerBlock(nn.Module):
                 self.hidden_dim,
             )
         )
+
         if float(query_group_init_std) > 0.0:
             nn.init.normal_(
                 self.query_group_embeddings.data[
@@ -196,7 +204,7 @@ class TransformerBlock(nn.Module):
                 std=float(query_group_init_std),
             )
 
-        encoder_layer = nn.TransformerEncoderLayer(
+        transformer_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
             dim_feedforward=int(
@@ -208,81 +216,250 @@ class TransformerBlock(nn.Module):
             norm_first=True,
         )
 
+        # PyTorch calls this TransformerEncoder, but here it is used as one
+        # unified decoder-only self-attention stack over context + queries.
         self.transformer = nn.TransformerEncoder(
-            encoder_layer,
+            transformer_layer,
             num_layers=num_layers,
         )
 
-        self.norm = nn.LayerNorm(
-            hidden_dim
-        )
+        self.norm = nn.LayerNorm(hidden_dim)
 
     @staticmethod
     def _build_padding_mask(
-        mask: torch.Tensor | None,
+        valid_mask: torch.Tensor | None,
     ) -> torch.Tensor | None:
-        if mask is None:
+        """
+        Convert valid-token mask (1=valid) to Transformer padding mask
+        (True=masked).
+        """
+        if valid_mask is None:
             return None
-        return torch.eq(mask, 0)
+        return torch.eq(valid_mask, 0)
+
+    @staticmethod
+    def _build_prefix_attention_mask(
+        context_length: int,
+        query_length: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Prefix-style attention mask.
+
+        Rows are readers and columns are keys/values.
+
+        Context -> Context: allowed
+        Context -> Query  : blocked
+        Query   -> Context: allowed
+        Query   -> Query  : allowed
+        """
+        context_length = int(context_length)
+        query_length = int(query_length)
+        total_length = context_length + query_length
+
+        attention_mask = torch.zeros(
+            total_length,
+            total_length,
+            dtype=torch.bool,
+            device=device,
+        )
+
+        attention_mask[
+            :context_length,
+            context_length:,
+        ] = True
+
+        return attention_mask
+
+    def _validate_queries(
+        self,
+        name: str,
+        queries: torch.Tensor,
+        *,
+        batch_size: int,
+    ) -> None:
+        if queries.ndim != 3:
+            raise ValueError(
+                f"{name} must have shape [B, Q, C], "
+                f"got {tuple(queries.shape)}"
+            )
+
+        if int(queries.shape[0]) != int(batch_size):
+            raise ValueError(
+                f"{name} batch size mismatch: "
+                f"{queries.shape[0]} != {batch_size}"
+            )
+
+        if int(queries.shape[-1]) != self.hidden_dim:
+            raise ValueError(
+                f"{name} hidden dimension mismatch: "
+                f"{queries.shape[-1]} != {self.hidden_dim}"
+            )
+
+        if int(queries.shape[1]) <= 0:
+            raise ValueError(
+                f"{name} must contain at least one object query"
+            )
 
     def _add_group_embedding(
         self,
-        x: torch.Tensor,
+        queries: torch.Tensor,
         group_index: int,
     ) -> torch.Tensor:
         return (
-            x
+            queries
             + self.query_group_embeddings[
                 int(group_index)
             ].to(
-                device=x.device,
-                dtype=x.dtype,
+                device=queries.device,
+                dtype=queries.dtype,
             )
+        )
+
+    @staticmethod
+    def _extend_valid_mask(
+        context_valid_mask: torch.Tensor | None,
+        *,
+        batch_size: int,
+        query_length: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if context_valid_mask is None:
+            return None
+
+        query_valid_mask = torch.ones(
+            int(batch_size),
+            int(query_length),
+            dtype=context_valid_mask.dtype,
+            device=device,
+        )
+
+        return torch.cat(
+            [
+                context_valid_mask,
+                query_valid_mask,
+            ],
+            dim=1,
         )
 
     def forward(
         self,
-        img_token,
-        text_token,
-        text_mask,
-        return_aux=False,
+        img_token: torch.Tensor,
+        text_token: torch.Tensor,
+        text_mask: torch.Tensor | None,
+        main_queries: torch.Tensor,
+        aux_queries: torch.Tensor | None = None,
+        return_aux: bool = False,
     ):
         """
+        Args:
+            img_token:
+                [B, N_image, C]
+            text_token:
+                [B, N_text, C]
+            text_mask:
+                [B, N_text], 1 for valid text token.
+            main_queries:
+                [B, N_query, C]
+            aux_queries:
+                [B, N_query, C] when return_aux=True.
+
         Returns:
-            main_out: [B, T, C]
-            aux_out : [B, T, C] or None
+            main_out:
+                [B, N_context + N_query, C]
+            aux_out:
+                [B, N_context + N_query, C] or None
         """
-        base_x, mask = self.fuse(
+        context, context_valid_mask = self.fuse(
             img_token,
             text_token,
             text_mask,
         )
-        padding_mask = self._build_padding_mask(
-            mask
+
+        batch_size = int(context.shape[0])
+        context_length = int(context.shape[1])
+
+        self._validate_queries(
+            "main_queries",
+            main_queries,
+            batch_size=batch_size,
         )
 
-        main_x = self._add_group_embedding(
-            base_x,
+        query_length = int(main_queries.shape[1])
+
+        main_queries = self._add_group_embedding(
+            main_queries,
             self.MAIN_GROUP,
+        )
+        main_sequence = torch.cat(
+            [
+                context,
+                main_queries,
+            ],
+            dim=1,
+        )
+
+        complete_valid_mask = self._extend_valid_mask(
+            context_valid_mask,
+            batch_size=batch_size,
+            query_length=query_length,
+            device=context.device,
+        )
+        padding_mask = self._build_padding_mask(
+            complete_valid_mask
+        )
+
+        attention_mask = self._build_prefix_attention_mask(
+            context_length=context_length,
+            query_length=query_length,
+            device=context.device,
         )
 
         if not bool(return_aux):
             main_out = self.transformer(
-                main_x,
+                main_sequence,
+                mask=attention_mask,
                 src_key_padding_mask=padding_mask,
             )
             return self.norm(main_out), None
 
-        aux_x = self._add_group_embedding(
-            base_x,
-            self.AUX_GROUP,
+        if aux_queries is None:
+            raise ValueError(
+                "aux_queries is required when return_aux=True"
+            )
+
+        self._validate_queries(
+            "aux_queries",
+            aux_queries,
+            batch_size=batch_size,
         )
 
-        # Batch-axis grouping gives exact query isolation without creating a
-        # 2T x 2T attention matrix. This is more efficient than concatenating
-        # both groups along the token dimension with a block-diagonal mask.
-        grouped_x = torch.cat(
-            [main_x, aux_x],
+        if int(aux_queries.shape[1]) != query_length:
+            raise ValueError(
+                "Main and Aux query counts must match for "
+                "batch-axis grouping: "
+                f"{query_length} != {aux_queries.shape[1]}"
+            )
+
+        aux_queries = self._add_group_embedding(
+            aux_queries,
+            self.AUX_GROUP,
+        )
+        aux_sequence = torch.cat(
+            [
+                context,
+                aux_queries,
+            ],
+            dim=1,
+        )
+
+        # Main and Aux sequences are isolated by the batch dimension while
+        # still sharing exactly the same Transformer parameters.
+        grouped_sequence = torch.cat(
+            [
+                main_sequence,
+                aux_sequence,
+            ],
             dim=0,
         )
 
@@ -290,21 +467,20 @@ class TransformerBlock(nn.Module):
             grouped_padding_mask = None
         else:
             grouped_padding_mask = torch.cat(
-                [padding_mask, padding_mask],
+                [
+                    padding_mask,
+                    padding_mask,
+                ],
                 dim=0,
             )
 
         grouped_out = self.transformer(
-            grouped_x,
-            src_key_padding_mask=(
-                grouped_padding_mask
-            ),
+            grouped_sequence,
+            mask=attention_mask,
+            src_key_padding_mask=grouped_padding_mask,
         )
-        grouped_out = self.norm(
-            grouped_out
-        )
+        grouped_out = self.norm(grouped_out)
 
-        batch_size = int(base_x.shape[0])
         main_out = grouped_out[:batch_size]
         aux_out = grouped_out[batch_size:]
 
@@ -992,13 +1168,14 @@ class BackBone(nn.Module):
         in_channels,
         out_channels=1024,
         target_size=(40, 40),
+        layer_num=3,
     ):
         super().__init__()
 
         self.backbone = ImgProjector(
             in_channels=in_channels,
             out_channels=out_channels,
-            layer_num=3,
+            layer_num=layer_num,
             expand_ratio=2.0,
             target_size=target_size,
         )
@@ -1064,56 +1241,26 @@ class BottleNet(nn.Module):
         return self.stem(x)
 
 
-class DenseHead(nn.Module):
+class QueryHead(nn.Module):
     """
-    Single prediction branch.
+    Decoupled prediction head for final object-query features.
 
-    The main one-to-one branch and auxiliary one-to-many branch use separate
-    DenseHead instances. Their bbox and score parameters are not shared.
+    Input:
+        query_tokens: [B, N_query, C]
+
+    Output:
+        bbox:        [B, N_query, 4]
+        score_logit: [B, N_query, 1]
     """
 
     def __init__(
         self,
         hidden_dim=512,
-        num_fusion=16,
-        num_image=400,
-        num_text=32,
-        alpha=0.4,
     ):
         super().__init__()
 
-        self.num_fusion = int(
-            num_fusion
-        )
-        self.num_image = int(
-            num_image
-        )
-        self.num_text = int(
-            num_text
-        )
-
-        if self.num_fusion < 0:
-            raise ValueError(
-                "num_fusion must be >= 0, "
-                f"got {self.num_fusion}"
-            )
-
-        if self.num_image <= 0:
-            raise ValueError(
-                "num_image must be > 0, "
-                f"got {self.num_image}"
-            )
-
-        if self.num_text < 0:
-            raise ValueError(
-                "num_text must be >= 0, "
-                f"got {self.num_text}"
-            )
-
         self.bbox_head = nn.Sequential(
-            nn.LayerNorm(
-                hidden_dim
-            ),
+            nn.LayerNorm(hidden_dim),
             nn.Linear(
                 hidden_dim,
                 hidden_dim,
@@ -1126,9 +1273,7 @@ class DenseHead(nn.Module):
         )
 
         self.score_head = nn.Sequential(
-            nn.LayerNorm(
-                hidden_dim
-            ),
+            nn.LayerNorm(hidden_dim),
             nn.Linear(
                 hidden_dim,
                 hidden_dim,
@@ -1144,9 +1289,7 @@ class DenseHead(nn.Module):
     def _decode_xyxy(
         bbox_raw: torch.Tensor,
     ) -> torch.Tensor:
-        bbox_raw = (
-            bbox_raw.sigmoid()
-        )
+        bbox_raw = bbox_raw.sigmoid()
 
         x1 = torch.minimum(
             bbox_raw[..., 0],
@@ -1177,51 +1320,23 @@ class DenseHead(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        query_tokens: torch.Tensor,
     ):
-        if x.ndim != 3:
+        if query_tokens.ndim != 3:
             raise ValueError(
-                "DenseHead input must have "
-                "shape [B, T, C], got "
-                f"{tuple(x.shape)}"
+                "QueryHead input must have shape "
+                f"[B, N_query, C], got {tuple(query_tokens.shape)}"
             )
-
-        image_start = (
-            self.num_fusion
-        )
-        image_end = (
-            image_start
-            + self.num_image
-        )
-
-        if (
-            int(x.shape[1])
-            < image_end
-        ):
-            raise ValueError(
-                "DenseHead input token "
-                "count is too small: "
-                f"tokens={x.shape[1]}, "
-                f"required={image_end}"
-            )
-
-        img_tokens = x[
-            :,
-            image_start:image_end,
-            :,
-        ]
 
         bbox_raw = self.bbox_head(
-            img_tokens
+            query_tokens
         )
         bbox = self._decode_xyxy(
             bbox_raw
         )
 
-        score_logit = (
-            self.score_head(
-                img_tokens
-            )
+        score_logit = self.score_head(
+            query_tokens
         )
 
         return bbox, score_logit
@@ -1229,25 +1344,28 @@ class DenseHead(nn.Module):
 
 class VisionTextModel(nn.Module):
     """
-    H-DETR-style query-isolated LightDet model.
+    Decoder-only, object-query-based LightDet model.
 
-    Shared:
-        BottleNet / image projector / BERT / Transformer weights
+    Shared context:
+        BottleNet -> image projector -> Image Tokens
+        BERT -> Text Tokens
+        FusionBlock -> Fusion Tokens
 
-    Main query group:
-        Isolated Transformer sequence
-        self.head
-        One-to-one loss
+    Unified Transformer input:
+        [Fusion, Image, Text, Object Queries]
+
+    Main branch:
+        Main object queries
+        One-to-one Hungarian matching
         Used for validation and inference
 
-    Auxiliary query group:
-        Isolated Transformer sequence
-        self.aux_head
-        Repeated-GT one-to-many loss
-        Used during training only by default
+    Auxiliary branch:
+        Auxiliary object queries
+        Repeated-GT one-to-many matching
+        Used during training by default
 
-    The two groups are stacked along the Transformer batch dimension. They
-    share weights and source features but cannot exchange self-attention.
+    Main and Aux share the Transformer weights but remain attention-isolated
+    by batch-axis grouping. Their QueryHead parameters are independent.
     """
 
     def __init__(
@@ -1257,6 +1375,7 @@ class VisionTextModel(nn.Module):
         target_size=(20, 20),
         text_max_length=32,
         fusion_token_num=16,
+        num_object_queries=100,
         num_heads=8,
         num_layers=1,
         mlp_ratio=4.0,
@@ -1266,20 +1385,19 @@ class VisionTextModel(nn.Module):
         use_auxiliary_head=True,
         auxiliary_in_eval=False,
         initialize_aux_from_main=True,
+        query_init_std=0.02,
         query_group_init_std=0.02,
+        cnn_layer=3,
     ):
         super().__init__()
 
         if len(target_size) != 2:
             raise ValueError(
-                "target_size must contain "
-                "two dimensions, got "
-                f"{target_size}"
+                "target_size must contain two dimensions, "
+                f"got {target_size}"
             )
 
-        self.hidden_dim = int(
-            hidden_dim
-        )
+        self.hidden_dim = int(hidden_dim)
         self.target_size = (
             int(target_size[0]),
             int(target_size[1]),
@@ -1287,6 +1405,15 @@ class VisionTextModel(nn.Module):
         self.fusion_token_num = int(
             fusion_token_num
         )
+        self.num_object_queries = int(
+            num_object_queries
+        )
+
+        if self.num_object_queries <= 0:
+            raise ValueError(
+                "num_object_queries must be > 0, "
+                f"got {self.num_object_queries}"
+            )
 
         self.num_image = (
             self.target_size[0]
@@ -1305,83 +1432,92 @@ class VisionTextModel(nn.Module):
 
         self.bottle_net = BottleNet(
             in_channels=3,
-            out_channels=(
-                img_in_channels
-            ),
+            out_channels=img_in_channels,
         )
 
         self.img_model = BackBone(
-            in_channels=(
-                img_in_channels
-            ),
+            in_channels=img_in_channels,
             out_channels=hidden_dim,
-            target_size=(
-                self.target_size
-            ),
+            target_size=self.target_size,
+            layer_num=cnn_layer,
+        )
+
+        # Learned 2D-grid position embedding after flattening the projected
+        # target_size feature map. This gives object queries explicit spatial
+        # information when reading image tokens.
+        self.image_position_embeddings = nn.Parameter(
+            torch.zeros(
+                1,
+                self.num_image,
+                self.hidden_dim,
+            )
+        )
+        nn.init.normal_(
+            self.image_position_embeddings,
+            mean=0.0,
+            std=0.02,
         )
 
         self.text_model = Bert(
             out_dim=hidden_dim,
-            max_length=(
-                text_max_length
-            ),
-            freeze_bert=(
-                freeze_bert
-            ),
-            precomputed_bert_path=(
-                precomputed_bert_path
-            ),
+            max_length=text_max_length,
+            freeze_bert=freeze_bert,
+            precomputed_bert_path=precomputed_bert_path,
         )
 
-        self.transformer = (
-            TransformerBlock(
-                hidden_dim=hidden_dim,
-                fusion_token_num=(
-                    fusion_token_num
-                ),
-                num_heads=num_heads,
-                num_layers=num_layers,
-                mlp_ratio=mlp_ratio,
-                dropout=dropout,
-                query_group_init_std=(
-                    query_group_init_std
-                ),
+        # Independent learned search slots for Main and Aux branches.
+        self.main_object_queries = nn.Embedding(
+            self.num_object_queries,
+            self.hidden_dim,
+        )
+        self.aux_object_queries = (
+            nn.Embedding(
+                self.num_object_queries,
+                self.hidden_dim,
             )
+            if self.use_auxiliary_head
+            else None
         )
 
-        # Main one-to-one branch.
-        # Keep the original "head.*" namespace for checkpoint compatibility.
-        self.head = DenseHead(
+        nn.init.normal_(
+            self.main_object_queries.weight,
+            mean=0.0,
+            std=float(query_init_std),
+        )
+        if self.aux_object_queries is not None:
+            nn.init.normal_(
+                self.aux_object_queries.weight,
+                mean=0.0,
+                std=float(query_init_std),
+            )
+
+        self.transformer = TransformerBlock(
             hidden_dim=hidden_dim,
-            num_fusion=(
-                fusion_token_num
-            ),
-            num_image=self.num_image,
-            num_text=self.num_text,
+            fusion_token_num=fusion_token_num,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            mlp_ratio=mlp_ratio,
+            dropout=dropout,
+            query_group_init_std=query_group_init_std,
         )
 
-        # Auxiliary one-to-many branch.
+        # Keep the "head.*" namespace for checkpoint compatibility. The
+        # parameter names inside QueryHead match the previous DenseHead.
+        self.head = QueryHead(
+            hidden_dim=hidden_dim,
+        )
+
         self.aux_head = (
-            DenseHead(
+            QueryHead(
                 hidden_dim=hidden_dim,
-                num_fusion=(
-                    fusion_token_num
-                ),
-                num_image=(
-                    self.num_image
-                ),
-                num_text=self.num_text,
             )
             if self.use_auxiliary_head
             else None
         )
 
         if (
-            self.aux_head
-            is not None
-            and bool(
-                initialize_aux_from_main
-            )
+            self.aux_head is not None
+            and bool(initialize_aux_from_main)
         ):
             self.initialize_auxiliary_head_from_main()
 
@@ -1393,6 +1529,12 @@ class VisionTextModel(nn.Module):
     def initialize_auxiliary_head_from_main(
         self,
     ) -> None:
+        """
+        Initialize the auxiliary prediction branch from Main.
+
+        The object-query table is copied once, but remains an independent
+        parameter afterwards. The Aux group embedding still breaks symmetry.
+        """
         if self.aux_head is None:
             return
 
@@ -1400,6 +1542,11 @@ class VisionTextModel(nn.Module):
             self.head.state_dict(),
             strict=True,
         )
+
+        if self.aux_object_queries is not None:
+            self.aux_object_queries.weight.copy_(
+                self.main_object_queries.weight
+            )
 
     def set_auxiliary_in_eval(
         self,
@@ -1416,57 +1563,107 @@ class VisionTextModel(nn.Module):
         if (
             not self.use_auxiliary_head
             or self.aux_head is None
+            or self.aux_object_queries is None
         ):
             return False
 
         if return_aux is not None:
-            return bool(
-                return_aux
-            )
+            return bool(return_aux)
 
         if self.training:
             return True
 
-        return bool(
-            self.auxiliary_in_eval
+        return bool(self.auxiliary_in_eval)
+
+    @staticmethod
+    def _expand_object_queries(
+        query_embedding: nn.Embedding,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Expand learned query table:
+            [N_query, C] -> [B, N_query, C]
+        """
+        query_weight = query_embedding.weight.to(
+            device=device,
+            dtype=dtype,
+        )
+
+        return (
+            query_weight
+            .unsqueeze(0)
+            .expand(
+                int(batch_size),
+                -1,
+                -1,
+            )
         )
 
     def _prepare_legacy_state_dict(
         self,
         state_dict,
     ):
+        """
+        Load older dense checkpoints as initialization.
+
+        Existing backbone, Transformer, bbox-head, and score-head weights are
+        reused. Newly introduced object queries and image position embeddings
+        are initialized from the current model when absent.
+        """
         prepared = state_dict.copy()
 
-        # Old checkpoints do not contain the query-group embedding because
-        # Main/Aux previously consumed the same Transformer output.
-        group_key = (
-            "transformer."
-            "query_group_embeddings"
-        )
-        if group_key not in prepared:
-            prepared[group_key] = (
+        default_keys = {
+            "transformer.query_group_embeddings": (
                 self.transformer
                 .query_group_embeddings
                 .detach()
                 .clone()
+            ),
+            "image_position_embeddings": (
+                self.image_position_embeddings
+                .detach()
+                .clone()
+            ),
+            "main_object_queries.weight": (
+                self.main_object_queries
+                .weight
+                .detach()
+                .clone()
+            ),
+        }
+
+        if self.aux_object_queries is not None:
+            default_keys[
+                "aux_object_queries.weight"
+            ] = (
+                self.aux_object_queries
+                .weight
+                .detach()
+                .clone()
             )
+
+        for key, value in default_keys.items():
+            if key not in prepared:
+                prepared[key] = value
 
         if self.aux_head is None:
             return {
                 key: value
-                for key, value
-                in prepared.items()
-                if not str(key).startswith(
-                    "aux_head."
+                for key, value in prepared.items()
+                if (
+                    not str(key).startswith("aux_head.")
+                    and not str(key).startswith(
+                        "aux_object_queries."
+                    )
                 )
             }
 
         has_auxiliary_weights = any(
-            str(key).startswith(
-                "aux_head."
-            )
-            for key
-            in prepared.keys()
+            str(key).startswith("aux_head.")
+            for key in prepared.keys()
         )
 
         if not has_auxiliary_weights:
@@ -1486,16 +1683,10 @@ class VisionTextModel(nn.Module):
                 suffix = key_text[
                     len(main_prefix):
                 ]
-
-                aux_key = (
-                    aux_prefix
-                    + suffix
-                )
+                aux_key = aux_prefix + suffix
 
                 if aux_key not in prepared:
-                    prepared[aux_key] = (
-                        value
-                    )
+                    prepared[aux_key] = value
 
         return prepared
 
@@ -1505,26 +1696,20 @@ class VisionTextModel(nn.Module):
         strict=True,
         assign=False,
     ):
-        prepared = (
-            self._prepare_legacy_state_dict(
-                state_dict
-            )
+        prepared = self._prepare_legacy_state_dict(
+            state_dict
         )
 
         try:
-            return (
-                super().load_state_dict(
-                    prepared,
-                    strict=strict,
-                    assign=assign,
-                )
+            return super().load_state_dict(
+                prepared,
+                strict=strict,
+                assign=assign,
             )
         except TypeError:
-            return (
-                super().load_state_dict(
-                    prepared,
-                    strict=strict,
-                )
+            return super().load_state_dict(
+                prepared,
+                strict=strict,
             )
 
     def forward(
@@ -1534,45 +1719,42 @@ class VisionTextModel(nn.Module):
         image_indices=None,
         return_aux=None,
     ):
-        img = self.bottle_net(
-            img
-        )
-        img_token = self.img_model(
-            img
+        img = self.bottle_net(img)
+        img_token = self.img_model(img)
+
+        if int(img_token.shape[1]) != self.num_image:
+            raise RuntimeError(
+                "Image token count does not match configured target_size: "
+                f"{img_token.shape[1]} != {self.num_image}"
+            )
+
+        img_token = (
+            img_token
+            + self.image_position_embeddings.to(
+                device=img_token.device,
+                dtype=img_token.dtype,
+            )
         )
 
         if image_indices is not None:
             if not torch.is_tensor(
                 image_indices
             ):
-                image_indices = (
-                    torch.tensor(
-                        image_indices,
-                        dtype=torch.long,
-                        device=(
-                            img_token.device
-                        ),
-                    )
+                image_indices = torch.tensor(
+                    image_indices,
+                    dtype=torch.long,
+                    device=img_token.device,
                 )
             else:
-                image_indices = (
-                    image_indices.to(
-                        device=(
-                            img_token.device
-                        ),
-                        dtype=torch.long,
-                        non_blocking=True,
-                    )
+                image_indices = image_indices.to(
+                    device=img_token.device,
+                    dtype=torch.long,
+                    non_blocking=True,
                 )
 
-            image_indices = (
-                image_indices.reshape(-1)
-            )
+            image_indices = image_indices.reshape(-1)
 
-            if (
-                image_indices.numel()
-                > 0
-            ):
+            if image_indices.numel() > 0:
                 minimum_index = int(
                     image_indices.min().item()
                 )
@@ -1582,132 +1764,138 @@ class VisionTextModel(nn.Module):
 
                 if minimum_index < 0:
                     raise IndexError(
-                        "image_indices contains "
-                        "a negative index: "
+                        "image_indices contains a negative index: "
                         f"{minimum_index}"
                     )
 
-                if (
-                    maximum_index
-                    >= int(
-                        img_token.shape[0]
-                    )
+                if maximum_index >= int(
+                    img_token.shape[0]
                 ):
                     raise IndexError(
-                        "image_indices exceeds "
-                        "image batch: "
-                        f"max_index="
-                        f"{maximum_index}, "
-                        f"image_batch="
-                        f"{img_token.shape[0]}"
+                        "image_indices exceeds image batch: "
+                        f"max_index={maximum_index}, "
+                        f"image_batch={img_token.shape[0]}"
                     )
 
-            img_token = (
-                img_token.index_select(
-                    0,
-                    image_indices,
-                )
+            img_token = img_token.index_select(
+                0,
+                image_indices,
             )
 
-        text_out = self.text_model(
-            texts
-        )
-        text_token = text_out[
-            "text_tokens"
-        ]
-        text_mask = text_out[
-            "text_mask"
-        ]
+        text_out = self.text_model(texts)
+        text_token = text_out["text_tokens"]
+        text_mask = text_out["text_mask"]
 
-        if (
-            int(img_token.shape[0])
-            != int(
-                text_token.shape[0]
-            )
+        if int(img_token.shape[0]) != int(
+            text_token.shape[0]
         ):
             raise ValueError(
-                "Image-query batch size "
-                "mismatch: "
+                "Image-query batch size mismatch: "
                 f"image={img_token.shape[0]}, "
                 f"text={text_token.shape[0]}"
             )
 
-        compute_auxiliary = (
-            self._resolve_return_aux(
-                return_aux
-            )
+        compute_auxiliary = self._resolve_return_aux(
+            return_aux
         )
+        batch_size = int(img_token.shape[0])
+
+        main_queries = self._expand_object_queries(
+            self.main_object_queries,
+            batch_size=batch_size,
+            device=img_token.device,
+            dtype=img_token.dtype,
+        )
+
+        aux_queries = None
+        if compute_auxiliary:
+            if self.aux_object_queries is None:
+                raise RuntimeError(
+                    "Auxiliary queries are not initialized"
+                )
+
+            aux_queries = self._expand_object_queries(
+                self.aux_object_queries,
+                batch_size=batch_size,
+                device=img_token.device,
+                dtype=img_token.dtype,
+            )
 
         (
             main_transformer_out,
             aux_transformer_out,
         ) = self.transformer(
-            img_token,
-            text_token,
-            text_mask,
+            img_token=img_token,
+            text_token=text_token,
+            text_mask=text_mask,
+            main_queries=main_queries,
+            aux_queries=aux_queries,
             return_aux=compute_auxiliary,
         )
+
+        # Object queries are appended after all context tokens.
+        main_query_out = main_transformer_out[
+            :,
+            -self.num_object_queries:,
+            :,
+        ]
 
         (
             main_bbox,
             main_score_logit,
-        ) = self.head(
-            main_transformer_out
-        )
+        ) = self.head(main_query_out)
 
         aux_bbox = None
         aux_score_logit = None
+        aux_query_out = None
 
         if compute_auxiliary:
             if aux_transformer_out is None:
                 raise RuntimeError(
-                    "Auxiliary output was requested "
-                    "but Transformer returned None."
+                    "Auxiliary output was requested but "
+                    "Transformer returned None"
                 )
+
+            aux_query_out = aux_transformer_out[
+                :,
+                -self.num_object_queries:,
+                :,
+            ]
 
             (
                 aux_bbox,
                 aux_score_logit,
-            ) = self.aux_head(
-                aux_transformer_out
-            )
+            ) = self.aux_head(aux_query_out)
 
         return {
-            # Backward-compatible main aliases.
+            # Backward-compatible Main aliases.
             "bbox": main_bbox,
-            "score_logit": (
-                main_score_logit
-            ),
+            "score_logit": main_score_logit,
 
-            # Explicit hybrid names.
+            # Explicit hybrid predictions.
             "main_bbox": main_bbox,
-            "main_score_logit": (
-                main_score_logit
-            ),
+            "main_score_logit": main_score_logit,
             "aux_bbox": aux_bbox,
-            "aux_score_logit": (
-                aux_score_logit
-            ),
-            "aux_computed": bool(
-                compute_auxiliary
-            ),
+            "aux_score_logit": aux_score_logit,
+            "aux_computed": bool(compute_auxiliary),
 
-            # Backward-compatible diagnostic alias points to Main.
-            "transformer_out": (
-                main_transformer_out
-            ),
+            # Final object-query representations.
+            "main_object_query_out": main_query_out,
+            "aux_object_query_out": aux_query_out,
 
-            # Explicit isolated-group diagnostics.
-            "main_transformer_out": (
-                main_transformer_out
-            ),
-            "aux_transformer_out": (
-                aux_transformer_out
-            ),
+            # Initial learned queries expanded to the current batch.
+            "main_object_queries": main_queries,
+            "aux_object_queries": aux_queries,
+
+            # Full decoder-only sequence outputs for diagnostics.
+            "transformer_out": main_transformer_out,
+            "main_transformer_out": main_transformer_out,
+            "aux_transformer_out": aux_transformer_out,
+
             "query_groups_isolated": True,
-            "query_group_batching": (
-                "batch_axis"
-            ),
+            "query_group_batching": "batch_axis",
+            "prediction_source": "object_queries",
+            "decoder_only": True,
 
             "img_token": img_token,
             "text_token": text_token,
@@ -1722,6 +1910,7 @@ if __name__ == "__main__":
         target_size=(10, 10),
         text_max_length=32,
         fusion_token_num=16,
+        num_object_queries=100,
         num_heads=8,
         num_layers=1,
         use_auxiliary_head=True,

@@ -1,18 +1,27 @@
 model:
+  # Image branch
   img_in_channels: 1024
-  hidden_dim: 512
-  num_heads: 8
-  num_layers: 4
-  mlp_ratio: 3.0
-  image_grid_size: 20
-  text_max_length: 32
-  fusion_token_num: 64
-  dropout: 0.15
   cnn_layers: 3
+  hidden_dim: 512
+  image_grid_size: 10
 
+  # Decoder-only object-query branch
+  num_object_queries: 100
+  query_group_init_std: 0.02
+  fusion_token_num: 16
+
+  # Shared Transformer
+  num_heads: 8
+  num_layers: 3
+  mlp_ratio: 3.5
+  dropout: 0.1
+
+  # Text branch
+  text_max_length: 32
   freeze_bert: true
-  precomputed_bert_path: /home/soic/Desktop/LightDet/units/model/cards/cache/bert_raw_cache.pt
+  precomputed_bert_path: units/model/cards/cache/bert_raw_cache.pt
 
+  # H-DETR Main/Aux branches
   use_auxiliary_head: true
   auxiliary_in_eval: false
   initialize_aux_from_main: true

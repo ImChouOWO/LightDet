@@ -23,44 +23,6 @@ def smoothstep(x: float) -> float:
     return x * x * (3.0 - 2.0 * x)
 
 
-def cosine_ramp(x: float) -> float:
-    """Cosine 0 -> 1 ramp with zero slope at both ends."""
-    x = clamp01(x)
-    return 0.5 - 0.5 * math.cos(math.pi * x)
-
-
-def schedule_progress(
-    current_epoch: Optional[int],
-    start_epoch: int,
-    duration: int,
-    *,
-    curve: str = "smoothstep",
-) -> float:
-    """Resolve a stable 0 -> 1 epoch schedule."""
-    if current_epoch is None:
-        return 1.0
-    if int(current_epoch) < int(start_epoch):
-        return 0.0
-    progress = (
-        float(current_epoch) - float(start_epoch) + 1.0
-    ) / float(max(int(duration), 1))
-    curve = str(curve).strip().lower()
-    if curve == "linear":
-        return clamp01(progress)
-    if curve == "cosine":
-        return cosine_ramp(progress)
-    return smoothstep(progress)
-
-
-def interpolate_value(
-    start: float,
-    end: float,
-    alpha: float,
-) -> float:
-    alpha = clamp01(alpha)
-    return float(start) + (float(end) - float(start)) * alpha
-
-
 def box_area(boxes: torch.Tensor) -> torch.Tensor:
     """Compute box area for boxes in normalized or pixel xyxy format."""
     return (
@@ -767,89 +729,44 @@ class HungarianOneToOneMatcher:
 
 class HDETRRepeatedHungarianMatcher:
     """
-    H-DETR auxiliary one-to-many matcher.
+    H-DETR-style auxiliary matcher.
 
-    Each ground-truth box is repeated ``repeat_k`` times before bipartite
-    assignment. The matching cost follows the DETR family:
-
-        classification + L1 + GIoU
-
-    The classification cost is dynamically scheduled. Early epochs can use
-    pure localization matching, then progressively introduce text-conditioned
-    confidence after the score head becomes meaningful.
+    Each GT is repeated K times, then a bipartite matching is performed
+    against the augmented target set. Score logits are intentionally excluded
+    from the cost so confidence learning cannot change regression assignment.
 
     Fast paths:
-      - Empty and single-GT rows remain fully batched on GPU.
-      - Equal-size multi-GT rows share one batched cost computation and one
-        GPU-to-CPU copy per GT-count group. Only SciPy assignment remains a
-        short per-sample loop because SciPy has no batched Hungarian API.
+      - 0/1 GT rows are fully vectorized with batched Top-K.
+      - Multi-GT rows are grouped by equal GT count. Base costs are computed
+        in batched GPU tensors and copied to CPU once per group. SciPy
+        Hungarian remains per query because SciPy has no batched API.
+
+    max_positive_per_gt is the H-DETR repeat factor K. positive_ratio is kept
+    only for backward compatibility and is not used.
     """
 
     def __init__(
         self,
         cost_bbox: float = 5.0,
         cost_giou: float = 2.0,
-        cost_score: float = 2.0,
+        cost_score: float = 0.0,
         positive_ratio: float = 0.05,
-        max_positive_per_gt: int = 5,
+        max_positive_per_gt: int = 2,
         min_extra_positive_iou: float = 0.0,
-        score_cost_type: str = "focal",
-        focal_alpha: float = 0.25,
-        focal_gamma: float = 2.0,
     ) -> None:
-        if (
-            float(cost_bbox) == 0.0
-            and float(cost_giou) == 0.0
-            and float(cost_score) == 0.0
-        ):
+        if float(cost_bbox) == 0.0 and float(cost_giou) == 0.0:
             raise ValueError(
-                "At least one H-DETR matching cost must be non-zero."
-            )
-
-        aliases = {
-            "focal": "focal",
-            "focal_loss": "focal",
-            "prob": "probability",
-            "probability": "probability",
-            "score": "probability",
-        }
-        score_cost_type = str(score_cost_type).strip().lower()
-        if score_cost_type not in aliases:
-            raise ValueError(
-                "score_cost_type must be 'focal' or 'probability', got "
-                f"{score_cost_type!r}"
+                "At least one H-DETR regression matching cost must be non-zero."
             )
 
         self.cost_bbox = float(cost_bbox)
         self.cost_giou = float(cost_giou)
-        self.cost_score = float(cost_score)
         self.repeat_k = max(1, int(max_positive_per_gt))
         self.min_extra_positive_iou = clamp01(min_extra_positive_iou)
-        self.score_cost_type = aliases[score_cost_type]
-        self.focal_alpha = clamp01(focal_alpha)
-        self.focal_gamma = max(0.0, float(focal_gamma))
 
-        # Retained only for backward-compatible configuration parsing.
+        # Retained for config compatibility. It is intentionally not used.
+        self.configured_cost_score = float(cost_score)
         self.configured_positive_ratio = float(positive_ratio)
-
-    def _score_cost(self, score_prob: torch.Tensor) -> torch.Tensor:
-        score_prob = score_prob.clamp(1e-6, 1.0 - 1e-6)
-        if self.score_cost_type == "probability":
-            return -score_prob
-
-        alpha = float(self.focal_alpha)
-        gamma = float(self.focal_gamma)
-        negative_cost = (
-            (1.0 - alpha)
-            * score_prob.pow(gamma)
-            * (-(1.0 - score_prob).log())
-        )
-        positive_cost = (
-            alpha
-            * (1.0 - score_prob).pow(gamma)
-            * (-score_prob.log())
-        )
-        return positive_cost - negative_cost
 
     @staticmethod
     def _filter_extra_matches(
@@ -864,7 +781,7 @@ class HDETRRepeatedHungarianMatcher:
 
         keep = pair_iou >= float(threshold)
 
-        # Keep at least one repeated assignment for every represented GT.
+        # Preserve at least the best repeated match for every represented GT.
         for gt_index in torch.unique(gt_indices):
             positions = torch.nonzero(
                 gt_indices == gt_index,
@@ -872,7 +789,9 @@ class HDETRRepeatedHungarianMatcher:
             ).squeeze(1)
             if positions.numel() == 0:
                 continue
-            best_position = positions[torch.argmax(pair_iou[positions])]
+            best_position = positions[
+                torch.argmax(pair_iou[positions])
+            ]
             keep[best_position] = True
 
         return pred_indices[keep], gt_indices[keep]
@@ -884,8 +803,6 @@ class HDETRRepeatedHungarianMatcher:
         pred_score_logit: torch.Tensor,
         targets: List[dict],
         packed_targets: Optional[PackedTargets] = None,
-        *,
-        score_cost_alpha: float = 1.0,
     ) -> AssignmentResult:
         if pred_bbox.ndim != 3 or pred_bbox.shape[-1] != 4:
             raise ValueError(
@@ -893,19 +810,7 @@ class HDETRRepeatedHungarianMatcher:
                 f"{tuple(pred_bbox.shape)}"
             )
 
-        if pred_score_logit.ndim == 3 and pred_score_logit.shape[-1] == 1:
-            score_logit = pred_score_logit.squeeze(-1)
-        elif pred_score_logit.ndim == 2:
-            score_logit = pred_score_logit
-        else:
-            raise ValueError(
-                "pred_score_logit must have shape [B, N, 1] or [B, N], got "
-                f"{tuple(pred_score_logit.shape)}"
-            )
-
         batch_size, num_pred, _ = pred_bbox.shape
-        if score_logit.shape != (batch_size, num_pred):
-            raise ValueError("pred_bbox/pred_score_logit shape mismatch")
         if len(targets) != batch_size:
             raise ValueError(
                 f"targets batch size mismatch: {len(targets)} != {batch_size}"
@@ -919,14 +824,14 @@ class HDETRRepeatedHungarianMatcher:
             )
 
         device = pred_bbox.device
-        score_cost_alpha = clamp01(score_cost_alpha)
-        empty = torch.empty(0, dtype=torch.long, device=device)
+        empty = torch.empty(
+            0,
+            dtype=torch.long,
+            device=device,
+        )
         per_batch: List[Tuple[torch.Tensor, torch.Tensor]] = [
             (empty, empty) for _ in range(batch_size)
         ]
-
-        pred_score = score_logit.detach().float().sigmoid()
-        score_cost_all = self._score_cost(pred_score)
 
         single_rows = [
             index
@@ -942,21 +847,26 @@ class HDETRRepeatedHungarianMatcher:
             )
             global_gt_index = packed_targets.offsets[batch_index]
             gt_bbox = packed_targets.boxes[global_gt_index].float()
-            boxes = pred_bbox.detach().float().index_select(0, batch_index)
+            boxes = pred_bbox.detach().float().index_select(
+                0,
+                batch_index,
+            )
 
             cost_bbox = torch.abs(
                 boxes - gt_bbox[:, None, :]
             ).sum(dim=-1)
-            giou = batched_single_target_giou(boxes, gt_bbox)
-            iou = batched_single_target_iou(boxes, gt_bbox)
-            cost = self.cost_bbox * cost_bbox - self.cost_giou * giou
-            if self.cost_score != 0.0 and score_cost_alpha > 0.0:
-                cost = (
-                    cost
-                    + self.cost_score
-                    * score_cost_alpha
-                    * score_cost_all.index_select(0, batch_index)
-                )
+            giou = batched_single_target_giou(
+                boxes,
+                gt_bbox,
+            )
+            iou = batched_single_target_iou(
+                boxes,
+                gt_bbox,
+            )
+            cost = (
+                self.cost_bbox * cost_bbox
+                - self.cost_giou * giou
+            )
 
             k = min(self.repeat_k, num_pred)
             _, selected_pred = torch.topk(
@@ -966,35 +876,60 @@ class HDETRRepeatedHungarianMatcher:
                 largest=False,
                 sorted=True,
             )
-            selected_iou = torch.gather(iou, 1, selected_pred)
+            selected_iou = torch.gather(
+                iou,
+                1,
+                selected_pred,
+            )
 
             if self.min_extra_positive_iou > 0.0 and k > 1:
-                keep = selected_iou >= self.min_extra_positive_iou
+                keep = (
+                    selected_iou
+                    >= self.min_extra_positive_iou
+                )
                 keep[:, 0] = True
             else:
-                keep = torch.ones_like(selected_pred, dtype=torch.bool)
+                keep = torch.ones_like(
+                    selected_pred,
+                    dtype=torch.bool,
+                )
 
-            if all(count <= 1 for count in packed_targets.counts):
-                selected_batch = batch_index[:, None].expand_as(selected_pred)
+            if all(
+                count <= 1
+                for count in packed_targets.counts
+            ):
+                selected_batch = (
+                    batch_index[:, None]
+                    .expand_as(selected_pred)
+                )
                 flat_batch = selected_batch[keep]
                 flat_pred = selected_pred[keep].long()
-                single_counts = keep.sum(dim=1).detach().cpu().tolist()
+                single_counts = (
+                    keep.sum(dim=1)
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
                 counts_list = [0] * batch_size
                 for row, original_batch_index in enumerate(single_rows):
-                    counts_list[original_batch_index] = int(single_counts[row])
+                    counts_list[original_batch_index] = int(
+                        single_counts[row]
+                    )
                 return AssignmentResult(
                     batch_indices=flat_batch.long(),
                     pred_indices=flat_pred,
-                    gt_indices=torch.zeros_like(flat_pred),
-                    counts=tuple(counts_list),
-                    mode=(
-                        "hdetr_repeated_gt_batched_"
-                        f"scorealpha_{score_cost_alpha:.3f}"
+                    gt_indices=torch.zeros_like(
+                        flat_pred
                     ),
+                    counts=tuple(counts_list),
+                    mode="hdetr_repeated_gt_batched",
                 )
 
             for row, original_batch_index in enumerate(single_rows):
-                pred_row = selected_pred[row][keep[row]].long()
+                pred_row = (
+                    selected_pred[row][keep[row]]
+                    .long()
+                )
                 per_batch[original_batch_index] = (
                     pred_row,
                     torch.zeros_like(pred_row),
@@ -1004,6 +939,7 @@ class HDETRRepeatedHungarianMatcher:
             packed_targets.counts,
             minimum_count=2,
         )
+
         if multi_groups and linear_sum_assignment is None:
             raise ImportError(
                 "Multi-GT H-DETR matching requires scipy. "
@@ -1011,8 +947,15 @@ class HDETRRepeatedHungarianMatcher:
             )
 
         for num_gt, rows in multi_groups.items():
-            row_tensor = torch.tensor(rows, device=device, dtype=torch.long)
-            boxes = pred_bbox.detach().float().index_select(0, row_tensor)
+            row_tensor = torch.tensor(
+                rows,
+                device=device,
+                dtype=torch.long,
+            )
+            boxes = pred_bbox.detach().float().index_select(
+                0,
+                row_tensor,
+            )
             gt_bbox = gather_grouped_targets(
                 packed_targets,
                 row_tensor,
@@ -1021,32 +964,42 @@ class HDETRRepeatedHungarianMatcher:
             )
 
             cost_bbox = torch.abs(
-                boxes[:, :, None, :] - gt_bbox[:, None, :, :]
+                boxes[:, :, None, :]
+                - gt_bbox[:, None, :, :]
             ).sum(dim=-1)
-            giou = batched_pairwise_giou(boxes, gt_bbox)
-            iou = batched_pairwise_iou(boxes, gt_bbox)
-            base_cost = self.cost_bbox * cost_bbox - self.cost_giou * giou
-            if self.cost_score != 0.0 and score_cost_alpha > 0.0:
-                base_cost = (
-                    base_cost
-                    + self.cost_score
-                    * score_cost_alpha
-                    * score_cost_all.index_select(0, row_tensor)[:, :, None]
-                )
+            giou = batched_pairwise_giou(
+                boxes,
+                gt_bbox,
+            )
+            iou = batched_pairwise_iou(
+                boxes,
+                gt_bbox,
+            )
+            base_cost = (
+                self.cost_bbox * cost_bbox
+                - self.cost_giou * giou
+            )
 
             repeated_gt = torch.arange(
                 num_gt,
                 device=device,
                 dtype=torch.long,
             ).repeat(self.repeat_k)
-            expanded_cost = base_cost.index_select(2, repeated_gt)
+            expanded_cost = base_cost.index_select(
+                2,
+                repeated_gt,
+            )
 
-            # One synchronization per equal-GT-count group.
-            expanded_cost_cpu = expanded_cost.detach().cpu().numpy()
+            # One GPU->CPU synchronization per equal-GT-count group.
+            expanded_cost_cpu = (
+                expanded_cost.detach().cpu().numpy()
+            )
 
             for group_row, batch_index in enumerate(rows):
-                pred_np, repeated_column_np = linear_sum_assignment(
-                    expanded_cost_cpu[group_row]
+                pred_np, repeated_column_np = (
+                    linear_sum_assignment(
+                        expanded_cost_cpu[group_row]
+                    )
                 )
                 pred_index = torch.as_tensor(
                     pred_np,
@@ -1058,22 +1011,35 @@ class HDETRRepeatedHungarianMatcher:
                     device=device,
                     dtype=torch.long,
                 )
-                gt_index = repeated_gt[repeated_column]
-                pair_iou = iou[group_row, pred_index, gt_index]
-                pred_index, gt_index = self._filter_extra_matches(
+                gt_index = repeated_gt[
+                    repeated_column
+                ]
+                pair_iou = iou[
+                    group_row,
                     pred_index,
                     gt_index,
-                    pair_iou,
-                    threshold=self.min_extra_positive_iou,
+                ]
+
+                pred_index, gt_index = (
+                    self._filter_extra_matches(
+                        pred_index,
+                        gt_index,
+                        pair_iou,
+                        threshold=(
+                            self.min_extra_positive_iou
+                        ),
+                    )
                 )
-                per_batch[batch_index] = (pred_index, gt_index)
+                per_batch[batch_index] = (
+                    pred_index,
+                    gt_index,
+                )
 
         mode = (
             "hdetr_repeated_gt_batched"
             if not multi_groups
             else "hdetr_repeated_gt_grouped_scipy"
         )
-        mode += f"_scorealpha_{score_cost_alpha:.3f}"
         return AssignmentResult.from_per_batch(
             per_batch,
             device=device,
@@ -1085,18 +1051,6 @@ class HDETRRepeatedHungarianMatcher:
 OneToManyMatcher = HDETRRepeatedHungarianMatcher
 
 
-
-
-@dataclass(frozen=True)
-class HDETRScheduleState:
-    quality_alpha: float
-    main_matcher_score_alpha: float
-    aux_matcher_score_alpha: float
-    aux_loss_factor: float
-    text_negative_alpha: float
-    duplicate_alpha: float
-    hard_negative_alpha: float
-    negative_iou_threshold: float
 
 
 class GroundingLoss(nn.Module):
@@ -1131,7 +1085,7 @@ class GroundingLoss(nn.Module):
         cost_score: float = 2.0,
         hard_negative_ratio: int = 5,
         positive_ratio: float = 0.05,
-        max_positive_per_gt: int = 5,
+        max_positive_per_gt: int = 2,
         aux_positive_label: float = 0.7,
         expand_cost_bbox: float = 5.0,
         expand_cost_giou: float = 2.0,
@@ -1157,33 +1111,24 @@ class GroundingLoss(nn.Module):
         duplicate_classification_weight: float = 0.25,
         duplicate_max_pairs: int = 128,
         duplicate_start_epoch: int = 5,
-        duplicate_warmup_epoch: int = 5,
         hard_negative_mining_enabled: bool = True,
         hard_negative_loss_weight: float = 0.05,
         hard_negative_topk: int = 10,
         hard_negative_max_iou: float = 0.30,
         hard_negative_start_epoch: int = 10,
-        hard_negative_warmup_epoch: int = 5,
         text_negative_loss_weight: float = 0.20,
         text_negative_topk: int = 20,
         text_negative_hard_mix: float = 0.50,
-        text_negative_start_epoch: int = 1,
-        text_negative_warmup_epoch: int = 5,
-        negative_classification_weight: float = 0.25,
-        negative_text_classification_weight: float = 1.0,
-        aux_loss_weight: float = 0.50,
-        aux_warmup_epoch: int = 3,
-        aux_decay_start_ratio: float = 0.75,
-        aux_min_factor: float = 0.25,
+        aux_loss_weight: float = 0.28,
         aux_cost_score: Optional[float] = None,
         score_match_rounds: int = 1,
         score_quality_gamma: float = 1.0,
         score_round_decay: float = 0.25,
         score_min_iou: float = 0.0,
         enable_pairwise_ranking: bool = False,
-        aux_score_enabled: bool = True,
+        aux_score_enabled: bool = False,
         # New DETR-native options.
-        classification_type: str = "iou",
+        classification_type: str = "ia_bce",
         ia_bce_alpha: float = 0.25,
         focal_alpha: float = 0.25,
         focal_gamma: Optional[float] = None,
@@ -1195,8 +1140,6 @@ class GroundingLoss(nn.Module):
         matcher_score_start_epoch: int = 5,
         matcher_score_warmup_epoch: int = 12,
         matcher_score_alpha_min: float = 0.0,
-        aux_matcher_score_start_epoch: int = 5,
-        aux_matcher_score_warmup_epoch: int = 10,
     ) -> None:
         super().__init__()
 
@@ -1242,20 +1185,9 @@ class GroundingLoss(nn.Module):
         )
         self.aux_loss_weight = max(0.0, float(aux_loss_weight))
         self.aux_score_enabled = bool(aux_score_enabled)
-        self.aux_warmup_epoch = max(1, int(aux_warmup_epoch))
-        self.aux_decay_start_ratio = clamp01(aux_decay_start_ratio)
-        self.aux_min_factor = clamp01(aux_min_factor)
         self.max_query_loss_weight = max(
             1.0,
             float(max_query_loss_weight),
-        )
-        self.negative_classification_weight = max(
-            0.0,
-            float(negative_classification_weight),
-        )
-        self.negative_text_classification_weight = max(
-            0.0,
-            float(negative_text_classification_weight),
         )
 
         # Main-branch unmatched queries whose IoU with any GT is at or
@@ -1267,23 +1199,6 @@ class GroundingLoss(nn.Module):
             if score_negative_iou_ignore_thr is None
             else clamp01(score_negative_iou_ignore_thr)
         )
-        self.score_negative_iou_ignore_start = clamp01(
-            score_negative_iou_ignore_start
-        )
-        self.score_negative_iou_ignore_end = clamp01(
-            score_negative_iou_ignore_end
-        )
-        self.score_negative_iou_ignore_start_epoch = max(
-            1,
-            int(score_negative_iou_ignore_start_epoch),
-        )
-        self.score_negative_iou_ignore_end_epoch = max(
-            self.score_negative_iou_ignore_start_epoch,
-            int(score_negative_iou_ignore_end_epoch),
-        )
-        self.score_negative_iou_ignore_schedule = str(
-            score_negative_iou_ignore_schedule
-        ).strip().lower()
 
         # Duplicate-like unmatched queries are ranked below the Hungarian
         # matched query and also retain partial target=0 classification loss.
@@ -1304,10 +1219,9 @@ class GroundingLoss(nn.Module):
         )
         self.duplicate_max_pairs = max(1, int(duplicate_max_pairs))
         self.duplicate_start_epoch = max(1, int(duplicate_start_epoch))
-        self.duplicate_warmup_epoch = max(1, int(duplicate_warmup_epoch))
 
         # Extra emphasis for high-score unmatched boxes that are genuinely
-        # far from every GT. Base Quality Focal Loss still uses target 0.
+        # far from every GT. Base IA-BCE still supervises these as target 0.
         self.hard_negative_mining_enabled = bool(
             hard_negative_mining_enabled
         )
@@ -1322,10 +1236,6 @@ class GroundingLoss(nn.Module):
             1,
             int(hard_negative_start_epoch),
         )
-        self.hard_negative_warmup_epoch = max(
-            1,
-            int(hard_negative_warmup_epoch),
-        )
 
         self.text_negative_loss_weight = max(
             0.0,
@@ -1334,14 +1244,6 @@ class GroundingLoss(nn.Module):
         self.text_negative_topk = max(1, int(text_negative_topk))
         self.text_negative_hard_mix = clamp01(
             text_negative_hard_mix
-        )
-        self.text_negative_start_epoch = max(
-            1,
-            int(text_negative_start_epoch),
-        )
-        self.text_negative_warmup_epoch = max(
-            1,
-            int(text_negative_warmup_epoch),
         )
 
         self.default_quality_warmup_epoch = max(
@@ -1358,14 +1260,6 @@ class GroundingLoss(nn.Module):
         )
         self.default_matcher_score_alpha_min = clamp01(
             matcher_score_alpha_min
-        )
-        self.default_aux_matcher_score_start_epoch = max(
-            1,
-            int(aux_matcher_score_start_epoch),
-        )
-        self.default_aux_matcher_score_warmup_epoch = max(
-            1,
-            int(aux_matcher_score_warmup_epoch),
         )
 
         self.main_matcher = HungarianOneToOneMatcher(
@@ -1387,17 +1281,10 @@ class GroundingLoss(nn.Module):
                 if expand_cost_giou is not None
                 else cost_giou
             ),
-            cost_score=(
-                cost_score
-                if aux_cost_score is None
-                else float(aux_cost_score)
-            ),
+            cost_score=0.0,
             positive_ratio=positive_ratio,
             max_positive_per_gt=max_positive_per_gt,
             min_extra_positive_iou=iou_pos_thr,
-            score_cost_type=matcher_score_cost_type,
-            focal_alpha=self.focal_alpha,
-            focal_gamma=self.focal_gamma,
         )
         self.matcher = self.main_matcher
 
@@ -1483,7 +1370,7 @@ class GroundingLoss(nn.Module):
 
         classification_type = classification.get(
             "type",
-            quality.get("classification_type", "iou"),
+            quality.get("classification_type", "ia_bce"),
         )
         focal_gamma = classification.get(
             "focal_gamma",
@@ -1505,7 +1392,7 @@ class GroundingLoss(nn.Module):
             focal_gamma=focal_gamma,
             max_positive_per_gt=sampling.get(
                 "max_positive_per_gt",
-                5,
+                2,
             ),
             positive_ratio=sampling.get("positive_ratio", 1.0),
             aux_positive_label=sampling.get(
@@ -1533,40 +1420,12 @@ class GroundingLoss(nn.Module):
                 "normalize_by_num_gt",
                 True,
             ),
-            negative_classification_weight=classification.get(
-                "negative_weight",
-                0.25,
-            ),
-            negative_text_classification_weight=text_negative.get(
-                "classification_weight",
-                1.0,
-            ),
             score_negative_iou_ignore_thr=classification.get(
                 "negative_iou_ignore_thr",
                 quality.get(
                     "score_negative_iou_ignore_thr",
                     0.50,
                 ),
-            ),
-            score_negative_iou_ignore_start=classification.get(
-                "negative_iou_ignore_start",
-                0.50,
-            ),
-            score_negative_iou_ignore_end=classification.get(
-                "negative_iou_ignore_end",
-                0.45,
-            ),
-            score_negative_iou_ignore_start_epoch=classification.get(
-                "negative_iou_ignore_start_epoch",
-                5,
-            ),
-            score_negative_iou_ignore_end_epoch=classification.get(
-                "negative_iou_ignore_end_epoch",
-                25,
-            ),
-            score_negative_iou_ignore_schedule=classification.get(
-                "negative_iou_ignore_schedule",
-                "cosine",
             ),
             duplicate_suppression_enabled=duplicate.get(
                 "enabled",
@@ -1587,7 +1446,6 @@ class GroundingLoss(nn.Module):
             ),
             duplicate_max_pairs=duplicate.get("max_pairs", 128),
             duplicate_start_epoch=duplicate.get("start_epoch", 5),
-            duplicate_warmup_epoch=duplicate.get("warmup_epoch", 5),
             hard_negative_mining_enabled=hard_negative.get(
                 "enabled",
                 sampling.get("hard_negative_mining_enabled", True),
@@ -1608,10 +1466,6 @@ class GroundingLoss(nn.Module):
                 "start_epoch",
                 sampling.get("hard_negative_start_epoch", 10),
             ),
-            hard_negative_warmup_epoch=hard_negative.get(
-                "warmup_epoch",
-                5,
-            ),
             negative_text_as_empty_target=text_negative.get(
                 "as_empty_target",
                 True,
@@ -1628,41 +1482,17 @@ class GroundingLoss(nn.Module):
                 "text_negative_hard_mix",
                 text_negative.get("hard_mix", 0.50),
             ),
-            text_negative_start_epoch=text_negative.get(
-                "start_epoch",
-                1,
-            ),
-            text_negative_warmup_epoch=text_negative.get(
-                "warmup_epoch",
-                5,
-            ),
             max_query_loss_weight=text_negative.get(
                 "max_query_loss_weight",
                 4.0,
             ),
             aux_loss_weight=hybrid.get(
                 "aux_loss_weight",
-                0.50,
-            ),
-            aux_warmup_epoch=hybrid.get(
-                "warmup_epoch",
-                3,
-            ),
-            aux_decay_start_ratio=hybrid.get(
-                "decay_start_ratio",
-                0.75,
-            ),
-            aux_min_factor=hybrid.get(
-                "min_factor",
-                0.25,
-            ),
-            aux_cost_score=hybrid.get(
-                "matcher_cost_score",
-                matcher.get("cost_score", 2.0),
+                0.28,
             ),
             aux_score_enabled=quality.get(
                 "aux_score_enabled",
-                True,
+                False,
             ),
             quality_warmup_epoch=quality.get(
                 "quality_warmup_epoch",
@@ -1679,14 +1509,6 @@ class GroundingLoss(nn.Module):
             matcher_score_alpha_min=matcher_schedule.get(
                 "alpha_min",
                 ranking.get("rank_alpha_min", 0.0),
-            ),
-            aux_matcher_score_start_epoch=hybrid.get(
-                "matcher_score_start_epoch",
-                matcher_schedule.get("start_epoch", 5),
-            ),
-            aux_matcher_score_warmup_epoch=hybrid.get(
-                "matcher_score_warmup_epoch",
-                matcher_schedule.get("warmup_epoch", 10),
             ),
             # Legacy fields are accepted and recorded, not used actively.
             hard_negative_ratio=sampling.get(
@@ -1755,116 +1577,6 @@ class GroundingLoss(nn.Module):
                 rank_alpha = clamp01(rank_alpha)
 
         return float(quality_alpha), float(rank_alpha)
-
-    def resolve_dynamic_schedule(
-        self,
-        *,
-        current_epoch: Optional[int],
-        total_epochs: Optional[int],
-        quality_alpha: Optional[float],
-        matcher_score_alpha: Optional[float],
-        quality_warmup_epoch: Optional[int],
-        matcher_score_start_epoch: Optional[int],
-        matcher_score_warmup_epoch: Optional[int],
-        matcher_score_alpha_min: Optional[float],
-    ) -> HDETRScheduleState:
-        quality_alpha_value, main_matcher_alpha = self.resolve_epoch_alpha(
-            current_epoch=current_epoch,
-            quality_alpha=quality_alpha,
-            rank_alpha=matcher_score_alpha,
-            quality_warmup_epoch=quality_warmup_epoch,
-            rank_start_epoch=matcher_score_start_epoch,
-            rank_warmup_epoch=matcher_score_warmup_epoch,
-            rank_alpha_min=matcher_score_alpha_min,
-        )
-
-        aux_matcher_alpha = schedule_progress(
-            current_epoch,
-            self.default_aux_matcher_score_start_epoch,
-            self.default_aux_matcher_score_warmup_epoch,
-            curve="smoothstep",
-        )
-        aux_warmup = schedule_progress(
-            current_epoch,
-            1,
-            self.aux_warmup_epoch,
-            curve="smoothstep",
-        )
-        aux_decay = 0.0
-        if (
-            current_epoch is not None
-            and total_epochs is not None
-            and int(total_epochs) > 1
-        ):
-            decay_start = max(
-                1,
-                int(round(
-                    float(total_epochs) * self.aux_decay_start_ratio
-                )),
-            )
-            decay_duration = max(
-                1,
-                int(total_epochs) - decay_start + 1,
-            )
-            aux_decay = schedule_progress(
-                current_epoch,
-                decay_start,
-                decay_duration,
-                curve="cosine",
-            )
-        aux_loss_factor = aux_warmup * interpolate_value(
-            1.0,
-            self.aux_min_factor,
-            aux_decay,
-        )
-
-        text_negative_alpha = schedule_progress(
-            current_epoch,
-            self.text_negative_start_epoch,
-            self.text_negative_warmup_epoch,
-            curve="smoothstep",
-        )
-        duplicate_alpha = schedule_progress(
-            current_epoch,
-            self.duplicate_start_epoch,
-            self.duplicate_warmup_epoch,
-            curve="smoothstep",
-        )
-        hard_negative_alpha = schedule_progress(
-            current_epoch,
-            self.hard_negative_start_epoch,
-            self.hard_negative_warmup_epoch,
-            curve="smoothstep",
-        )
-
-        threshold_duration = max(
-            1,
-            self.score_negative_iou_ignore_end_epoch
-            - self.score_negative_iou_ignore_start_epoch
-            + 1,
-        )
-        threshold_alpha = schedule_progress(
-            current_epoch,
-            self.score_negative_iou_ignore_start_epoch,
-            threshold_duration,
-            curve=self.score_negative_iou_ignore_schedule,
-        )
-        negative_iou_threshold = interpolate_value(
-            self.score_negative_iou_ignore_start,
-            self.score_negative_iou_ignore_end,
-            threshold_alpha,
-        )
-
-        return HDETRScheduleState(
-            quality_alpha=float(quality_alpha_value),
-            main_matcher_score_alpha=float(main_matcher_alpha),
-            aux_matcher_score_alpha=float(aux_matcher_alpha),
-            aux_loss_factor=float(aux_loss_factor),
-            text_negative_alpha=float(text_negative_alpha),
-            duplicate_alpha=float(duplicate_alpha),
-            hard_negative_alpha=float(hard_negative_alpha),
-            negative_iou_threshold=float(negative_iou_threshold),
-        )
 
     def _prepare_query_loss_weights(
         self,
@@ -2153,25 +1865,23 @@ class GroundingLoss(nn.Module):
         pred_bbox: torch.Tensor,
         quality_alpha: float,
         query_loss_weights: Optional[torch.Tensor],
-        text_negative_mask: torch.Tensor,
-        text_negative_alpha: float,
-        duplicate_alpha: float,
         negative_iou_ignore_thr: float,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Batched binary Quality Focal Loss for text-conditioned detection.
+        Fully vectorized DETR classification over all queries.
 
-        - Matched queries receive an IoU/GIoU-aware soft target.
-        - Every unmatched query is no-object.
-        - Negative-text rows are empty-target rows and receive a progressively
-          stronger no-object weight.
-        - High-IoU one-to-one duplicates keep a reduced classification weight
-          and are additionally handled by duplicate ranking.
+        Positive queries are exactly the Hungarian matches. Every unmatched
+        query uses target 0. Duplicate-like unmatched queries whose IoU with
+        any GT exceeds ``negative_iou_ignore_thr`` retain a configurable
+        partial classification weight instead of being fully ignored.
         """
         logits = pred_score_logit.float()
         probability = logits.sigmoid()
         target = torch.zeros_like(logits)
-        positive_mask = torch.zeros_like(logits, dtype=torch.bool)
+        positive_mask = torch.zeros_like(
+            logits,
+            dtype=torch.bool,
+        )
 
         if assignments.num_matches > 0:
             batch_index = assignments.batch_indices
@@ -2196,7 +1906,11 @@ class GroundingLoss(nn.Module):
                 positive_gt_boxes,
             ).clamp(-1.0, 1.0)
 
-            matched_logits = logits[batch_index, pred_index, 0]
+            matched_logits = logits[
+                batch_index,
+                pred_index,
+                0,
+            ]
             final_target = self._classification_quality_target(
                 logits=matched_logits,
                 matched_iou=matched_iou,
@@ -2211,125 +1925,108 @@ class GroundingLoss(nn.Module):
                 + float(quality_alpha) * final_target
             ).clamp(0.0, 1.0)
 
-            target[batch_index, pred_index, 0] = positive_target.to(
-                target.dtype
-            )
-            positive_mask[batch_index, pred_index, 0] = True
+            target[
+                batch_index,
+                pred_index,
+                0,
+            ] = positive_target.to(target.dtype)
+            positive_mask[
+                batch_index,
+                pred_index,
+                0,
+            ] = True
         else:
             matched_iou = logits.new_zeros((0,))
             matched_giou = logits.new_zeros((0,))
             positive_target = logits.new_zeros((0,))
 
-        duplicate_mask, max_iou_to_gt, nearest_gt_index = (
-            self._build_high_iou_ignore_mask(
-                pred_bbox=pred_bbox,
-                positive_mask=positive_mask,
-                packed_targets=packed_targets,
-                threshold=negative_iou_ignore_thr,
-            )
+        (
+            duplicate_mask,
+            max_iou_to_gt,
+            nearest_gt_index,
+        ) = self._build_high_iou_ignore_mask(
+            pred_bbox=pred_bbox,
+            positive_mask=positive_mask,
+            packed_targets=packed_targets,
+            threshold=negative_iou_ignore_thr,
         )
 
-        # Canonical binary Quality Focal Loss:
-        # BCE(logit, soft_quality_target) * |target - probability|^beta
-        bce = F.binary_cross_entropy_with_logits(
-            logits,
-            target,
-            reduction="none",
+        gamma = float(self.focal_gamma)
+
+        # IA-BCE style decomposition:
+        # positive confidence follows the quality target;
+        # no-object confidence is suppressed with focal weighting.
+        positive_term = (
+            -target * F.logsigmoid(logits)
+            * (target - probability).abs().pow(gamma)
         )
-        modulation = (target - probability).abs().pow(
-            float(self.focal_gamma)
+        negative_term = (
+            -(1.0 - target) * F.logsigmoid(-logits)
+            * probability.pow(gamma)
         )
-        element_loss = bce * modulation
+        element_loss = positive_term + negative_term
 
         query_weight = self._prepare_query_loss_weights(
             pred_score_logit,
             query_loss_weights,
         ).float()
 
-        negative_weight = torch.full_like(
+        # Do not fully ignore high-IoU unmatched predictions. They are still
+        # false-positive candidates under one-to-one evaluation, so preserve
+        # a partial target=0 classification gradient. Low-IoU unmatched
+        # predictions keep the full classification weight.
+        classification_weight = torch.ones_like(
             element_loss,
-            float(self.negative_classification_weight),
             dtype=torch.float32,
         )
-        if bool(text_negative_mask.any()):
-            negative_text_weight = interpolate_value(
-                self.negative_classification_weight,
-                self.negative_text_classification_weight,
-                text_negative_alpha,
-            )
-            negative_weight[text_negative_mask, :, :] = float(
-                negative_text_weight
-            )
-
-        classification_weight = torch.where(
-            positive_mask,
-            torch.ones_like(negative_weight),
-            negative_weight,
-        )
-
-        # Duplicate classification weight is smoothly enabled rather than
-        # switching abruptly at one epoch.
-        duplicate_scale = interpolate_value(
-            1.0,
-            self.duplicate_classification_weight,
-            duplicate_alpha,
-        )
-        classification_weight = torch.where(
+        classification_weight = classification_weight.masked_fill(
             duplicate_mask,
-            classification_weight * float(duplicate_scale),
-            classification_weight,
+            float(self.duplicate_classification_weight),
         )
 
-        expanded_query_weight = query_weight.expand_as(element_loss)
         weighted_loss = (
             element_loss
-            * expanded_query_weight
+            * query_weight
             * classification_weight
         )
 
-        negative_mask = ~positive_mask
+        num_matches = max(assignments.num_matches, 1)
         if self.normalize_classification_by_num_gt:
-            # Balanced QFL: positive and negative means are normalized
-            # separately. This prevents 100 object queries or a negative-text
-            # batch from overwhelming L1/GIoU while keeping all queries in one
-            # batched tensor operation.
-            if bool(positive_mask.any()):
-                positive_denominator = expanded_query_weight[
-                    positive_mask
-                ].sum().clamp_min(1.0)
-                loss_score_pos = (
-                    element_loss[positive_mask]
-                    * expanded_query_weight[positive_mask]
-                ).sum() / positive_denominator
-            else:
-                loss_score_pos = logits.new_zeros(())
-
-            if bool(negative_mask.any()):
-                negative_denominator = expanded_query_weight[
-                    negative_mask
-                ].sum().clamp_min(1.0)
-                loss_score_neg = weighted_loss[
-                    negative_mask
-                ].sum() / negative_denominator
-            else:
-                loss_score_neg = logits.new_zeros(())
-
-            loss_score = loss_score_pos + loss_score_neg
+            loss_score = weighted_loss.sum() / float(num_matches)
         else:
             total_weight = (
-                expanded_query_weight * classification_weight
+                query_weight
+                * classification_weight
             ).sum().clamp_min(1.0)
             loss_score = weighted_loss.sum() / total_weight
-            if bool(positive_mask.any()):
-                loss_score_pos = element_loss[positive_mask].mean()
-            else:
-                loss_score_pos = logits.new_zeros(())
-            if bool(negative_mask.any()):
-                loss_score_neg = element_loss[negative_mask].mean()
-            else:
-                loss_score_neg = logits.new_zeros(())
 
-        hard_negative_mask = (~positive_mask) & (~duplicate_mask)
+        if bool(positive_mask.any()):
+            loss_score_pos = element_loss[
+                positive_mask
+            ].mean()
+        else:
+            loss_score_pos = logits.new_zeros(())
+
+        # All unmatched queries are classification negatives. Duplicate-like
+        # negatives use the reduced classification weight above.
+        negative_mask = ~positive_mask
+        if bool(negative_mask.any()):
+            negative_element_loss = element_loss[negative_mask]
+            negative_element_weight = classification_weight[negative_mask]
+            loss_score_neg = (
+                negative_element_loss
+                * negative_element_weight
+            ).sum() / negative_element_weight.sum().clamp_min(1.0)
+        else:
+            loss_score_neg = logits.new_zeros(())
+
+        # Hard-negative mining remains restricted to non-duplicate unmatched
+        # predictions, preventing duplicate and hard-negative objectives from
+        # selecting the same prediction twice.
+        hard_negative_mask = (
+            (~positive_mask)
+            & (~duplicate_mask)
+        )
 
         ignored_score_mean = logits.new_zeros(())
         ignored_iou_mean = logits.new_zeros(())
@@ -2340,9 +2037,13 @@ class GroundingLoss(nn.Module):
         return loss_score.to(pred_score_logit.dtype), {
             "target": target.to(pred_score_logit.dtype),
             "positive_mask": positive_mask,
+            # Backward-compatible key. Semantically this is now a duplicate
+            # mask rather than a zero-loss ignore mask.
             "ignore_mask": duplicate_mask,
             "valid_negative_mask": hard_negative_mask,
-            "max_iou_to_gt": max_iou_to_gt.to(pred_score_logit.dtype),
+            "max_iou_to_gt": max_iou_to_gt.to(
+                pred_score_logit.dtype
+            ),
             "nearest_gt_index": nearest_gt_index,
             "ignored_score_mean": ignored_score_mean.to(
                 pred_score_logit.dtype
@@ -2354,12 +2055,9 @@ class GroundingLoss(nn.Module):
             "loss_neg": loss_score_neg.to(pred_score_logit.dtype),
             "matched_iou": matched_iou.to(pred_score_logit.dtype),
             "matched_giou": matched_giou.to(pred_score_logit.dtype),
-            "positive_target": positive_target.to(pred_score_logit.dtype),
-            "negative_weight_mean": classification_weight[
-                negative_mask
-            ].mean().to(pred_score_logit.dtype)
-            if bool(negative_mask.any())
-            else logits.new_zeros(()).to(pred_score_logit.dtype),
+            "positive_target": positive_target.to(
+                pred_score_logit.dtype
+            ),
         }
 
     def duplicate_ranking_loss(
@@ -2732,9 +2430,6 @@ class GroundingLoss(nn.Module):
         quality_alpha: float,
         query_loss_weights: Optional[torch.Tensor],
         text_negative_mask: torch.Tensor,
-        text_negative_alpha: float,
-        duplicate_alpha: float,
-        hard_negative_alpha: float,
         score_enabled: bool,
         allow_text_negative_hard_loss: bool,
         allow_duplicate_suppression: bool,
@@ -2796,9 +2491,6 @@ class GroundingLoss(nn.Module):
                     pred_bbox=pred_bbox,
                     quality_alpha=quality_alpha,
                     query_loss_weights=query_loss_weights,
-                    text_negative_mask=text_negative_mask,
-                    text_negative_alpha=text_negative_alpha,
-                    duplicate_alpha=duplicate_alpha,
                     negative_iou_ignore_thr=negative_iou_ignore_thr,
                 )
             )
@@ -2937,17 +2629,14 @@ class GroundingLoss(nn.Module):
         score_contrib = float(lambda_score) * loss_score
         loss_text_negative_contrib = (
             float(self.text_negative_loss_weight)
-            * float(text_negative_alpha)
             * loss_text_negative
         )
         loss_duplicate_contrib = (
             float(self.duplicate_loss_weight)
-            * float(duplicate_alpha)
             * loss_duplicate
         )
         loss_hard_negative_contrib = (
             float(self.hard_negative_loss_weight)
-            * float(hard_negative_alpha)
             * loss_hard_negative
         )
 
@@ -3074,9 +2763,6 @@ class GroundingLoss(nn.Module):
             "lambda_rank_eff": 0.0,
             "pos_weight": 1.0,
             "quality_alpha": float(quality_alpha),
-            "text_negative_alpha": float(text_negative_alpha),
-            "duplicate_alpha": float(duplicate_alpha),
-            "hard_negative_alpha": float(hard_negative_alpha),
             "rank_alpha": 0.0,
             "assignment_mode": assignments.mode,
             "score_assignment_mode": "hungarian_one_to_one",
@@ -3102,7 +2788,6 @@ class GroundingLoss(nn.Module):
         lambda_score: float = 2.0,
         pos_weight: float = 1.0,
         current_epoch=None,
-        total_epochs: Optional[int] = None,
         quality_alpha=None,
         rank_alpha=None,
         quality_warmup_epoch: Optional[int] = None,
@@ -3134,18 +2819,17 @@ class GroundingLoss(nn.Module):
             targets,
         )
 
-        schedule_state = self.resolve_dynamic_schedule(
-            current_epoch=current_epoch,
-            total_epochs=total_epochs,
-            quality_alpha=quality_alpha,
-            matcher_score_alpha=rank_alpha,
-            quality_warmup_epoch=quality_warmup_epoch,
-            matcher_score_start_epoch=rank_start_epoch,
-            matcher_score_warmup_epoch=rank_warmup_epoch,
-            matcher_score_alpha_min=rank_alpha_min,
+        quality_alpha, matcher_score_alpha = (
+            self.resolve_epoch_alpha(
+                current_epoch=current_epoch,
+                quality_alpha=quality_alpha,
+                rank_alpha=rank_alpha,
+                quality_warmup_epoch=quality_warmup_epoch,
+                rank_start_epoch=rank_start_epoch,
+                rank_warmup_epoch=rank_warmup_epoch,
+                rank_alpha_min=rank_alpha_min,
+            )
         )
-        quality_alpha = schedule_state.quality_alpha
-        matcher_score_alpha = schedule_state.main_matcher_score_alpha
 
         prepared_text_negative_mask = (
             self._prepare_text_negative_mask(
@@ -3163,13 +2847,14 @@ class GroundingLoss(nn.Module):
             dtype=pred_bbox.dtype,
         )
 
+        epoch_value = 1 if current_epoch is None else int(current_epoch)
         duplicate_suppression_active = (
             self.duplicate_suppression_enabled
-            and schedule_state.duplicate_alpha > 0.0
+            and epoch_value >= self.duplicate_start_epoch
         )
         hard_negative_mining_active = (
             self.hard_negative_mining_enabled
-            and schedule_state.hard_negative_alpha > 0.0
+            and epoch_value >= self.hard_negative_start_epoch
         )
 
         main_assignments = self.main_matcher(
@@ -3192,9 +2877,6 @@ class GroundingLoss(nn.Module):
             quality_alpha=quality_alpha,
             query_loss_weights=query_loss_weights,
             text_negative_mask=prepared_text_negative_mask,
-            text_negative_alpha=schedule_state.text_negative_alpha,
-            duplicate_alpha=schedule_state.duplicate_alpha,
-            hard_negative_alpha=schedule_state.hard_negative_alpha,
             score_enabled=True,
             allow_text_negative_hard_loss=True,
             allow_duplicate_suppression=(
@@ -3204,7 +2886,7 @@ class GroundingLoss(nn.Module):
                 hard_negative_mining_active
             ),
             negative_iou_ignore_thr=(
-                schedule_state.negative_iou_threshold
+                self.score_negative_iou_ignore_thr
             ),
         )
 
@@ -3247,9 +2929,6 @@ class GroundingLoss(nn.Module):
                 pred_score_logit=aux_pred_score_logit,
                 targets=effective_targets,
                 packed_targets=packed_targets,
-                score_cost_alpha=(
-                    schedule_state.aux_matcher_score_alpha
-                ),
             )
             aux_loss, aux_metrics = self._compute_branch_loss(
                 branch_name="aux",
@@ -3264,9 +2943,6 @@ class GroundingLoss(nn.Module):
                 quality_alpha=quality_alpha,
                 query_loss_weights=query_loss_weights,
                 text_negative_mask=prepared_text_negative_mask,
-                text_negative_alpha=schedule_state.text_negative_alpha,
-                duplicate_alpha=0.0,
-                hard_negative_alpha=0.0,
                 score_enabled=self.aux_score_enabled,
                 allow_text_negative_hard_loss=False,
                 allow_duplicate_suppression=False,
@@ -3353,39 +3029,21 @@ class GroundingLoss(nn.Module):
                 "classification_type": self.classification_type,
             }
 
-        aux_loss_contrib = (
-            float(lambda_aux_eff)
-            * float(schedule_state.aux_loss_factor)
-            * aux_loss
-        )
+        aux_loss_contrib = float(lambda_aux_eff) * aux_loss
         loss = main_loss + aux_loss_contrib
 
-        # Negative-text rows must never produce regression assignments in
-        # either H-DETR branch.
-        negative_main_regression_matches = 0
+        # Negative-text rows must never produce regression assignments.
+        negative_regression_matches = 0
         if main_assignments.num_matches > 0:
-            negative_main_regression_matches = int(
+            negative_regression_matches = int(
                 prepared_text_negative_mask[
                     main_assignments.batch_indices
                 ].sum().item()
             )
-
-        negative_aux_regression_matches = 0
-        if aux_enabled and aux_assignments.num_matches > 0:
-            negative_aux_regression_matches = int(
-                prepared_text_negative_mask[
-                    aux_assignments.batch_indices
-                ].sum().item()
-            )
-
-        negative_regression_matches = (
-            negative_main_regression_matches
-            + negative_aux_regression_matches
-        )
         if negative_regression_matches != 0:
             raise RuntimeError(
-                "Negative-text rows received H-DETR regression matches. "
-                "This violates no-object supervision."
+                "Negative-text rows received main regression matches. "
+                "This violates DETR no-object supervision."
             )
 
         loss_dict: Dict[str, Any] = {
@@ -3394,10 +3052,6 @@ class GroundingLoss(nn.Module):
             "loss_aux_total": aux_loss.detach(),
             "loss_aux_contrib": aux_loss_contrib.detach(),
             "lambda_aux": float(lambda_aux_eff),
-            "lambda_aux_effective": float(
-                lambda_aux_eff * schedule_state.aux_loss_factor
-            ),
-            "aux_loss_factor": float(schedule_state.aux_loss_factor),
             "aux_enabled": bool(aux_enabled),
             "aux_score_enabled": bool(self.aux_score_enabled),
             "hdetr_repeat_k": int(self.aux_matcher.repeat_k),
@@ -3415,16 +3069,6 @@ class GroundingLoss(nn.Module):
             "matcher_score_alpha": float(
                 matcher_score_alpha
             ),
-            "aux_matcher_score_alpha": float(
-                schedule_state.aux_matcher_score_alpha
-            ),
-            "text_negative_alpha": float(
-                schedule_state.text_negative_alpha
-            ),
-            "duplicate_alpha": float(schedule_state.duplicate_alpha),
-            "hard_negative_alpha": float(
-                schedule_state.hard_negative_alpha
-            ),
             "matcher_cost_score_effective": float(
                 self.main_matcher.cost_score
                 * matcher_score_alpha
@@ -3436,16 +3080,9 @@ class GroundingLoss(nn.Module):
             "negative_text_regression_matches": float(
                 negative_regression_matches
             ),
-            "negative_text_main_regression_matches": float(
-                negative_main_regression_matches
-            ),
-            "negative_text_aux_regression_matches": float(
-                negative_aux_regression_matches
-            ),
-            "classification_loss_type": "quality_focal",
             "classification_type": self.classification_type,
             "score_negative_iou_ignore_thr": float(
-                schedule_state.negative_iou_threshold
+                self.score_negative_iou_ignore_thr
             ),
             "duplicate_classification_weight": float(
                 self.duplicate_classification_weight
@@ -3615,63 +3252,24 @@ def grounding_loss_forward_kwargs_from_config(
     config: Dict[str, Any],
     *,
     current_epoch: int,
-    total_epochs: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Build the complete dynamic forward kwargs from YAML.
+    Build forward kwargs from the same YAML.
 
-    Supported weight schedule:
-
-      loss.weight:
-        bbox_start: 5.0
-        bbox_end: 3.0
-        giou_start: 2.0
-        giou_end: 2.0
-        score_start: 1.0
-        score_end: 4.0
-        start_epoch: 1
-        end_epoch: 30
-        schedule: cosine
+    Dynamic bbox/score interpolation remains in train.py when already present;
+    this helper only provides deterministic defaults and schedule parameters.
     """
     loss_cfg = config.get("loss", config)
     weights = dict(loss_cfg.get("weight", {}))
     quality = dict(loss_cfg.get("quality", {}))
     ranking = dict(loss_cfg.get("ranking", {}))
-    matcher_schedule = dict(loss_cfg.get("matcher_schedule", {}))
+    matcher_schedule = dict(
+        loss_cfg.get("matcher_schedule", {})
+    )
     hybrid = dict(loss_cfg.get("hybrid", {}))
-
-    if total_epochs is None:
-        train_cfg = config.get("train", {}) if isinstance(config, dict) else {}
-        candidate = train_cfg.get("epochs") if isinstance(train_cfg, dict) else None
-        total_epochs = None if candidate is None else int(candidate)
-
-    schedule_start = int(weights.get("start_epoch", 1))
-    schedule_end = int(
-        weights.get(
-            "end_epoch",
-            total_epochs if total_epochs is not None else schedule_start,
-        )
-    )
-    duration = max(1, schedule_end - schedule_start + 1)
-    weight_alpha = schedule_progress(
-        int(current_epoch),
-        schedule_start,
-        duration,
-        curve=str(weights.get("schedule", "cosine")),
-    )
-
-    bbox_start = float(weights.get("bbox_start", 5.0))
-    bbox_end = float(weights.get("bbox_end", bbox_start))
-    giou_start = float(weights.get("giou_start", weights.get("giou", 2.0)))
-    giou_end = float(weights.get("giou_end", giou_start))
-    score_start = float(weights.get("score_start", 1.0))
-    score_end = float(weights.get("score_end", score_start))
 
     return {
         "current_epoch": int(current_epoch),
-        "total_epochs": (
-            None if total_epochs is None else int(total_epochs)
-        ),
         "quality_warmup_epoch": int(
             quality.get("quality_warmup_epoch", 10)
         ),
@@ -3693,24 +3291,16 @@ def grounding_loss_forward_kwargs_from_config(
                 ranking.get("rank_alpha_min", 0.0),
             )
         ),
-        "lambda_bbox": interpolate_value(
-            bbox_start,
-            bbox_end,
-            weight_alpha,
+        "lambda_bbox": float(
+            weights.get("bbox_start", 5.0)
         ),
-        "lambda_giou": interpolate_value(
-            giou_start,
-            giou_end,
-            weight_alpha,
-        ),
-        "lambda_score": interpolate_value(
-            score_start,
-            score_end,
-            weight_alpha,
+        "lambda_giou": float(weights.get("giou", 2.0)),
+        "lambda_score": float(
+            weights.get("score_start", 2.0)
         ),
         "lambda_rank": 0.0,
         "lambda_aux": float(
-            hybrid.get("aux_loss_weight", 0.50)
+            hybrid.get("aux_loss_weight", 0.28)
         ),
     }
 

@@ -1,42 +1,39 @@
 data:
-  dataset_dir: /home/soic/Desktop/LightDet/datasets
-  image_size: 512
+  dataset_dir: datasets
+  image_size: 1024
   max_text_aug_per_image: 1
 
   cache_images: true
-  image_cache_dir: /home/soic/Desktop/LightDet/datasets/.cache/images_512_uint8
+  image_cache_dir: datasets/.cache/images_1024_uint8
   prebuild_image_cache: true
-
-  # train.py 最多只使用 2。
-  prefetch_factor: 2
   cache_workers: 8
 
+  prefetch_factor: 2
   pin_memory: true
   persistent_workers: true
   query_budget: true
 
-  negative_query_path: /home/soic/Desktop/LightDet/units/model/cards/cache/negative_query_pool.json
+  negative_query_path: units/model/cards/cache/negative_query_pool.json
   negative_sample_ratio: 0.15
   use_negative_queries_in_val: true
 
-
 train:
-  epochs: 60
+  epochs: 300
   batch_size: 48
   warmup_epochs: 3
   num_workers: 16
-
   device: cuda:1
-  seed: 51
+  seed: 49
   deterministic: false
 
   use_amp: true
   amp_dtype: bf16
   allow_tf32: true
   matmul_precision: high
-
   channels_last: false
+
   compile: false
+  compile_mode: reduce-overhead
   startup_smoke_test: true
 
   use_ema: true
@@ -46,210 +43,167 @@ train:
 
   grad_clip_norm: 1.0
 
-
 optim:
-  lr_vision: 0.000150
-  lr_text: 0.000060
-  lr_transformer: 0.000220
-  lr_head: 0.000380
-
+  lr_vision: 0.0001
+  lr_text: 0.00001
+  lr_transformer: 0.0001
+  lr_head: 0.0001
   weight_decay: 0.0001
 
   min_lr_ratio: 0.05
-  max_warmup_steps: 4000
-
+  max_warmup_steps: 3000
   fused: true
 
-
 loss:
-  hybrid:
-    # H-DETR one-to-many auxiliary branch 只提供定位監督。
-    aux_loss_weight: 0.28
-
-
   matcher:
-    # Hungarian matching cost：
-    # score : bbox : GIoU = 2 : 5 : 2
-    cost_score: 2.0
     cost_bbox: 5.0
     cost_giou: 2.0
-
+    cost_score: 2.0
     score_cost_type: focal
     focal_alpha: 0.25
-
-
-  matcher_schedule:
-    # 訓練初期以定位為主，逐步提高 score 對 assignment 的影響。
-    start_epoch: 1
-    warmup_epoch: 12
-    alpha_min: 0.10
-
-
-  score_sampling:
-    # Auxiliary one-to-many 每個 GT 重複配對數。
-    max_positive_per_gt: 2
-
-    # 每個 GT 的 hard-negative 比例上限。
-    # 最終選取數量仍受 hard_negative.topk 限制。
-    hard_negative_ratio: 5
-
-
-  quality:
-    # Auxiliary 額外配對框的最低 IoU。
-    iou_pos_thr: 0.10
-
-    # Main matched prediction 的品質 target 範圍。
-    quality_min: 0.10
-    quality_max: 1.0
-    quality_warmup_epoch: 10
-
-    # Auxiliary branch 不訓練 score。
-    aux_score_enabled: false
-
-
-  classification:
-    # Align-DETR / IA-BCE 式品質感知分類。
-    type: ia_bce
-    ia_bce_alpha: 0.25
     focal_gamma: 2.0
 
-    # 以 matched GT 數量正規化分類 loss。
-    normalize_by_num_gt: true
-
-    # 未被 Hungarian 配對且最大 IoU < 0.75：
-    # 使用完整 target=0 背景分類監督。
-    #
-    # 未被配對且最大 IoU >= 0.75：
-    # 判定為 duplicate candidate，
-    # 使用 duplicate_suppression.classification_weight
-    # 的部分背景分類監督。
-    #
-    # 提高到 0.75 後，IoU 0.50～0.75 的 unmatched prediction
-    # 會重新接受完整背景監督，有利於降低 AP50 中的 FP score。
-    negative_iou_ignore_thr: 0.75
-
-
-  duplicate_suppression:
-    # 處理高 IoU、但沒有被 one-to-one Hungarian 選中的重複框。
-    enabled: true
-
-    # Duplicate 在主 IA-BCE 中仍接受 target=0 的背景監督。
-    #
-    # 0.0：完全忽略，等同舊版行為。
-    # 1.0：完整背景監督，等同標準 DETR。
-    # 0.30：保留足夠負梯度，同時降低 assignment switching 風險。
-    classification_weight: 0.30
-
-    # Duplicate ranking + absolute suppression 加入總 loss 的權重。
-    loss_weight: 0.25
-
-    # 要求：
-    # z_tp >= z_duplicate + margin
-    #
-    # 這會直接拉開 matched TP 與 duplicate 的 logit 差距。
-    margin: 0.50
-
-    # Duplicate absolute target=0 suppression 權重。
-    #
-    # 不只要求 duplicate 低於 TP，
-    # 也要求 duplicate 自身 logit 往負值移動。
-    background_weight: 0.50
-
-    # 增加每個 batch 可處理的 duplicate pairs，
-    # 避免 batch_size=48 時只有少量 duplicate 得到監督。
-    max_pairs: 1024
-
-    # 前幾個 epoch assignment 尚未穩定，延後啟用。
-    start_epoch: 5
-
-
-  hard_negative:
-    # 處理低 IoU、但置信度過高的真正背景 FP。
-    enabled: true
-
-    # 額外 hard-negative loss 權重。
-    #
-    # 一般 unmatched prediction 已經接受主 IA-BCE target=0，
-    # 此 loss 只額外強調其中分數最高的背景框。
-    loss_weight: 0.15
-
-    # 每筆 query 最多選取的高分背景 prediction。
-    topk: 30
-
-    # 只有與所有 GT 的最大 IoU <= 0.30，
-    # 才視為明確背景 hard negative。
-    max_iou: 0.30
-
-    # Duplicate suppression 啟用後一個 epoch 再啟用。
-    start_epoch: 6
-
-
-  text_negative:
-    # 負文字 query 視為 empty-target DETR sample，
-    # 所有 prediction 都應學習為 no-object。
-    as_empty_target: true
-
-    # 額外抑制負文字下分數最高的 prediction。
-    lambda_text_negative: 0.25
-
-    text_negative_topk: 20
-    text_negative_hard_mix: 0.50
-
-    # 限制 query-level loss weight，避免單一負文字樣本梯度過大。
-    max_query_loss_weight: 4.0
-
-
+  # Main loss contribution schedule.
   weight:
     dynamic: true
-
-    # 訓練前期較強調 bbox，後期稍微降低。
-    bbox_start: 5.0
-    bbox_end: 4.5
-    bbox_decay_until: 0.5
-
+    bbox: 5.0
     giou: 2.0
+    score: 1.0
 
-    # Classification 維持固定權重。
-    #
-    # FP suppression 已經由 duplicate 與 hard-negative
-    # 進行針對性加強，因此先不直接提高全域 score loss，
-    # 避免 TP score 同時被壓低。
-    score_start: 2.0
-    score_end: 2.0
+    bbox_start: 5.0
+    bbox_end: 3.5
+    bbox_decay_until: 0.50
 
+    giou_start: 2.0
+    giou_end: 2.0
+
+    score_start: 1.0
+    score_end: 4.0
+    score_warm_until: 0.50
+
+    start_epoch: 1
+    end_epoch: 30
+    schedule: cosine
+
+  classification:
+    # Matched query target = IoU; unmatched query target = 0.
+    type: iou
+    ia_bce_alpha: 0.25
+    focal_alpha: 0.25
+    focal_gamma: 2.0
+    negative_weight: 0.25
+    normalize_by_num_gt: true
+
+    negative_iou_ignore_thr: 0.50
+    negative_iou_ignore_start: 0.55
+    negative_iou_ignore_end: 0.45
+    negative_iou_ignore_start_epoch: 5
+    negative_iou_ignore_end_epoch: 25
+    negative_iou_ignore_schedule: cosine
+
+  quality:
+    iou_pos_thr: 0.0
+    quality_min: 0.10
+    quality_max: 1.0
+    qfl_beta: 2.0
+    quality_warmup_epoch: 10
+    aux_score_enabled: true
+
+  matcher_schedule:
+    start_epoch: 5
+    warmup_epoch: 12
+    alpha_min: 0.0
+
+  score_sampling:
+    positive_ratio: 1.0
+    max_positive_per_gt: 5
+    hard_negative_ratio: 5
+    aux_positive_label: 0.7
+    expand_cost_bbox: 5.0
+    expand_cost_giou: 2.0
+
+  hybrid:
+    aux_loss_weight: 0.50
+    aux_cost_score: 2.0
+    warmup_epoch: 3
+    decay_start_ratio: 0.75
+    min_factor: 0.25
+    matcher_cost_score: 2.0
+    matcher_score_start_epoch: 5
+    matcher_score_warmup_epoch: 10
+
+  text_negative:
+    as_empty_target: true
+    classification_weight: 1.0
+    max_query_loss_weight: 4.0
+    lambda_text_negative: 0.25
+    text_negative_topk: 20
+    hard_topk: 20
+    text_negative_hard_mix: 0.50
+    hard_mix: 0.50
+    start_epoch: 1
+    warmup_epoch: 5
+
+  duplicate_suppression:
+    enabled: true
+    loss_weight: 0.10
+    margin: 0.25
+    background_weight: 0.05
+    classification_weight: 0.25
+    max_pairs: 128
+    start_epoch: 5
+    warmup_epoch: 5
+
+  hard_negative:
+    enabled: true
+    loss_weight: 0.05
+    topk: 10
+    max_iou: 0.30
+    start_epoch: 10
+    warmup_epoch: 5
+
+  ranking:
+    enabled: false
+    lambda_rank: 0.0
+    rank_margin: 0.1
+    rank_min_quality_gap: 0.1
+    rank_max_pairs: 512
+    rank_start_epoch: 5
+    rank_warmup_epoch: 12
+    rank_alpha_min: 0.0
+    rank_negative_iou_max: 0.20
+
+  pos_weight:
+    value: 1.0
 
 eval:
-  val_loss_interval: 2
+  val_loss_interval: 5
   eval_interval: 1
+  max_val_batches: null
 
-  # AP 必須保留完整 score ranking。
-  # 不建議用較高 score threshold 隱藏 FP 問題。
-  score_thr: 0.0
+  score_thr: 0.001
+  top_k: 100
+  nms_iou_thr: 0.5
+  use_nms: false
+  use_topk_fallback: false
 
-  # 保留較完整的預測排序，用於檢驗 ranking 是否改善。
-  top_k: 20
-
-  # 去除同一 query 下高度重疊的 prediction。
-  use_nms: true
-
-  # 若主要目標是提升 map50，可改為 map50。
-  # 若希望兼顧定位精度，維持 map50_95。
+  iou_thresholds: null
+  compute_raw_oracle: true
+  raw_oracle_iou_thresholds: [0.25, 0.50, 0.75]
   best_metric: map50_95
 
-  compute_raw_oracle: true
-
-  raw_oracle_iou_thresholds:
-    - 0.25
-    - 0.50
-    - 0.75
-
-
 log:
+  save_dir: units/model/runs/train/lightdet_HDETR_object_query
+
+  # weights_path: warm start only; resume_path: full-state resume.
+  # Do not enable both at the same time.
+  weights_path: null
+  resume_path: null
+  prefer_ema: true
+
   save_latest_interval: 1
-  save_epoch_interval: 5
-
-  emit_step_metrics: true
-  log_interval: 20
-
+  save_epoch_interval: 50
+  emit_step_metrics: false
+  log_interval: 50
   progress_leave: true
   progress_mininterval: 0.5

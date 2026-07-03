@@ -20,11 +20,9 @@ import time
 import numpy as np
 import torch
 import torch.multiprocessing as mp
-import yaml
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from torchvision.ops import batched_nms
 from tqdm import tqdm
 
 
@@ -40,11 +38,38 @@ from units.tool.card import VisionTextModel, Bert
 from units.model.pipeline.data import (
     QueryBudgetBatchSampler,
     build_dataloaders,
-    grounding_collate_fn,
 )
 from units.model.cards.loss import (
     GroundingLoss,
     build_grounding_loss_from_config,
+)
+
+try:
+    from units.model.cards.loss import (
+        grounding_loss_forward_kwargs_from_config,
+    )
+except ImportError:
+    grounding_loss_forward_kwargs_from_config = None
+from units.model.tool.config import (
+    DEFAULT_MODEL_CONFIG_PATH,
+    DEFAULT_TRAIN_CONFIG_PATH,
+    cfg_to_args,
+    deepcopy_cfg,
+    load_model_config,
+    load_train_config,
+    normalize_device,
+    print_config_summary,
+)
+from units.model.tool.evaluation import validate_one_epoch
+from units.model.tool.runtime import (
+    build_text_conditioning_probe,
+    compact_grounding_collate_fn,
+    forward_model_batch,
+    get_score_logit,
+    make_progress_bar,
+    move_targets_to_device,
+    prepare_model_batch,
+    seed_dataloader_worker,
 )
 
 
@@ -245,242 +270,6 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return getattr(model, "_orig_mod", model)
 
 
-def move_images_to_device(
-    images: torch.Tensor,
-    device: torch.device,
-    channels_last: bool,
-) -> torch.Tensor:
-    """
-    將 DataLoader 影像搬到運算裝置並統一為 float32。
-
-    LightDet 的 uint8 image cache 刻意保留 CHW uint8，以降低 CPU RAM 與
-    Host-to-Device 傳輸量；因此必須在 GPU transfer 後才轉為 [0, 1] float32。
-    非 cache 路徑本來就是 float tensor，則保留其數值尺度，只統一 dtype。
-    """
-    if not torch.is_tensor(images):
-        raise TypeError(f"images must be a Tensor, got {type(images)}")
-
-    if images.ndim != 4:
-        raise ValueError(
-            f"images must be BCHW [B, C, H, W], got shape={tuple(images.shape)}"
-        )
-
-    if images.shape[1] not in (1, 3, 4):
-        raise ValueError(
-            f"unexpected image channel count: C={images.shape[1]}, "
-            f"shape={tuple(images.shape)}"
-        )
-
-    source_dtype = images.dtype
-
-    # 先以 uint8 搬到 GPU，維持最小 H2D transfer；再由 GPU 轉 float32。
-    images = images.to(device=device, non_blocking=True)
-
-    if source_dtype == torch.uint8:
-        images = images.to(dtype=torch.float32).mul_(1.0 / 255.0)
-    elif source_dtype.is_floating_point:
-        # autocast 會在卷積/矩陣運算時轉為 BF16/FP16；模型輸入維持 FP32
-        # 可避免非 autocast op 出現 dtype 不一致。
-        if images.dtype != torch.float32:
-            images = images.float()
-    else:
-        raise TypeError(
-            "Unsupported image dtype. Expected uint8 or floating point, "
-            f"got {source_dtype}."
-        )
-
-    if channels_last:
-        images = images.contiguous(memory_format=torch.channels_last)
-    elif not images.is_contiguous():
-        images = images.contiguous()
-
-    return images
-
-
-def prepare_model_batch(
-    batch: Dict[str, Any],
-    device: torch.device,
-    channels_last: bool,
-) -> Tuple[torch.Tensor, List[str], Optional[torch.Tensor]]:
-    """
-    同時支援兩種 DataLoader schema：
-
-    1. query-level batching
-       images:        [Q, C, H, W]
-       query_texts:   Q 個文字
-       image_indices: None
-
-    2. image-level batching
-       unique_images: [U, C, H, W]
-       query_texts:   Q 個文字
-       image_indices: [Q]，將 U 張影像特徵展開到 Q 個 query
-
-    image-level batching 可避免同一張影像因不同文字 query 重複跑 vision backbone。
-    """
-    query_texts = batch.get("query_texts")
-
-    if query_texts is None:
-        raise KeyError(
-            f"Batch missing 'query_texts'. Available keys: {sorted(batch.keys())}"
-        )
-
-    if "unique_images" in batch:
-        images = move_images_to_device(
-            batch["unique_images"],
-            device,
-            channels_last=channels_last,
-        )
-
-        image_indices = batch.get("image_indices")
-        if image_indices is None:
-            raise KeyError(
-                "Image-level batch contains 'unique_images' but is missing "
-                "'image_indices'."
-            )
-
-        if not torch.is_tensor(image_indices):
-            image_indices = torch.as_tensor(image_indices, dtype=torch.long)
-        else:
-            image_indices = image_indices.to(dtype=torch.long)
-
-        if image_indices.ndim != 1:
-            raise ValueError(
-                f"image_indices must be 1-D, got shape={tuple(image_indices.shape)}"
-            )
-
-        if image_indices.numel() != len(query_texts):
-            raise ValueError(
-                "image_indices/query_texts size mismatch: "
-                f"{image_indices.numel()} != {len(query_texts)}"
-            )
-
-        if image_indices.numel() > 0:
-            min_index = int(image_indices.min().item())
-            max_index = int(image_indices.max().item())
-            if min_index < 0 or max_index >= images.shape[0]:
-                raise IndexError(
-                    "image_indices out of range: "
-                    f"min={min_index}, max={max_index}, "
-                    f"num_unique_images={images.shape[0]}"
-                )
-
-        image_indices = image_indices.to(
-            device=device,
-            non_blocking=True,
-        )
-
-        return images, query_texts, image_indices
-
-    if "images" in batch:
-        images = move_images_to_device(
-            batch["images"],
-            device,
-            channels_last=channels_last,
-        )
-
-        if images.shape[0] != len(query_texts):
-            raise ValueError(
-                "images/query_texts batch size mismatch: "
-                f"{images.shape[0]} != {len(query_texts)}"
-            )
-
-        return images, query_texts, None
-
-    raise KeyError(
-        "Batch must contain either 'unique_images' or 'images'. "
-        f"Available keys: {sorted(batch.keys())}"
-    )
-
-
-def forward_model_batch(
-    model: torch.nn.Module,
-    images: torch.Tensor,
-    query_texts: List[str],
-    image_indices: Optional[torch.Tensor],
-    return_aux: Optional[bool] = None,
-) -> Dict[str, Any]:
-    """
-    Unified model forward.
-
-    return_aux:
-        None  -> let VisionTextModel decide from train/eval mode
-        True  -> force main + auxiliary outputs
-        False -> force main-only output
-    """
-    model_kwargs: Dict[str, Any] = {
-        "return_aux": return_aux,
-    }
-
-    if image_indices is not None:
-        model_kwargs["image_indices"] = image_indices
-
-    return model(
-        images,
-        query_texts,
-        **model_kwargs,
-    )
-
-
-
-def build_text_conditioning_probe(
-    query_texts: Sequence[str],
-    text_negative_mask: Optional[torch.Tensor],
-) -> Tuple[Optional[List[str]], List[int], str]:
-    """
-    Build a second text ordering while keeping every image tensor and
-    image_indices entry unchanged.
-
-    Priority is given to swapping one positive and one negative description,
-    because this directly checks that positive/negative wording can alter the
-    predicted localization. If such a pair is unavailable, use the rotation
-    that changes the largest number of query strings.
-    """
-    texts = [str(value) for value in query_texts]
-    count = len(texts)
-    if count < 2 or len(set(texts)) < 2:
-        return None, [], "insufficient_distinct_texts"
-
-    if text_negative_mask is not None:
-        if not torch.is_tensor(text_negative_mask):
-            mask = torch.as_tensor(text_negative_mask, dtype=torch.bool)
-        else:
-            mask = text_negative_mask.detach().to(device="cpu", dtype=torch.bool)
-        mask = mask.reshape(-1)
-        if mask.numel() == count:
-            negative_indices = torch.nonzero(mask, as_tuple=False).flatten().tolist()
-            positive_indices = torch.nonzero(~mask, as_tuple=False).flatten().tolist()
-            for positive_index in positive_indices:
-                for negative_index in negative_indices:
-                    if texts[positive_index] == texts[negative_index]:
-                        continue
-                    permuted = list(texts)
-                    permuted[positive_index], permuted[negative_index] = (
-                        permuted[negative_index],
-                        permuted[positive_index],
-                    )
-                    return (
-                        permuted,
-                        [positive_index, negative_index],
-                        "positive_negative_swap",
-                    )
-
-    best_permuted: Optional[List[str]] = None
-    best_changed: List[int] = []
-    for shift in range(1, count):
-        candidate = texts[shift:] + texts[:shift]
-        changed = [
-            index
-            for index, (source, target) in enumerate(zip(texts, candidate))
-            if source != target
-        ]
-        if len(changed) > len(best_changed):
-            best_permuted = candidate
-            best_changed = changed
-
-    if not best_changed:
-        return None, [], "no_changed_rows"
-    return best_permuted, best_changed, "text_rotation"
-
 def run_startup_smoke_test(
     model: torch.nn.Module,
     criterion: Any,
@@ -535,10 +324,10 @@ def run_startup_smoke_test(
             f"Prepared images must be floating point, got {images.dtype}"
         )
 
-    lambda_bbox, lambda_giou, lambda_score = get_loss_weights(
+    loss_forward_kwargs = resolve_loss_forward_kwargs(
+        args=args,
         epoch=1,
         total_epochs=total_epochs,
-        args=args,
     )
 
     was_training = model.training
@@ -580,20 +369,12 @@ def run_startup_smoke_test(
                     pred_bbox=pred_bbox,
                     pred_score_logit=pred_score_logit,
                     targets=targets,
-                    lambda_bbox=lambda_bbox,
-                    lambda_giou=lambda_giou,
-                    lambda_score=lambda_score,
-                    lambda_rank=0.0,
                     pos_weight=float(args.pos_weight),
-                    current_epoch=1,
-                    quality_warmup_epoch=args.quality_warmup_epoch,
-                    rank_start_epoch=args.rank_start_epoch,
-                    rank_warmup_epoch=args.rank_warmup_epoch,
-                    rank_alpha_min=args.rank_alpha_min,
                     query_loss_weights=batch.get("query_loss_weights"),
                     text_negative_mask=batch.get("text_negative_mask"),
                     aux_pred_bbox=aux_pred_bbox,
                     aux_pred_score_logit=aux_pred_score_logit,
+                    **loss_forward_kwargs,
                 )
 
                 negative_text_matches = int(
@@ -1162,218 +943,44 @@ def get_loss_weights(
     return lambda_bbox, lambda_giou, lambda_score
 
 
+def resolve_loss_forward_kwargs(
+    *,
+    args: SimpleNamespace,
+    epoch: int,
+    total_epochs: int,
+) -> Dict[str, Any]:
+    """Resolve all epoch-dependent H-DETR loss parameters from train.yaml."""
+    if grounding_loss_forward_kwargs_from_config is not None:
+        return grounding_loss_forward_kwargs_from_config(
+            args.train_cfg,
+            current_epoch=int(epoch),
+            total_epochs=int(total_epochs),
+        )
+
+    lambda_bbox, lambda_giou, lambda_score = get_loss_weights(
+        epoch=epoch,
+        total_epochs=total_epochs,
+        args=args,
+    )
+    return {
+        "lambda_bbox": float(lambda_bbox),
+        "lambda_giou": float(lambda_giou),
+        "lambda_score": float(lambda_score),
+        "lambda_rank": 0.0,
+        "lambda_aux": float(args.aux_loss_weight),
+        "current_epoch": int(epoch),
+        "total_epochs": int(total_epochs),
+        "quality_warmup_epoch": int(args.quality_warmup_epoch),
+        "rank_start_epoch": int(args.rank_start_epoch),
+        "rank_warmup_epoch": int(args.rank_warmup_epoch),
+        "rank_alpha_min": float(args.rank_alpha_min),
+    }
+
 
 # Box / target helpers
 
 
-
-def box_area(box: torch.Tensor) -> torch.Tensor:
-    return (
-        (box[..., 2] - box[..., 0]).clamp(min=0)
-        * (box[..., 3] - box[..., 1]).clamp(min=0)
-    )
-
-
-def box_iou_xyxy(
-    boxes1: torch.Tensor,
-    boxes2: torch.Tensor,
-    eps: float = 1e-7,
-) -> torch.Tensor:
-    if boxes1.numel() == 0 or boxes2.numel() == 0:
-        return boxes1.new_zeros((boxes1.shape[0], boxes2.shape[0]))
-
-    area1 = box_area(boxes1)
-    area2 = box_area(boxes2)
-
-    lt = torch.maximum(boxes1[:, None, :2], boxes2[None, :, :2])
-    rb = torch.minimum(boxes1[:, None, 2:], boxes2[None, :, 2:])
-
-    wh = (rb - lt).clamp(min=0)
-    intersection = wh[..., 0] * wh[..., 1]
-    union = area1[:, None] + area2[None, :] - intersection
-
-    return intersection / union.clamp(min=eps)
-
-
-def compact_grounding_collate_fn(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Collate through the project implementation, then pack all GT boxes into one
-    contiguous tensor. GroundingLoss and evaluation only consume target["boxes"].
-
-    This changes IPC from dozens/hundreds of small target storages per batch to:
-      - one image tensor
-      - one image_indices tensor
-      - one flat GT box tensor
-      - one offsets tensor
-    """
-    batch = grounding_collate_fn(items)
-    targets = batch.pop("targets", [])
-
-    box_tensors: List[torch.Tensor] = []
-    offsets = [0]
-
-    for target in targets:
-        boxes = target.get("boxes")
-        if boxes is None:
-            raise KeyError("Each target must contain 'boxes'")
-        if not torch.is_tensor(boxes):
-            boxes = torch.as_tensor(boxes, dtype=torch.float32)
-        boxes = boxes.to(dtype=torch.float32).reshape(-1, 4).contiguous()
-        box_tensors.append(boxes)
-        offsets.append(offsets[-1] + int(boxes.shape[0]))
-
-    if box_tensors and offsets[-1] > 0:
-        flat_boxes = torch.cat(box_tensors, dim=0).contiguous()
-    else:
-        flat_boxes = torch.empty((0, 4), dtype=torch.float32)
-
-    batch["target_boxes_flat"] = flat_boxes
-    batch["target_offsets"] = torch.tensor(offsets, dtype=torch.int64)
-    batch["num_targets"] = len(targets)
-
-    # Query-level collate contains several duplicate tensor lists. They are not
-    # consumed by train.py and substantially increase shared-memory objects.
-    for key in (
-        "boxes_per_image",
-        "boxes_pixel_per_image",
-        "labels_per_image",
-        "target_boxes_per_image",
-        "target_boxes_pixel_per_image",
-        "target_labels_per_image",
-        "image_sizes",
-        "orig_sizes",
-        "obj_indices",
-    ):
-        batch.pop(key, None)
-
-    return batch
-
-
-def seed_dataloader_worker(worker_id: int) -> None:
-    worker_seed = torch.initial_seed() % (2 ** 32)
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-
-
-def get_raw_targets(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
-    if "target_boxes_flat" in batch and "target_offsets" in batch:
-        flat_boxes = batch["target_boxes_flat"]
-        offsets_tensor = batch["target_offsets"]
-
-        if not torch.is_tensor(flat_boxes) or not torch.is_tensor(offsets_tensor):
-            raise TypeError("Compact target tensors are invalid")
-
-        offsets = offsets_tensor.tolist()
-        return [
-            {"boxes": flat_boxes[offsets[index]:offsets[index + 1]]}
-            for index in range(len(offsets) - 1)
-        ]
-
-    if "targets" in batch:
-        return batch["targets"]
-
-    boxes_list = batch.get("target_boxes_per_image")
-
-    if boxes_list is None:
-        raise KeyError(
-            "Batch must contain compact targets, 'targets', or "
-            "'target_boxes_per_image'."
-        )
-
-    labels_list = batch.get("target_labels_per_image")
-    targets = []
-
-    for index, boxes in enumerate(boxes_list):
-        target: Dict[str, Any] = {"boxes": boxes}
-        if labels_list is not None:
-            target["labels"] = labels_list[index]
-        targets.append(target)
-
-    return targets
-
-def move_targets_to_device(
-    batch: Dict[str, Any],
-    device: torch.device,
-) -> List[Dict[str, Any]]:
-    if "target_boxes_flat" in batch and "target_offsets" in batch:
-        flat_boxes = batch["target_boxes_flat"].to(
-            device=device,
-            dtype=torch.float32,
-            non_blocking=True,
-        )
-        offsets = batch["target_offsets"].tolist()
-        return [
-            {"boxes": flat_boxes[offsets[index]:offsets[index + 1]]}
-            for index in range(len(offsets) - 1)
-        ]
-
-    targets = []
-    for target in get_raw_targets(batch):
-        moved: Dict[str, Any] = {}
-        for key, value in target.items():
-            if torch.is_tensor(value):
-                moved[key] = value.to(device, non_blocking=True)
-            else:
-                moved[key] = value
-        if "boxes" not in moved:
-            raise KeyError("target must contain key: boxes")
-        targets.append(moved)
-    return targets
-
-def get_target_boxes_cpu(batch: Dict[str, Any]) -> List[torch.Tensor]:
-    if "target_boxes_flat" in batch and "target_offsets" in batch:
-        flat_boxes = batch["target_boxes_flat"]
-        if flat_boxes.device.type != "cpu":
-            flat_boxes = flat_boxes.cpu()
-        flat_boxes = flat_boxes.to(dtype=torch.float32)
-        offsets = batch["target_offsets"].tolist()
-        return [
-            flat_boxes[offsets[index]:offsets[index + 1]].reshape(-1, 4)
-            for index in range(len(offsets) - 1)
-        ]
-
-    boxes_list = []
-    for target in get_raw_targets(batch):
-        boxes = target["boxes"]
-        if not torch.is_tensor(boxes):
-            boxes = torch.as_tensor(boxes)
-        boxes = boxes.detach()
-        if boxes.device.type != "cpu":
-            boxes = boxes.cpu()
-        boxes_list.append(boxes.to(dtype=torch.float32).reshape(-1, 4))
-    return boxes_list
-
-def get_score_logit(outputs: Dict[str, torch.Tensor]) -> torch.Tensor:
-    if "score_logit" in outputs:
-        return outputs["score_logit"]
-
-    if "score" in outputs:
-        return outputs["score"]
-
-    raise KeyError("Model output must contain score_logit or score")
-
-
-
 # Training
-
-
-
-def make_progress_bar(
-    iterable: Iterable[Any],
-    *,
-    total: int,
-    desc: str,
-    leave: bool,
-    mininterval: float,
-) -> tqdm:
-    return tqdm(
-        iterable,
-        total=total,
-        desc=desc,
-        dynamic_ncols=True,
-        leave=leave,
-        mininterval=mininterval,
-    )
 
 
 def train_one_epoch(
@@ -1395,6 +1002,7 @@ def train_one_epoch(
     lambda_bbox: float = 5.0,
     lambda_giou: float = 2.0,
     lambda_score: float = 1.0,
+    lambda_aux: Optional[float] = None,
     lambda_rank: float = 0.0,
     pos_weight: float = 1.0,
     quality_warmup_epoch: int = 20,
@@ -1521,9 +1129,11 @@ def train_one_epoch(
                 lambda_bbox=lambda_bbox,
                 lambda_giou=lambda_giou,
                 lambda_score=lambda_score,
+                lambda_aux=lambda_aux,
                 lambda_rank=0.0,
                 pos_weight=pos_weight,
                 current_epoch=epoch,
+                total_epochs=num_epochs,
                 quality_warmup_epoch=quality_warmup_epoch,
                 rank_start_epoch=rank_start_epoch,
                 rank_warmup_epoch=rank_warmup_epoch,
@@ -1967,513 +1577,6 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def select_predictions_batch(
-    boxes: torch.Tensor,
-    scores: torch.Tensor,
-    score_thr: float = 0.001,
-    top_k: int = 20,
-    nms_iou_thr: float = 0.5,
-    use_topk_fallback: bool = False,
-    use_nms: bool = True,
-) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-    """
-    在 GPU 上批次完成 top-k、threshold 與 batched NMS；每個 batch 僅集中搬一次 CPU。
-
-    boxes:  [B, N, 4], normalized xyxy
-    scores: [B, N], sigmoid scores
-    """
-
-    if boxes.ndim != 3 or boxes.shape[-1] != 4:
-        raise ValueError(f"boxes must be [B, N, 4], got {tuple(boxes.shape)}")
-
-    if scores.ndim != 2:
-        raise ValueError(f"scores must be [B, N], got {tuple(scores.shape)}")
-
-    batch_size, num_queries = scores.shape
-
-    if num_queries == 0 or top_k <= 0:
-        return [
-            (
-                torch.empty((0, 4), dtype=torch.float32),
-                torch.empty((0,), dtype=torch.float32),
-            )
-            for _ in range(batch_size)
-        ]
-
-    k = min(int(top_k), int(num_queries))
-
-    top_scores, top_indices = torch.topk(
-        scores,
-        k=k,
-        dim=1,
-        largest=True,
-        sorted=True,
-    )
-
-    top_boxes = torch.gather(
-        boxes,
-        dim=1,
-        index=top_indices.unsqueeze(-1).expand(-1, -1, 4),
-    )
-
-    valid_mask = top_scores >= float(score_thr)
-
-    if use_topk_fallback:
-        no_valid = ~valid_mask.any(dim=1)
-        valid_mask[no_valid] = True
-
-    batch_ids = torch.arange(
-        batch_size,
-        device=boxes.device,
-        dtype=torch.long,
-    ).unsqueeze(1).expand(batch_size, k)
-
-    flat_boxes = top_boxes[valid_mask]
-    flat_scores = top_scores[valid_mask]
-    flat_batch_ids = batch_ids[valid_mask]
-
-    if flat_boxes.numel() == 0:
-        return [
-            (
-                torch.empty((0, 4), dtype=torch.float32),
-                torch.empty((0,), dtype=torch.float32),
-            )
-            for _ in range(batch_size)
-        ]
-
-    if use_nms:
-        keep = batched_nms(
-            flat_boxes.float(),
-            flat_scores.float(),
-            flat_batch_ids,
-            float(nms_iou_thr),
-        )
-
-        flat_boxes = flat_boxes[keep]
-        flat_scores = flat_scores[keep]
-        flat_batch_ids = flat_batch_ids[keep]
-
-    # 非同步 copy 在 pinned destination 上才真正有利；這裡一次性 copy 已避免逐框同步。
-    boxes_cpu = flat_boxes.detach().to(dtype=torch.float32, device="cpu")
-    scores_cpu = flat_scores.detach().to(dtype=torch.float32, device="cpu")
-    batch_ids_cpu = flat_batch_ids.detach().to(device="cpu")
-
-    results: List[Tuple[torch.Tensor, torch.Tensor]] = []
-
-    for batch_index in range(batch_size):
-        mask = batch_ids_cpu == batch_index
-        boxes_i = boxes_cpu[mask]
-        scores_i = scores_cpu[mask]
-
-        # topk 與 batched_nms 的輸出已依 score 由高到低排列；
-        # 依 batch mask 取出後仍保留該 sample 的相對順序。
-        results.append((boxes_i, scores_i))
-
-    return results
-
-
-class BinaryDetectionAPAccumulator:
-    """
-    保留原本 query-conditioned binary detection 的 matching 定義，但：
-      1. 每個 sample 僅計算一次 IoU matrix。
-      2. 所有 IoU thresholds 同時計算。
-      3. 所有 prediction 只做一次全域 score 排序。
-      4. 不建立逐框 Python dict。
-    """
-
-    def __init__(
-        self,
-        iou_thresholds: Optional[Sequence[float]] = None,
-    ) -> None:
-        if iou_thresholds is None:
-            iou_thresholds = [
-                round(value, 2)
-                for value in np.arange(0.50, 0.96, 0.05)
-            ]
-
-        self.iou_thresholds = torch.as_tensor(
-            iou_thresholds,
-            dtype=torch.float32,
-        )
-
-        if self.iou_thresholds.numel() == 0:
-            raise ValueError("iou_thresholds must not be empty")
-
-        self.score_chunks: List[torch.Tensor] = []
-        self.tp_chunks: List[torch.Tensor] = []
-        self.num_gt = 0
-        self.num_pred = 0
-
-    def update(
-        self,
-        pred_boxes: torch.Tensor,
-        pred_scores: torch.Tensor,
-        gt_boxes: torch.Tensor,
-    ) -> None:
-        pred_boxes = pred_boxes.float().reshape(-1, 4)
-        pred_scores = pred_scores.float().reshape(-1)
-        gt_boxes = gt_boxes.float().reshape(-1, 4)
-
-        num_pred = int(pred_boxes.shape[0])
-        num_gt = int(gt_boxes.shape[0])
-        num_thresholds = int(self.iou_thresholds.numel())
-
-        if pred_scores.numel() != num_pred:
-            raise ValueError(
-                "pred_boxes/pred_scores size mismatch: "
-                f"{num_pred} != {pred_scores.numel()}"
-            )
-
-        self.num_gt += num_gt
-        self.num_pred += num_pred
-
-        if num_pred == 0:
-            return
-
-        # AP matching 必須依 confidence 由高到低逐一處理 prediction。
-        # 即使上游 select_predictions_batch 已排序，這裡仍再次排序，
-        # 避免未來由其他呼叫路徑傳入未排序 prediction 時造成評估偏差。
-        score_order = torch.argsort(
-            pred_scores,
-            descending=True,
-            stable=True,
-        )
-        pred_boxes = pred_boxes[score_order]
-        pred_scores = pred_scores[score_order]
-
-        metric_device = pred_boxes.device
-
-        if gt_boxes.device != metric_device:
-            gt_boxes = gt_boxes.to(metric_device)
-
-        # 每一列對應一個 prediction，每一欄對應一個 IoU threshold。
-        tp_matrix = torch.zeros(
-            (num_pred, num_thresholds),
-            dtype=torch.bool,
-            device=metric_device,
-        )
-
-        if num_gt > 0:
-            iou_matrix = box_iou_xyxy(
-                pred_boxes,
-                gt_boxes,
-            )
-
-            iou_thresholds = self.iou_thresholds.to(
-                device=metric_device,
-                dtype=iou_matrix.dtype,
-            )
-
-            # 每個 IoU threshold 都必須維護獨立的 GT 配對狀態。
-            # shape: [num_thresholds, num_gt]
-            matched_gt = torch.zeros(
-                (num_thresholds, num_gt),
-                dtype=torch.bool,
-                device=metric_device,
-            )
-
-            threshold_indices = torch.arange(
-                num_thresholds,
-                device=metric_device,
-            )
-
-            # prediction 已依 confidence 由高到低排列。
-            for prediction_index in range(num_pred):
-                # 同一個 prediction 在每個 IoU threshold 下，都只可從
-                # 尚未配對的 GT 中選擇 IoU 最高者。
-                candidate_ious = (
-                    iou_matrix[prediction_index]
-                    .unsqueeze(0)
-                    .expand(num_thresholds, -1)
-                    .masked_fill(matched_gt, -1.0)
-                )
-
-                best_iou, best_gt_index = candidate_ious.max(dim=1)
-                is_true_positive = best_iou >= iou_thresholds
-
-                tp_matrix[prediction_index] = is_true_positive
-
-                # 僅更新本次成功配對的 threshold/GT 組合。
-                valid_threshold_indices = threshold_indices[
-                    is_true_positive
-                ]
-                valid_gt_indices = best_gt_index[
-                    is_true_positive
-                ]
-
-                matched_gt[
-                    valid_threshold_indices,
-                    valid_gt_indices,
-                ] = True
-
-        # 累積資料固定搬回 CPU，避免跨 batch 保留 GPU tensor，
-        # 並確保 compute() 的全域排序與累積運算裝置一致。
-        self.score_chunks.append(
-            pred_scores.detach().cpu().contiguous()
-        )
-        self.tp_chunks.append(
-            tp_matrix.detach().cpu().contiguous()
-        )
-
-    def compute(self) -> Dict[str, float]:
-        if self.num_gt == 0:
-            return {
-                "map50": 0.0,
-                "map50_95": 0.0,
-                "precision": 0.0,
-                "recall": 0.0,
-                "tp": 0,
-                "fp": int(self.num_pred),
-                "num_gt": 0,
-                "num_pred": int(self.num_pred),
-            }
-
-        if not self.score_chunks:
-            return {
-                "map50": 0.0,
-                "map50_95": 0.0,
-                "precision": 0.0,
-                "recall": 0.0,
-                "tp": 0,
-                "fp": 0,
-                "num_gt": int(self.num_gt),
-                "num_pred": 0,
-            }
-
-        all_scores = torch.cat(self.score_chunks, dim=0)
-        all_tp = torch.cat(self.tp_chunks, dim=0).to(torch.float32)
-
-        global_order = torch.argsort(
-            all_scores,
-            descending=True,
-            stable=True,
-        )
-
-        all_tp = all_tp[global_order]
-        all_fp = 1.0 - all_tp
-
-        cumulative_tp = torch.cumsum(all_tp, dim=0)
-        cumulative_fp = torch.cumsum(all_fp, dim=0)
-
-        recall = cumulative_tp / max(1, self.num_gt)
-        precision = cumulative_tp / torch.clamp(
-            cumulative_tp + cumulative_fp,
-            min=1e-7,
-        )
-
-        # Precision envelope，等價於原本由後往前逐點 max。
-        precision_envelope = torch.flip(
-            torch.cummax(
-                torch.flip(precision, dims=[0]),
-                dim=0,
-            ).values,
-            dims=[0],
-        )
-
-        previous_recall = torch.cat(
-            [
-                torch.zeros(
-                    (1, recall.shape[1]),
-                    dtype=recall.dtype,
-                ),
-                recall[:-1],
-            ],
-            dim=0,
-        )
-
-        recall_delta = recall - previous_recall
-        ap_per_threshold = torch.sum(
-            recall_delta * precision_envelope,
-            dim=0,
-        )
-
-        final_tp = cumulative_tp[-1]
-        final_fp = cumulative_fp[-1]
-
-        # 找最接近 0.50 的 threshold，避免自訂 threshold 順序造成錯誤。
-        threshold_50_index = int(
-            torch.argmin(torch.abs(self.iou_thresholds - 0.50)).item()
-        )
-
-        tp50 = int(final_tp[threshold_50_index].item())
-        fp50 = int(final_fp[threshold_50_index].item())
-
-        return {
-            "map50": float(ap_per_threshold[threshold_50_index].item()),
-            "map50_95": float(ap_per_threshold.mean().item()),
-            "precision": tp50 / max(1, tp50 + fp50),
-            "recall": tp50 / max(1, self.num_gt),
-            "tp": tp50,
-            "fp": fp50,
-            "num_gt": int(self.num_gt),
-            "num_pred": int(self.num_pred),
-        }
-
-
-
-class RawOracleRecallAccumulator:
-    """
-    使用全部 raw prediction 計算候選框覆蓋能力。
-
-    對每一個 GT，從該 query 的所有原始預測框中取最大 IoU：
-        best_iou(gt) = max IoU(raw_prediction, gt)
-
-    Raw Oracle Recall@t：
-        best_iou >= t 的 GT 數 / 全部 GT 數
-
-    此指標不套用 confidence threshold、Top-K 或 NMS，並允許同一個
-    prediction 成為多個 GT 的最佳候選。因此它是偏樂觀的候選框覆蓋
-    上限，只用於診斷定位能力，不能取代正式 mAP、Precision 或 Recall。
-    """
-
-    def __init__(
-        self,
-        iou_thresholds: Optional[Sequence[float]] = None,
-    ) -> None:
-        if iou_thresholds is None:
-            iou_thresholds = (0.25, 0.50, 0.75)
-
-        self.iou_thresholds = torch.as_tensor(
-            list(iou_thresholds),
-            dtype=torch.float32,
-        )
-
-        if self.iou_thresholds.numel() == 0:
-            raise ValueError(
-                "raw_oracle_iou_thresholds must not be empty"
-            )
-
-        if bool(
-            ((self.iou_thresholds < 0.0) | (self.iou_thresholds > 1.0)).any()
-        ):
-            raise ValueError(
-                "raw_oracle_iou_thresholds must be within [0, 1]"
-            )
-
-        self.best_iou_chunks: List[torch.Tensor] = []
-        self.num_gt = 0
-        self.num_samples = 0
-        self.num_positive_samples = 0
-        self.num_raw_pred = 0
-        self.num_raw_pred_positive = 0
-
-    @staticmethod
-    def threshold_key(threshold: float) -> str:
-        return f"raw_oracle_recall{int(round(float(threshold) * 100)):02d}"
-
-    def update(
-        self,
-        pred_boxes: torch.Tensor,
-        gt_boxes: torch.Tensor,
-    ) -> None:
-        # Raw Oracle 只需要 bbox，不使用 score。固定搬到 CPU，避免跨 batch
-        # 保留 GPU tensor，並讓獨立 validate.py 與 train.py 的結果一致。
-        pred_boxes = (
-            pred_boxes.detach()
-            .to(device="cpu", dtype=torch.float32)
-            .reshape(-1, 4)
-            .contiguous()
-        )
-        gt_boxes = (
-            gt_boxes.detach()
-            .to(device="cpu", dtype=torch.float32)
-            .reshape(-1, 4)
-            .contiguous()
-        )
-
-        num_pred = int(pred_boxes.shape[0])
-        num_gt = int(gt_boxes.shape[0])
-
-        self.num_samples += 1
-        self.num_raw_pred += num_pred
-        self.num_gt += num_gt
-
-        # 負文字 query 沒有 GT，不參與 Raw Oracle Recall，但仍保留於
-        # 正式 AP/Precision 的 FP 計算。
-        if num_gt == 0:
-            return
-
-        self.num_positive_samples += 1
-        self.num_raw_pred_positive += num_pred
-
-        if num_pred == 0:
-            best_iou = torch.zeros(
-                num_gt,
-                dtype=torch.float32,
-            )
-        else:
-            iou_matrix = box_iou_xyxy(
-                pred_boxes,
-                gt_boxes,
-            )
-            # 每一欄是一個 GT，取所有 raw prediction 中的最大 IoU。
-            best_iou = iou_matrix.max(dim=0).values
-
-        self.best_iou_chunks.append(
-            best_iou.detach().cpu().contiguous()
-        )
-
-    def compute(self) -> Dict[str, float]:
-        result: Dict[str, float] = {
-            "raw_oracle_num_gt": int(self.num_gt),
-            "raw_oracle_num_samples": int(self.num_samples),
-            "raw_oracle_positive_samples": int(
-                self.num_positive_samples
-            ),
-            "raw_oracle_num_pred": int(self.num_raw_pred),
-            "raw_oracle_avg_pred_per_sample": (
-                self.num_raw_pred / max(1, self.num_samples)
-            ),
-            "raw_oracle_avg_pred_per_positive_sample": (
-                self.num_raw_pred_positive
-                / max(1, self.num_positive_samples)
-            ),
-        }
-
-        if self.num_gt == 0 or not self.best_iou_chunks:
-            result.update({
-                "raw_best_iou_mean": 0.0,
-                "raw_best_iou_median": 0.0,
-                "raw_best_iou_p25": 0.0,
-                "raw_best_iou_p75": 0.0,
-            })
-
-            for threshold in self.iou_thresholds.tolist():
-                result[self.threshold_key(threshold)] = 0.0
-
-            return result
-
-        best_iou = torch.cat(
-            self.best_iou_chunks,
-            dim=0,
-        )
-
-        if int(best_iou.numel()) != int(self.num_gt):
-            raise RuntimeError(
-                "Raw Oracle GT count mismatch: "
-                f"best_iou={best_iou.numel()}, num_gt={self.num_gt}"
-            )
-
-        result.update({
-            "raw_best_iou_mean": float(best_iou.mean().item()),
-            "raw_best_iou_median": float(best_iou.median().item()),
-            "raw_best_iou_p25": float(
-                torch.quantile(best_iou, 0.25).item()
-            ),
-            "raw_best_iou_p75": float(
-                torch.quantile(best_iou, 0.75).item()
-            ),
-        })
-
-        for threshold in self.iou_thresholds.tolist():
-            result[self.threshold_key(threshold)] = float(
-                (best_iou >= float(threshold))
-                .to(torch.float32)
-                .mean()
-                .item()
-            )
-
-        return result
 
 
 # Unified validation: one forward pass for val loss + metrics + Raw Oracle
@@ -2481,409 +1584,6 @@ class RawOracleRecallAccumulator:
 
 
 @torch.inference_mode()
-def validate_one_epoch(
-    model: torch.nn.Module,
-    criterion: torch.nn.Module,
-    val_loader: Any,
-    device: torch.device,
-    epoch: int,
-    compute_loss: bool,
-    compute_metrics: bool,
-    use_amp: bool = True,
-    amp_dtype: torch.dtype = torch.bfloat16,
-    channels_last: bool = False,
-    lambda_bbox: float = 5.0,
-    lambda_giou: float = 2.0,
-    lambda_score: float = 1.0,
-    lambda_rank: float = 0.0,
-    pos_weight: float = 1.0,
-    quality_warmup_epoch: int = 20,
-    rank_start_epoch: int = 15,
-    rank_warmup_epoch: int = 30,
-    rank_alpha_min: float = 1e-4,
-    score_thr: float = 0.001,
-    top_k: int = 20,
-    nms_iou_thr: float = 0.5,
-    use_topk_fallback: bool = False,
-    use_nms: bool = True,
-    iou_thresholds: Optional[Sequence[float]] = None,
-    compute_raw_oracle: bool = True,
-    raw_oracle_iou_thresholds: Optional[Sequence[float]] = (
-        0.25,
-        0.50,
-        0.75,
-    ),
-    max_val_batches: Optional[int] = None,
-    log_interval: int = 50,
-    progress_leave: bool = True,
-    progress_mininterval: float = 0.5,
-) -> Tuple[Dict[str, float], Dict[str, float]]:
-    if not compute_loss and not compute_metrics:
-        return {}, {}
-
-    model.eval()
-    amp_enabled = get_amp_enabled(device, use_amp)
-
-    total_loss_sum = torch.zeros((), device=device)
-    total_bbox_sum = torch.zeros((), device=device)
-    total_giou_sum = torch.zeros((), device=device)
-    total_score_sum = torch.zeros((), device=device)
-    total_rank_contrib_sum = torch.zeros((), device=device)
-    total_rank_raw_sum = torch.zeros((), device=device)
-    total_text_negative_sum = torch.zeros((), device=device)
-    total_text_negative_contrib_sum = torch.zeros((), device=device)
-    total_text_negative_queries = 0
-
-    metric = (
-        BinaryDetectionAPAccumulator(iou_thresholds=iou_thresholds)
-        if compute_metrics
-        else None
-    )
-
-    raw_oracle_metric = (
-        RawOracleRecallAccumulator(
-            iou_thresholds=raw_oracle_iou_thresholds,
-        )
-        if compute_metrics and compute_raw_oracle
-        else None
-    )
-
-    sample_count = 0
-    skipped_empty_gt = 0
-    total_selected = 0
-    processed_batches = 0
-
-    pbar_total = (
-        len(val_loader)
-        if max_val_batches is None
-        else min(len(val_loader), int(max_val_batches))
-    )
-
-    labels = []
-    if compute_loss:
-        labels.append("Loss")
-    if compute_metrics:
-        labels.append("Eval")
-
-    pbar = make_progress_bar(
-        enumerate(val_loader),
-        total=pbar_total,
-        desc=f"Epoch {epoch} [Val {'+'.join(labels)}]",
-        leave=progress_leave,
-        mininterval=progress_mininterval,
-    )
-
-    validation_start = time.perf_counter()
-
-    for step, batch in pbar:
-        if max_val_batches is not None and step >= int(max_val_batches):
-            break
-
-        processed_batches += 1
-
-        images, query_texts, image_indices = prepare_model_batch(
-            batch=batch,
-            device=device,
-            channels_last=channels_last,
-        )
-
-        targets_device = (
-            move_targets_to_device(batch, device)
-            if compute_loss
-            else None
-        )
-
-        gt_boxes_cpu = (
-            get_target_boxes_cpu(batch)
-            if compute_metrics
-            else None
-        )
-
-        with autocast(
-            device_type=device.type,
-            enabled=amp_enabled,
-            dtype=amp_dtype if amp_enabled else None,
-        ):
-            outputs = forward_model_batch(
-                model=model,
-                images=images,
-                query_texts=query_texts,
-                image_indices=image_indices,
-                return_aux=False,
-            )
-
-            pred_bbox = outputs["bbox"]
-            pred_score_logit = get_score_logit(outputs)
-
-            if compute_loss:
-                loss, loss_dict = criterion(
-                    pred_bbox=pred_bbox,
-                    pred_score_logit=pred_score_logit,
-                    targets=targets_device,
-                    lambda_bbox=lambda_bbox,
-                    lambda_giou=lambda_giou,
-                    lambda_score=lambda_score,
-                    lambda_rank=0.0,
-                    pos_weight=pos_weight,
-                    current_epoch=epoch,
-                    quality_warmup_epoch=quality_warmup_epoch,
-                    rank_start_epoch=rank_start_epoch,
-                    rank_warmup_epoch=rank_warmup_epoch,
-                    rank_alpha_min=rank_alpha_min,
-                    query_loss_weights=batch.get("query_loss_weights"),
-                    text_negative_mask=batch.get("text_negative_mask"),
-                )
-
-        if compute_loss:
-            zero = pred_bbox.new_zeros(())
-
-            total_loss_sum.add_(loss.detach())
-            total_bbox_sum.add_(loss_dict["loss_bbox"].detach())
-            total_giou_sum.add_(loss_dict["loss_giou"].detach())
-            total_score_sum.add_(loss_dict["loss_score"].detach())
-            total_rank_contrib_sum.add_(
-                loss_dict.get(
-                    "loss_rank_contrib",
-                    loss_dict.get("loss_rank", zero),
-                ).detach()
-            )
-            total_rank_raw_sum.add_(
-                loss_dict.get("loss_rank_raw", zero).detach()
-            )
-            total_text_negative_sum.add_(
-                loss_dict.get("loss_text_negative", zero).detach()
-            )
-            total_text_negative_contrib_sum.add_(
-                loss_dict.get(
-                    "loss_text_negative_contrib",
-                    zero,
-                ).detach()
-            )
-            total_text_negative_queries += int(
-                batch.get(
-                    "text_negative_mask",
-                    torch.zeros(0, dtype=torch.bool),
-                ).sum().item()
-            )
-
-        if compute_metrics and metric is not None and gt_boxes_cpu is not None:
-            # Raw Oracle 與正式 filtered metric 共用同一次 model forward。
-            # 先使用全部原始 bbox 更新 Oracle，再做 threshold/Top-K/NMS。
-            if raw_oracle_metric is not None:
-                raw_pred_bbox_cpu = (
-                    pred_bbox.detach()
-                    .to(device="cpu", dtype=torch.float32)
-                    .contiguous()
-                )
-
-                if int(raw_pred_bbox_cpu.shape[0]) != len(gt_boxes_cpu):
-                    raise RuntimeError(
-                        "Raw prediction/GT batch size mismatch: "
-                        f"{raw_pred_bbox_cpu.shape[0]} != "
-                        f"{len(gt_boxes_cpu)}"
-                    )
-
-                for raw_boxes, gt_boxes in zip(
-                    raw_pred_bbox_cpu,
-                    gt_boxes_cpu,
-                ):
-                    raw_oracle_metric.update(
-                        pred_boxes=raw_boxes,
-                        gt_boxes=gt_boxes,
-                    )
-
-            pred_scores = pred_score_logit.sigmoid()
-
-            if pred_scores.ndim == 3:
-                pred_scores = pred_scores.squeeze(-1)
-
-            selected_batch = select_predictions_batch(
-                boxes=pred_bbox.detach(),
-                scores=pred_scores.detach(),
-                score_thr=score_thr,
-                top_k=top_k,
-                nms_iou_thr=nms_iou_thr,
-                use_topk_fallback=use_topk_fallback,
-                use_nms=use_nms,
-            )
-
-            for (selected_boxes, selected_scores), gt_boxes in zip(
-                selected_batch,
-                gt_boxes_cpu,
-            ):
-                if gt_boxes.numel() == 0:
-                    skipped_empty_gt += 1
-
-                total_selected += int(selected_boxes.shape[0])
-                sample_count += 1
-
-                metric.update(
-                    pred_boxes=selected_boxes,
-                    pred_scores=selected_scores,
-                    gt_boxes=gt_boxes,
-                )
-
-        should_log = (
-            (step + 1) % max(1, int(log_interval)) == 0
-            or (step + 1) == pbar_total
-        )
-
-        if should_log:
-            postfix: Dict[str, Any] = {}
-
-            if compute_loss:
-                postfix["loss"] = (
-                    f"{float((total_loss_sum / processed_batches).item()):.4f}"
-                )
-
-            if compute_metrics and metric is not None:
-                postfix.update({
-                    "samples": sample_count,
-                    "pred": metric.num_pred,
-                    "sel/img": f"{total_selected / max(1, sample_count):.2f}",
-                    "skip_empty": skipped_empty_gt,
-                })
-
-            pbar.set_postfix(postfix)
-            
-    pbar.refresh()
-    pbar.close()
-    validation_loop_time = time.perf_counter() - validation_start
-
-    val_loss_metrics: Dict[str, float] = {}
-    eval_metrics: Dict[str, float] = {}
-
-    if compute_loss:
-        denominator = max(1, processed_batches)
-        val_loss_metrics = {
-            "val_loss": float((total_loss_sum / denominator).item()),
-            "val_loss_bbox": float((total_bbox_sum / denominator).item()),
-            "val_loss_giou": float((total_giou_sum / denominator).item()),
-            "val_loss_score": float((total_score_sum / denominator).item()),
-            "val_loss_rank_raw": float((total_rank_raw_sum / denominator).item()),
-            "val_loss_rank": float(
-                (total_rank_contrib_sum / denominator).item()
-            ),
-            "val_loss_text_negative": float(
-                (total_text_negative_sum / denominator).item()
-            ),
-            "val_loss_text_negative_contrib": float(
-                (total_text_negative_contrib_sum / denominator).item()
-            ),
-            "val_text_negative_queries": int(total_text_negative_queries),
-            "val_score_negative_iou_ignore_thr": float(
-                criterion.score_negative_iou_ignore_thr
-            ),
-            "val_duplicate_suppression_enabled": bool(
-                criterion.duplicate_suppression_enabled
-            ),
-            "val_hard_negative_mining_enabled": bool(
-                criterion.hard_negative_mining_enabled
-            ),
-            "val_matcher_score_alpha": float(
-                criterion.resolve_epoch_alpha(
-                    current_epoch=epoch,
-                    quality_warmup_epoch=quality_warmup_epoch,
-                    rank_start_epoch=rank_start_epoch,
-                    rank_warmup_epoch=rank_warmup_epoch,
-                    rank_alpha_min=rank_alpha_min,
-                )[1]
-            ),
-            "val_matcher_cost_score_effective": float(
-                criterion.main_matcher.cost_score
-                * criterion.resolve_epoch_alpha(
-                    current_epoch=epoch,
-                    quality_warmup_epoch=quality_warmup_epoch,
-                    rank_start_epoch=rank_start_epoch,
-                    rank_warmup_epoch=rank_warmup_epoch,
-                    rank_alpha_min=rank_alpha_min,
-                )[1]
-            ),
-        }
-
-    if compute_metrics and metric is not None:
-        tqdm.write(
-            f"[Eval Metric] Start: samples={sample_count}, "
-            f"pred={metric.num_pred}, gt={metric.num_gt}"
-        )
-
-        metric_start = time.perf_counter()
-        eval_metrics = metric.compute()
-        metric_time = time.perf_counter() - metric_start
-
-        raw_oracle_time = 0.0
-        if raw_oracle_metric is not None:
-            raw_oracle_start = time.perf_counter()
-            raw_oracle_metrics = raw_oracle_metric.compute()
-            raw_oracle_time = (
-                time.perf_counter() - raw_oracle_start
-            )
-            eval_metrics.update(raw_oracle_metrics)
-
-            raw_oracle_recall50 = float(
-                raw_oracle_metrics.get(
-                    "raw_oracle_recall50",
-                    0.0,
-                )
-            )
-            filtered_recall50 = float(
-                eval_metrics.get("recall", 0.0)
-            )
-
-            eval_metrics["raw_oracle_gap50"] = (
-                raw_oracle_recall50 - filtered_recall50
-            )
-            eval_metrics["raw_oracle_retention50"] = (
-                filtered_recall50
-                / max(raw_oracle_recall50, 1e-12)
-            )
-
-        eval_metrics.update({
-            "valid_samples": sample_count,
-            "skipped_empty_gt": skipped_empty_gt,
-            "avg_selected_per_sample": (
-                total_selected / max(1, sample_count)
-            ),
-            "eval_loop_time": validation_loop_time,
-            "eval_metric_time": metric_time,
-            "raw_oracle_metric_time": raw_oracle_time,
-        })
-
-        tqdm.write(
-            f"[Eval Timing] loop={validation_loop_time:.2f}s "
-            f"metric={metric_time:.2f}s "
-            f"raw_oracle={raw_oracle_time:.2f}s"
-        )
-        tqdm.write(
-            f"Eval Epoch [{epoch}] "
-            f"mAP50={eval_metrics['map50']:.4f} "
-            f"mAP50-95={eval_metrics['map50_95']:.4f} "
-            f"P={eval_metrics['precision']:.4f} "
-            f"R={eval_metrics['recall']:.4f} "
-            f"TP={eval_metrics['tp']} "
-            f"FP={eval_metrics['fp']} "
-            f"GT={eval_metrics['num_gt']} "
-            f"Pred={eval_metrics['num_pred']} "
-            f"skip_empty={eval_metrics['skipped_empty_gt']}"
-        )
-
-        if raw_oracle_metric is not None:
-            tqdm.write(
-                f"Raw Oracle [{epoch}] "
-                f"R25={eval_metrics.get('raw_oracle_recall25', 0.0):.4f} "
-                f"R50={eval_metrics.get('raw_oracle_recall50', 0.0):.4f} "
-                f"R75={eval_metrics.get('raw_oracle_recall75', 0.0):.4f} "
-                f"BestIoUMean="
-                f"{eval_metrics.get('raw_best_iou_mean', 0.0):.4f} "
-                f"BestIoUMedian="
-                f"{eval_metrics.get('raw_best_iou_median', 0.0):.4f} "
-                f"Gap50="
-                f"{eval_metrics.get('raw_oracle_gap50', 0.0):.4f} "
-                f"Retention50="
-                f"{eval_metrics.get('raw_oracle_retention50', 0.0):.4f}"
-            )
-
-    return val_loss_metrics, eval_metrics
 
 
 
@@ -3723,6 +2423,7 @@ def train(args: SimpleNamespace) -> None:
         target_size=(args.target_size, args.target_size),
         text_max_length=args.text_max_length,
         fusion_token_num=args.fusion_token_num,
+        num_object_queries=args.num_object_queries,
         num_heads=args.num_heads,
         num_layers=args.num_layers,
         mlp_ratio=args.mlp_ratio,
@@ -3732,6 +2433,7 @@ def train(args: SimpleNamespace) -> None:
         use_auxiliary_head=args.use_auxiliary_head,
         auxiliary_in_eval=args.auxiliary_in_eval,
         initialize_aux_from_main=args.initialize_aux_from_main,
+        query_group_init_std=args.query_group_init_std,
     ).to(device)
 
     if args.channels_last:
@@ -4134,10 +2836,16 @@ def train(args: SimpleNamespace) -> None:
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.perf_counter()
 
-        lambda_bbox, lambda_giou, lambda_score = get_loss_weights(
+        loss_forward_kwargs = resolve_loss_forward_kwargs(
+            args=args,
             epoch=epoch,
             total_epochs=args.epochs,
-            args=args,
+        )
+        lambda_bbox = float(loss_forward_kwargs["lambda_bbox"])
+        lambda_giou = float(loss_forward_kwargs["lambda_giou"])
+        lambda_score = float(loss_forward_kwargs["lambda_score"])
+        lambda_aux = float(
+            loss_forward_kwargs.get("lambda_aux", args.aux_loss_weight)
         )
 
         pos_weight = float(args.pos_weight)
@@ -4161,6 +2869,7 @@ def train(args: SimpleNamespace) -> None:
             lambda_bbox=lambda_bbox,
             lambda_giou=lambda_giou,
             lambda_score=lambda_score,
+            lambda_aux=lambda_aux,
             lambda_rank=0.0,
             pos_weight=pos_weight,
             quality_warmup_epoch=args.quality_warmup_epoch,
@@ -4193,6 +2902,7 @@ def train(args: SimpleNamespace) -> None:
             device=device,
             epoch=epoch,
             compute_loss=run_val_loss,
+            total_epochs=args.epochs,
             compute_metrics=run_eval,
             use_amp=args.use_amp,
             amp_dtype=amp_dtype,
@@ -4278,7 +2988,7 @@ def train(args: SimpleNamespace) -> None:
                 args.hard_negative_start_epoch
             ),
             "lambda_rank_max": 0.0,
-            "lambda_aux": float(args.aux_loss_weight),
+            "lambda_aux": float(lambda_aux),
             "pos_weight": 1.0,
             "quality_warmup_epoch": int(args.quality_warmup_epoch),
             "aux_score_enabled": bool(args.aux_score_enabled),
@@ -4446,850 +3156,6 @@ def train(args: SimpleNamespace) -> None:
 # Configuration
 
 
-DEFAULT_MODEL_CFG = {
-    "model": {
-        "img_in_channels": 1024,
-        "hidden_dim": 512,
-        "num_heads": 8,
-        "num_layers": 3,
-        "mlp_ratio": 3.5,
-        "image_grid_size": 10,
-        "text_max_length": 32,
-        "fusion_token_num": 16,
-        "dropout": 0.1,
-        "cnn_layers": 3,
-        "freeze_bert": True,
-        "precomputed_bert_path": os.path.join(
-            CURRENT_DIR,
-            "cards",
-            "cache",
-            "bert_raw_cache.pt",
-        ),
-        "use_auxiliary_head": True,
-        "auxiliary_in_eval": False,
-        "initialize_aux_from_main": True,
-    }
-}
-
-
-DEFAULT_TRAIN_CFG = {
-    "data": {
-        "dataset_dir": os.path.join(PROJECT_ROOT, "datasets"),
-        "image_size": 640,
-        "max_text_aug_per_image": 1,
-        "cache_images": False,
-        "image_cache_dir": None,
-        "prebuild_image_cache": False,
-        "prefetch_factor": 4,
-        "pin_memory": True,
-        "persistent_workers": True,
-        "query_budget": True,
-        "cache_workers": 8,
-        "negative_query_path": os.path.join(
-            CURRENT_DIR,
-            "cards",
-            "cache",
-            "negative_query_pool.json",
-        ),
-        "negative_sample_ratio": 0.05,
-        "use_negative_queries_in_val": False,
-    },
-    "train": {
-        "epochs": 300,
-        "batch_size": 12,
-        "warmup_epochs": 5,
-        "num_workers": 8,
-        "device": "cuda:1",
-        "seed": 42,
-        "deterministic": False,
-        "use_amp": True,
-        "amp_dtype": "bf16",
-        "use_ema": True,
-        "ema_decay": 0.999,
-        "ema_update_interval": 1,
-        "ema_buffer_update_interval": 1,
-        "grad_clip_norm": 1.0,
-        "allow_tf32": True,
-        "matmul_precision": "high",
-        "channels_last": False,
-        "compile": False,
-        "compile_mode": "reduce-overhead",
-        "startup_smoke_test": True,
-    },
-    "optim": {
-        "lr_vision": 1e-4,
-        "lr_text": 1e-5,
-        "lr_transformer": 1e-4,
-        "lr_head": 1e-4,
-        "weight_decay": 1e-4,
-        "min_lr_ratio": 0.05,
-        "max_warmup_steps": 3000,
-        "fused": True,
-    },
-    "loss": {
-        "hybrid": {
-            "aux_loss_weight": 0.28,
-            "aux_cost_score": 0.0,
-        },
-        "matcher": {
-            "cost_bbox": 5.0,
-            "cost_giou": 2.0,
-            "cost_score": 2.0,
-            "score_cost_type": "focal",
-            "focal_alpha": 0.25,
-            "focal_gamma": 2.0,
-        },
-        "matcher_schedule": {
-            # Preserves the previous ranking schedule, but now controls how
-            # strongly text-aware score participates in Hungarian matching.
-            "start_epoch": 5,
-            "warmup_epoch": 12,
-            "alpha_min": 0.10,
-        },
-        "score_sampling": {
-            # Only the H-DETR auxiliary repeated-GT matcher uses these fields.
-            "positive_ratio": 1.0,
-            "max_positive_per_gt": 2,
-            "hard_negative_ratio": 5,
-            "aux_positive_label": 0.7,
-            "expand_cost_bbox": 5.0,
-            "expand_cost_giou": 2.0,
-        },
-        "quality": {
-            "iou_pos_thr": 0.10,
-            "quality_min": 0.10,
-            "quality_max": 1.0,
-            "quality_warmup_epoch": 10,
-            "aux_score_enabled": False,
-        },
-        "classification": {
-            "type": "ia_bce",
-            "ia_bce_alpha": 0.25,
-            "focal_alpha": 0.25,
-            "focal_gamma": 2.0,
-            "normalize_by_num_gt": True,
-            "negative_iou_ignore_thr": 0.50,
-        },
-        "duplicate_suppression": {
-            "enabled": True,
-            "loss_weight": 0.10,
-            "margin": 0.25,
-            "background_weight": 0.05,
-            "max_pairs": 128,
-            "start_epoch": 5,
-        },
-        "hard_negative": {
-            "enabled": True,
-            "loss_weight": 0.05,
-            "topk": 10,
-            "max_iou": 0.30,
-            "start_epoch": 10,
-        },
-        "text_negative": {
-            "as_empty_target": True,
-            "max_query_loss_weight": 4.0,
-            "lambda_text_negative": 0.20,
-            "text_negative_topk": 20,
-            "text_negative_hard_mix": 0.50,
-        },
-        "ranking": {
-            # Explicit dense pairwise ranking has been removed.
-            "enabled": False,
-            "lambda_rank": 0.0,
-            # Backward-compatible aliases for older YAML readers.
-            "rank_start_epoch": 5,
-            "rank_warmup_epoch": 12,
-            "rank_alpha_min": 0.10,
-        },
-        "weight": {
-            "dynamic": True,
-            "bbox": 5.0,
-            "giou": 2.0,
-            "score": 2.0,
-            "bbox_start": 5.0,
-            "bbox_end": 4.5,
-            "bbox_decay_until": 0.5,
-            "score_start": 2.0,
-            "score_end": 2.0,
-            "score_warm_until": 0.5,
-        },
-        "pos_weight": {
-            # Retained only for forward compatibility.
-            "value": 1.0,
-        },
-    },
-    "eval": {
-        "val_loss_interval": 5,
-        "eval_interval": 1,
-        "max_val_batches": None,
-        "score_thr": 0.001,
-        "top_k": 100,
-        "nms_iou_thr": 0.5,
-        "use_nms": False,
-        "iou_thresholds": None,
-        "compute_raw_oracle": True,
-        "raw_oracle_iou_thresholds": [0.25, 0.50, 0.75],
-        "best_metric": "map50_95",
-        "use_topk_fallback": False,
-    },
-    "log": {
-        "save_dir": None,
-        "resume_path": None,
-        "save_latest_interval": 1,
-        "save_epoch_interval": 50,
-        "emit_step_metrics": False,
-        "log_interval": 50,
-        "progress_leave": True,
-        "progress_mininterval": 0.5,
-    },
-}
-
-
-def deepcopy_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    return copy.deepcopy(cfg)
-
-
-def deep_update(
-    base: Dict[str, Any],
-    override: Dict[str, Any],
-) -> Dict[str, Any]:
-    for key, value in override.items():
-        if (
-            isinstance(value, dict)
-            and key in base
-            and isinstance(base[key], dict)
-        ):
-            deep_update(base[key], value)
-        else:
-            base[key] = value
-
-    return base
-
-
-def load_yaml(path: Optional[str]) -> Dict[str, Any]:
-    if path is None:
-        return {}
-
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"YAML config not found: {path}")
-
-    with open(path, "r", encoding="utf-8") as file:
-        config = yaml.safe_load(file)
-
-    if config is None:
-        return {}
-
-    if not isinstance(config, dict):
-        raise ValueError(f"YAML config must be a dict: {path}")
-
-    return config
-
-
-def load_model_config(path: Optional[str]) -> Dict[str, Any]:
-    config = deepcopy_cfg(DEFAULT_MODEL_CFG)
-    return deep_update(config, load_yaml(path))
-
-
-def load_train_config(path: Optional[str]) -> Dict[str, Any]:
-    config = deepcopy_cfg(DEFAULT_TRAIN_CFG)
-    return deep_update(config, load_yaml(path))
-
-
-def normalize_device(device: Any) -> str:
-    if device is None:
-        return "cuda:0" if torch.cuda.is_available() else "cpu"
-
-    if isinstance(device, int):
-        return f"cuda:{device}" if torch.cuda.is_available() else "cpu"
-
-    if isinstance(device, str):
-        device = device.strip()
-
-        if device.isdigit():
-            return f"cuda:{device}" if torch.cuda.is_available() else "cpu"
-
-        return device
-
-    raise TypeError(f"Unsupported device type: {type(device)}")
-
-
-def cfg_to_args(
-    model_cfg_all: Dict[str, Any],
-    train_cfg_all: Dict[str, Any],
-) -> SimpleNamespace:
-    model_cfg = model_cfg_all["model"]
-    data_cfg = train_cfg_all["data"]
-    train_cfg = train_cfg_all["train"]
-    optim_cfg = train_cfg_all["optim"]
-    loss_cfg = train_cfg_all["loss"]
-    eval_cfg = train_cfg_all["eval"]
-    log_cfg = train_cfg_all["log"]
-
-    hybrid_cfg = loss_cfg.get("hybrid", {})
-    matcher_cfg = loss_cfg.get("matcher", {})
-    weight_cfg = loss_cfg.get("weight", {})
-    pos_weight_cfg = loss_cfg.get("pos_weight", {})
-    score_sampling_cfg = loss_cfg.get("score_sampling", {})
-    quality_cfg = loss_cfg.get("quality", {})
-    ranking_cfg = loss_cfg.get("ranking", {})
-    classification_cfg = loss_cfg.get("classification", {})
-    matcher_schedule_cfg = loss_cfg.get("matcher_schedule", {})
-    text_negative_cfg = loss_cfg.get("text_negative", {})
-    duplicate_cfg = loss_cfg.get("duplicate_suppression", {})
-    hard_negative_cfg = loss_cfg.get("hard_negative", {})
-
-    # Backward compatibility: an old fixed threshold becomes a constant
-    # schedule unless any dynamic key is explicitly present.
-    legacy_score_ignore = quality_cfg.get(
-        "score_negative_iou_ignore_thr"
-    )
-    has_dynamic_score_ignore = any(
-        key in quality_cfg
-        for key in (
-            "score_negative_iou_ignore_start",
-            "score_negative_iou_ignore_end",
-            "score_negative_iou_ignore_start_epoch",
-            "score_negative_iou_ignore_end_epoch",
-            "score_negative_iou_ignore_schedule",
-        )
-    )
-    if legacy_score_ignore is not None and not has_dynamic_score_ignore:
-        score_ignore_start = float(legacy_score_ignore)
-        score_ignore_end = float(legacy_score_ignore)
-        score_ignore_start_epoch = 1
-        score_ignore_end_epoch = 1
-        score_ignore_schedule = "constant"
-    else:
-        score_ignore_start = float(
-            quality_cfg.get("score_negative_iou_ignore_start", 0.50)
-        )
-        score_ignore_end = float(
-            quality_cfg.get("score_negative_iou_ignore_end", 0.45)
-        )
-        score_ignore_start_epoch = int(
-            quality_cfg.get(
-                "score_negative_iou_ignore_start_epoch",
-                5,
-            )
-        )
-        score_ignore_end_epoch = int(
-            quality_cfg.get(
-                "score_negative_iou_ignore_end_epoch",
-                25,
-            )
-        )
-        score_ignore_schedule = str(
-            quality_cfg.get(
-                "score_negative_iou_ignore_schedule",
-                "cosine",
-            )
-        ).strip().lower()
-
-    return SimpleNamespace(
-        # data
-        dir=data_cfg["dataset_dir"],
-        image_size=data_cfg["image_size"],
-        max_text_aug_per_image=data_cfg["max_text_aug_per_image"],
-        cache_images=data_cfg.get("cache_images", False),
-        image_cache_dir=data_cfg.get("image_cache_dir"),
-        prebuild_image_cache=data_cfg.get("prebuild_image_cache", False),
-        prefetch_factor=data_cfg.get("prefetch_factor", 4),
-        pin_memory=data_cfg.get("pin_memory", True),
-        persistent_workers=data_cfg.get("persistent_workers", True),
-        query_budget=data_cfg.get("query_budget", True),
-        cache_workers=data_cfg.get("cache_workers", 8),
-        negative_query_path=data_cfg.get("negative_query_path"),
-        negative_sample_ratio=float(
-            data_cfg.get("negative_sample_ratio", 0.05)
-        ),
-        use_negative_queries_in_val=bool(
-            data_cfg.get("use_negative_queries_in_val", False)
-        ),
-
-        # train
-        epochs=train_cfg["epochs"],
-        batch_size=train_cfg["batch_size"],
-        warmup_epochs=train_cfg["warmup_epochs"],
-        num_workers=train_cfg["num_workers"],
-        device=train_cfg["device"],
-        seed=train_cfg["seed"],
-        deterministic=train_cfg["deterministic"],
-        use_amp=train_cfg["use_amp"],
-        amp_dtype=train_cfg.get("amp_dtype", "bf16"),
-        use_ema=train_cfg["use_ema"],
-        ema_decay=train_cfg["ema_decay"],
-        ema_update_interval=train_cfg.get("ema_update_interval", 1),
-        ema_buffer_update_interval=train_cfg.get(
-            "ema_buffer_update_interval",
-            1,
-        ),
-        grad_clip_norm=train_cfg["grad_clip_norm"],
-        allow_tf32=train_cfg.get("allow_tf32", True),
-        matmul_precision=train_cfg.get("matmul_precision", "high"),
-        channels_last=train_cfg.get("channels_last", False),
-        compile_model=train_cfg.get("compile", False),
-        compile_mode=train_cfg.get("compile_mode", "reduce-overhead"),
-        startup_smoke_test=train_cfg.get("startup_smoke_test", True),
-
-        # model
-        img_in_channels=model_cfg["img_in_channels"],
-        cnn_layers = model_cfg.get("cnn_layers"),
-        hidden_dim=model_cfg["hidden_dim"],
-        target_size=model_cfg["image_grid_size"],
-        text_max_length=model_cfg["text_max_length"],
-        fusion_token_num=model_cfg["fusion_token_num"],
-        num_heads=model_cfg["num_heads"],
-        num_layers=model_cfg["num_layers"],
-        mlp_ratio=model_cfg["mlp_ratio"],
-        dropout=model_cfg["dropout"],
-        freeze_bert=model_cfg["freeze_bert"],
-        precomputed_bert_path=model_cfg.get("precomputed_bert_path"),
-        use_auxiliary_head=bool(
-            model_cfg.get("use_auxiliary_head", True)
-        ),
-        auxiliary_in_eval=bool(
-            model_cfg.get("auxiliary_in_eval", False)
-        ),
-        initialize_aux_from_main=bool(
-            model_cfg.get("initialize_aux_from_main", True)
-        ),
-
-        # optimizer
-        lr_vision=optim_cfg["lr_vision"],
-        lr_text=optim_cfg["lr_text"],
-        lr_transformer=optim_cfg["lr_transformer"],
-        lr_head=optim_cfg["lr_head"],
-        weight_decay=optim_cfg["weight_decay"],
-        min_lr_ratio=optim_cfg["min_lr_ratio"],
-        max_warmup_steps=optim_cfg.get("max_warmup_steps", 3000),
-        fused_optimizer=optim_cfg.get("fused", True),
-
-        # hybrid loss
-        aux_loss_weight=float(
-            hybrid_cfg.get("aux_loss_weight", 0.5)
-        ),
-        aux_cost_score=float(
-            hybrid_cfg.get("aux_cost_score", 0.0)
-        ),
-
-        # matcher
-        cost_bbox=matcher_cfg.get("cost_bbox", 5.0),
-        cost_giou=matcher_cfg.get("cost_giou", 2.0),
-        cost_score=float(matcher_cfg.get("cost_score", 2.0)),
-        matcher_score_cost_type=str(
-            matcher_cfg.get("score_cost_type", "focal")
-        ),
-        matcher_focal_alpha=float(
-            matcher_cfg.get("focal_alpha", 0.25)
-        ),
-        matcher_focal_gamma=float(
-            matcher_cfg.get("focal_gamma", 2.0)
-        ),
-
-        # score sampling
-        hard_negative_ratio=score_sampling_cfg.get("hard_negative_ratio", 5),
-        positive_ratio=score_sampling_cfg.get("positive_ratio", 0.2),
-        max_positive_per_gt=score_sampling_cfg.get("max_positive_per_gt", 5),
-        aux_positive_label=score_sampling_cfg.get("aux_positive_label", 0.7),
-        expand_cost_bbox=score_sampling_cfg.get("expand_cost_bbox", 5.0),
-        expand_cost_giou=score_sampling_cfg.get("expand_cost_giou", 2.0),
-
-        # loss weights
-        loss_dynamic=weight_cfg.get("dynamic", True),
-        lambda_bbox=weight_cfg.get("bbox", 5.0),
-        lambda_giou=weight_cfg.get("giou", 2.0),
-        lambda_score=weight_cfg.get("score", 1.0),
-        lambda_bbox_start=weight_cfg.get("bbox_start", 5.0),
-        lambda_bbox_end=weight_cfg.get("bbox_end", 3.0),
-        lambda_bbox_decay_until=weight_cfg.get("bbox_decay_until", 0.5),
-        lambda_score_start=weight_cfg.get("score_start", 1.0),
-        lambda_score_end=weight_cfg.get("score_end", 2.0),
-        lambda_score_warm_until=weight_cfg.get("score_warm_until", 0.4),
-
-        # quality / ranking
-        pos_weight=pos_weight_cfg.get("value", 1.0),
-        iou_pos_thr=quality_cfg.get("iou_pos_thr", 0.15),
-        quality_min=quality_cfg.get("quality_min", 0.25),
-        quality_max=quality_cfg.get("quality_max", 1.0),
-        qfl_beta=quality_cfg.get("qfl_beta", 2.0),
-        quality_warmup_epoch=quality_cfg.get("quality_warmup_epoch", 10),
-
-        # DETR-native matched-query classification.
-        classification_type=str(
-            classification_cfg.get("type", "ia_bce")
-        ).strip().lower(),
-        ia_bce_alpha=float(
-            classification_cfg.get("ia_bce_alpha", 0.25)
-        ),
-        classification_focal_alpha=float(
-            classification_cfg.get("focal_alpha", 0.25)
-        ),
-        classification_focal_gamma=float(
-            classification_cfg.get("focal_gamma", 2.0)
-        ),
-        normalize_classification_by_num_gt=bool(
-            classification_cfg.get("normalize_by_num_gt", True)
-        ),
-        score_negative_iou_ignore_thr=float(
-            classification_cfg.get(
-                "negative_iou_ignore_thr",
-                quality_cfg.get(
-                    "score_negative_iou_ignore_thr",
-                    0.50,
-                ),
-            )
-        ),
-
-        # Duplicate-like unmatched queries.
-        duplicate_suppression_enabled=bool(
-            duplicate_cfg.get("enabled", True)
-        ),
-        duplicate_loss_weight=float(
-            duplicate_cfg.get(
-                "loss_weight",
-                duplicate_cfg.get("lambda_duplicate", 0.10),
-            )
-        ),
-        duplicate_margin=float(
-            duplicate_cfg.get("margin", 0.25)
-        ),
-        duplicate_background_weight=float(
-            duplicate_cfg.get("background_weight", 0.05)
-        ),
-        # Duplicate-like unmatched queries remain target=0 negatives in the
-        # main classification loss, but use a reduced weight to avoid
-        # suppressing unstable assignment candidates too aggressively.
-        duplicate_classification_weight=float(
-            duplicate_cfg.get("classification_weight", 0.25)
-        ),
-        duplicate_max_pairs=int(
-            duplicate_cfg.get("max_pairs", 128)
-        ),
-        duplicate_start_epoch=int(
-            duplicate_cfg.get("start_epoch", 5)
-        ),
-
-        # High-score, low-IoU unmatched queries.
-        hard_negative_mining_enabled=bool(
-            hard_negative_cfg.get(
-                "enabled",
-                score_sampling_cfg.get(
-                    "hard_negative_mining_enabled",
-                    True,
-                ),
-            )
-        ),
-        hard_negative_loss_weight=float(
-            hard_negative_cfg.get(
-                "loss_weight",
-                score_sampling_cfg.get(
-                    "hard_negative_loss_weight",
-                    0.05,
-                ),
-            )
-        ),
-        hard_negative_topk=int(
-            hard_negative_cfg.get(
-                "topk",
-                score_sampling_cfg.get("hard_negative_topk", 10),
-            )
-        ),
-        hard_negative_max_iou=float(
-            hard_negative_cfg.get(
-                "max_iou",
-                score_sampling_cfg.get(
-                    "hard_negative_max_iou",
-                    0.30,
-                ),
-            )
-        ),
-        hard_negative_start_epoch=int(
-            hard_negative_cfg.get(
-                "start_epoch",
-                score_sampling_cfg.get(
-                    "hard_negative_start_epoch",
-                    10,
-                ),
-            )
-        ),
-
-        negative_text_as_empty_target=bool(
-            text_negative_cfg.get("as_empty_target", True)
-        ),
-
-        # Legacy dense-score fields are retained only for old YAML parsing.
-        score_match_rounds=int(
-            quality_cfg.get("score_match_rounds", 1)
-        ),
-        score_quality_gamma=float(
-            quality_cfg.get("score_quality_gamma", 1.0)
-        ),
-        score_round_decay=float(
-            quality_cfg.get("score_round_decay", 0.25)
-        ),
-        score_min_iou=float(
-            quality_cfg.get("score_min_iou", 0.0)
-        ),
-        score_negative_iou_ignore_start=score_ignore_start,
-        score_negative_iou_ignore_end=score_ignore_end,
-        score_negative_iou_ignore_start_epoch=(
-            score_ignore_start_epoch
-        ),
-        score_negative_iou_ignore_end_epoch=(
-            score_ignore_end_epoch
-        ),
-        score_negative_iou_ignore_schedule=(
-            score_ignore_schedule
-        ),
-        aux_score_enabled=bool(
-            quality_cfg.get("aux_score_enabled", False)
-        ),
-
-        # Pairwise score ranking is opt-in.
-        ranking_enabled=bool(
-            ranking_cfg.get("enabled", False)
-        ),
-        lambda_rank=ranking_cfg.get("lambda_rank", 0.10),
-        rank_margin=ranking_cfg.get("rank_margin", 0.1),
-        rank_min_quality_gap=ranking_cfg.get("rank_min_quality_gap", 0.1),
-        rank_max_pairs=ranking_cfg.get("rank_max_pairs", 512),
-        rank_start_epoch=int(
-            matcher_schedule_cfg.get(
-                "start_epoch",
-                ranking_cfg.get("rank_start_epoch", 5),
-            )
-        ),
-        rank_warmup_epoch=int(
-            matcher_schedule_cfg.get(
-                "warmup_epoch",
-                ranking_cfg.get("rank_warmup_epoch", 12),
-            )
-        ),
-        rank_alpha_min=float(
-            matcher_schedule_cfg.get(
-                "alpha_min",
-                ranking_cfg.get("rank_alpha_min", 0.10),
-            )
-        ),
-        rank_negative_iou_max=float(
-            ranking_cfg.get("rank_negative_iou_max", 0.20)
-        ),
-        max_query_loss_weight=text_negative_cfg.get(
-            "max_query_loss_weight",
-            10.0,
-        ),
-        lambda_text_negative=float(
-            text_negative_cfg.get("lambda_text_negative", 0.50)
-        ),
-        text_negative_topk=int(
-            text_negative_cfg.get("text_negative_topk", 20)
-        ),
-        text_negative_hard_mix=float(
-            text_negative_cfg.get("text_negative_hard_mix", 0.50)
-        ),
-
-        # eval
-        val_loss_interval=eval_cfg["val_loss_interval"],
-        eval_interval=eval_cfg["eval_interval"],
-        max_val_batches=eval_cfg.get("max_val_batches"),
-        score_thr=eval_cfg["score_thr"],
-        top_k=eval_cfg["top_k"],
-        nms_iou_thr=eval_cfg["nms_iou_thr"],
-        use_nms=eval_cfg.get("use_nms", True),
-        iou_thresholds=eval_cfg.get("iou_thresholds"),
-        compute_raw_oracle=bool(
-            eval_cfg.get("compute_raw_oracle", True)
-        ),
-        raw_oracle_iou_thresholds=eval_cfg.get(
-            "raw_oracle_iou_thresholds",
-            [0.25, 0.50, 0.75],
-        ),
-        best_metric=eval_cfg["best_metric"],
-        use_topk_fallback=eval_cfg.get("use_topk_fallback", False),
-
-        # log
-        save_dir=log_cfg["save_dir"],
-        resume_path=log_cfg["resume_path"],
-        save_latest_interval=log_cfg.get("save_latest_interval", 1),
-        save_epoch_interval=log_cfg["save_epoch_interval"],
-        emit_step_metrics=log_cfg["emit_step_metrics"],
-        log_interval=log_cfg["log_interval"],
-        progress_leave=log_cfg.get("progress_leave", False),
-        progress_mininterval=log_cfg.get("progress_mininterval", 0.5),
-
-        model_cfg=model_cfg_all,
-        train_cfg=train_cfg_all,
-    )
-
-
-def print_config_summary(
-    model_cfg: Dict[str, Any],
-    train_cfg: Dict[str, Any],
-) -> None:
-    model = model_cfg["model"]
-    data = train_cfg["data"]
-    training = train_cfg["train"]
-    optimizer = train_cfg["optim"]
-    loss = train_cfg["loss"]
-    evaluation = train_cfg["eval"]
-    logging = train_cfg["log"]
-
-    hybrid = loss.get("hybrid", {})
-    matcher = loss.get("matcher", {})
-    weight = loss.get("weight", {})
-    pos_weight = loss.get("pos_weight", {})
-    quality = loss.get("quality", {})
-    ranking = loss.get("ranking", {})
-    classification = loss.get("classification", {})
-    matcher_schedule = loss.get("matcher_schedule", {})
-    score_sampling = loss.get("score_sampling", {})
-    text_negative = loss.get("text_negative", {})
-    duplicate = loss.get("duplicate_suppression", {})
-    hard_negative = loss.get("hard_negative", {})
-
-    print("\n[LightDet] Training config")
-    print(f"  dataset      : {data['dataset_dir']}")
-    print(f"  image_size   : {data['image_size']}")
-    print(
-        f"  image cache  : enabled={data.get('cache_images', False)}, "
-        f"prebuild={data.get('prebuild_image_cache', False)}, "
-        f"prefetch={data.get('prefetch_factor', 4)}, "
-        f"dir={data.get('image_cache_dir')}"
-    )
-    print(
-        f"  dataloader   : workers={training['num_workers']}, "
-        f"pin_memory={data.get('pin_memory', True)}, "
-        f"persistent={data.get('persistent_workers', True)}, "
-        f"query_budget={data.get('query_budget', True)}, "
-        f"cache_workers={data.get('cache_workers', 8)}"
-    )
-    print(
-        f"  text negative: path={data.get('negative_query_path')}, "
-        f"ratio={data.get('negative_sample_ratio', 0.05)}, "
-        f"val={data.get('use_negative_queries_in_val', False)}, "
-        f"max_weight={text_negative.get('max_query_loss_weight', 10.0)}, "
-        f"lambda={text_negative.get('lambda_text_negative', 0.50)}, "
-        f"topk={text_negative.get('text_negative_topk', 20)}, "
-        f"empty_target={text_negative.get('as_empty_target', True)}"
-    )
-    print(f"  epochs       : {training['epochs']}")
-    print(f"  batch        : {training['batch_size']}")
-    print(f"  device       : {training['device']}")
-    print(f"  seed         : {training['seed']}")
-    print(f"  save_dir     : {logging['save_dir']}")
-    print(
-        f"  AMP          : use={training.get('use_amp', True)}, "
-        f"dtype={training.get('amp_dtype', 'bf16')}"
-    )
-    print(
-        f"  TF32         : allow={training.get('allow_tf32', True)}, "
-        f"matmul={training.get('matmul_precision', 'high')}"
-    )
-    print(
-        f"  channels_last: {training.get('channels_last', False)}"
-    )
-    print(
-        f"  compile      : {training.get('compile', False)}, "
-        f"mode={training.get('compile_mode', 'reduce-overhead')}"
-    )
-    print(f"  hidden_dim   : {model['hidden_dim']}")
-    print(
-        f"  grid         : {model['image_grid_size']}x"
-        f"{model['image_grid_size']}"
-    )
-    print(f"  num_layers   : {model['num_layers']}")
-    print(f"  num_heads    : {model['num_heads']}")
-    print(f"  mlp_ratio    : {model['mlp_ratio']}")
-    print(f"  cnn_layers   : {model.get('cnn_layers', 3)}")
-    print(f"  bert_cache   : {model.get('precomputed_bert_path')}")
-    print(
-        f"  hybrid head  : enabled="
-        f"{model.get('use_auxiliary_head', True)}, "
-        f"aux_eval={model.get('auxiliary_in_eval', False)}, "
-        f"init_from_main="
-        f"{model.get('initialize_aux_from_main', True)}"
-    )
-    print(f"  lr_vision    : {optimizer['lr_vision']}")
-    print(f"  lr_text      : {optimizer['lr_text']}")
-    print(f"  lr_trans     : {optimizer['lr_transformer']}")
-    print(f"  lr_head      : {optimizer['lr_head']}")
-    print(f"  fused AdamW  : {optimizer.get('fused', True)}")
-    print(
-        f"  hybrid loss  : weight="
-        f"{hybrid.get('aux_loss_weight', 0.5)}, "
-        f"aux_score_cost={hybrid.get('aux_cost_score', 0.0)}"
-    )
-    print(
-        f"  matcher      : bbox={matcher.get('cost_bbox', 5.0)}, "
-        f"giou={matcher.get('cost_giou', 2.0)}, "
-        f"score={matcher.get('cost_score', 2.0)}"
-    )
-    print(
-        f"  loss weight  : dynamic={weight.get('dynamic', True)}, "
-        f"bbox={weight.get('bbox_start', weight.get('bbox', 5.0))}"
-        f"->{weight.get('bbox_end', weight.get('bbox', 5.0))}, "
-        f"giou={weight.get('giou', 2.0)}, "
-        f"score={weight.get('score_start', weight.get('score', 1.0))}"
-        f"->{weight.get('score_end', weight.get('score', 1.0))}"
-    )
-    print(
-        f"  aux matching : repeat_k="
-        f"{score_sampling.get('max_positive_per_gt', 2)}, "
-        f"iou_thr={quality.get('iou_pos_thr', 0.10)}, "
-        f"aux_score={quality.get('aux_score_enabled', False)}"
-    )
-    print(
-        f"  class loss   : type={classification.get('type', 'ia_bce')}, "
-        f"ia_alpha={classification.get('ia_bce_alpha', 0.25)}, "
-        f"focal_alpha={classification.get('focal_alpha', 0.25)}, "
-        f"focal_gamma={classification.get('focal_gamma', 2.0)}, "
-        f"norm_gt={classification.get('normalize_by_num_gt', True)}, "
-        f"ignore_iou={classification.get('negative_iou_ignore_thr', 0.50)}, "
-        f"quality_warmup={quality.get('quality_warmup_epoch', 10)}"
-    )
-    print(
-        f"  duplicate    : enabled={duplicate.get('enabled', True)}, "
-        f"weight={duplicate.get('loss_weight', 0.10)}, "
-        f"margin={duplicate.get('margin', 0.25)}, "
-        f"bg_weight={duplicate.get('background_weight', 0.05)}, "
-        f"max_pairs={duplicate.get('max_pairs', 128)}, "
-        f"start={duplicate.get('start_epoch', 5)}"
-    )
-    print(
-        f"  hard negative: enabled={hard_negative.get('enabled', True)}, "
-        f"weight={hard_negative.get('loss_weight', 0.05)}, "
-        f"topk={hard_negative.get('topk', 10)}, "
-        f"max_iou={hard_negative.get('max_iou', 0.30)}, "
-        f"start={hard_negative.get('start_epoch', 10)}"
-    )
-    print(
-        f"  matcher sched: start="
-        f"{matcher_schedule.get('start_epoch', ranking.get('rank_start_epoch', 5))}, "
-        f"warmup="
-        f"{matcher_schedule.get('warmup_epoch', ranking.get('rank_warmup_epoch', 12))}, "
-        f"alpha_min="
-        f"{matcher_schedule.get('alpha_min', ranking.get('rank_alpha_min', 0.10))}"
-    )
-    print(
-        "  dense losses : pairwise_rank=False, "
-        "dense_score_assignment=False"
-    )
-    print(f"  pos weight   : {pos_weight.get('value', 1.0)}")
-    print(
-        f"  eval         : metric={evaluation['best_metric']}, "
-        f"score_thr={evaluation['score_thr']}, "
-        f"top_k={evaluation['top_k']}, "
-        f"use_nms={evaluation.get('use_nms', True)}, "
-        f"max_batches={evaluation.get('max_val_batches')}"
-    )
-    print(
-        f"  raw oracle   : enabled="
-        f"{evaluation.get('compute_raw_oracle', True)}, "
-        f"iou={evaluation.get('raw_oracle_iou_thresholds', [0.25, 0.5, 0.75])}"
-    )
-    print("")
-
-
 class LightDet:
     """
     YOLO-style training interface.
@@ -5301,7 +3167,7 @@ class LightDet:
 
     def __init__(
         self,
-        model: str = "cards/config/model.yaml",
+        model: str = str(DEFAULT_MODEL_CONFIG_PATH),
     ) -> None:
         self.model_cfg_path = model
         self.model_cfg = load_model_config(
@@ -5318,7 +3184,7 @@ class LightDet:
 
     def train(
         self,
-        cfg: str = "cards/config/train.yaml",
+        cfg: str = str(DEFAULT_TRAIN_CONFIG_PATH),
         data: Optional[str] = None,
         epochs: Optional[int] = None,
         imgsz: Optional[int] = None,
@@ -5326,11 +3192,11 @@ class LightDet:
         device: Optional[Any] = None,
         workers: Optional[int] = None,
         seed: Optional[int] = None,
-        project: str = "runs/train",
-        name: str = "exp",
+        project: Optional[str] = None,
+        name: Optional[str] = None,
         weights: Optional[str] = None,
         resume: Optional[Any] = None,
-        prefer_ema: bool = True,
+        prefer_ema: Optional[bool] = None,
     ) -> None:
         """
         Train LightDet through a compact YOLO-like function call.
@@ -5363,7 +3229,7 @@ class LightDet:
         if data is not None:
             train_cfg["data"][
                 "dataset_dir"
-            ] = str(data)
+            ] = os.path.abspath(str(data))
 
         if epochs is not None:
             train_cfg["train"][
@@ -5405,19 +3271,32 @@ class LightDet:
                 ]
             )
 
-        train_cfg["log"]["save_dir"] = (
-            os.path.join(
-                str(project),
-                str(name),
+        if project is not None or name is not None:
+            configured_save_dir = train_cfg["log"].get("save_dir")
+            project_value = (
+                str(project)
+                if project is not None
+                else os.path.dirname(str(configured_save_dir))
             )
-        )
+            name_value = (
+                str(name)
+                if name is not None
+                else os.path.basename(str(configured_save_dir))
+            )
+            train_cfg["log"]["save_dir"] = os.path.abspath(
+                os.path.join(project_value, name_value)
+            )
 
-        resolved_weights_path: Optional[
-            str
-        ] = None
-        resolved_resume_path: Optional[
-            str
-        ] = None
+        resolved_weights_path: Optional[str] = None
+        resolved_resume_path: Optional[str] = None
+
+        configured_weights = train_cfg["log"].get("weights_path")
+        configured_resume = train_cfg["log"].get("resume_path")
+
+        if weights is None:
+            weights = configured_weights
+        if resume is None:
+            resume = configured_resume
 
         if weights is not None:
             if isinstance(weights, bool):
@@ -5437,8 +3316,7 @@ class LightDet:
                 resolved_resume_path = (
                     os.path.abspath(
                         os.path.join(
-                            str(project),
-                            str(name),
+                            str(train_cfg["log"]["save_dir"]),
                             "latest.pt",
                         )
                     )
@@ -5489,9 +3367,11 @@ class LightDet:
         # True for deployment-oriented duplicate removal.
 
         # Checkpoint mode is controlled only by this function call.
-        train_cfg["log"][
-            "resume_path"
-        ] = resolved_resume_path
+        train_cfg["log"]["weights_path"] = resolved_weights_path
+        train_cfg["log"]["resume_path"] = resolved_resume_path
+        if prefer_ema is None:
+            prefer_ema = bool(train_cfg["log"].get("prefer_ema", True))
+        train_cfg["log"]["prefer_ema"] = bool(prefer_ema)
 
         set_deterministic(
             seed=train_cfg["train"][
@@ -5513,9 +3393,7 @@ class LightDet:
         args.resume_path = (
             resolved_resume_path
         )
-        args.prefer_ema = bool(
-            prefer_ema
-        )
+        args.prefer_ema = bool(prefer_ema)
 
         print_config_summary(
             model_cfg=model_cfg,
@@ -5566,27 +3444,10 @@ def main() -> None:
     os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
     model = LightDet(
-        model=(
-            "/home/soic/Desktop/LightDet/units/model/cards/config/model.yaml"
-        )
+        model=str(DEFAULT_MODEL_CONFIG_PATH),
     )
-
     model.train(
-        cfg=(
-            "/home/soic/Desktop/LightDet/units/model/cards/config/train.yaml"
-        ),
-        data="/home/soic/Desktop/LightDet/datasets",
-        epochs=100,
-        imgsz=512,
-        batch=48,
-        device=1,
-        workers=16,
-        seed=49,
-        weights=None,
-        resume=None,
-        prefer_ema=True,
-        project="runs/train",
-        name="lightdet_HDETR_textaware_dynamic_scale_up",
+        cfg=str(DEFAULT_TRAIN_CONFIG_PATH),
     )
 
 
