@@ -3580,6 +3580,7 @@ def train(args: SimpleNamespace) -> None:
 
     model = VisionTextModel(
         img_in_channels=args.img_in_channels,
+        cnn_layer= args.cnn_layers,
         hidden_dim=args.hidden_dim,
         target_size=(args.target_size, args.target_size),
         text_max_length=args.text_max_length,
@@ -4555,6 +4556,7 @@ def cfg_to_args(
 
         # model
         img_in_channels=model_cfg["img_in_channels"],
+        cnn_layers = model_cfg.get("cnn_layers"),
         hidden_dim=model_cfg["hidden_dim"],
         target_size=model_cfg["image_grid_size"],
         text_max_length=model_cfg["text_max_length"],
@@ -5205,7 +5207,7 @@ def main() -> None:
         resume=None,
         prefer_ema=True,
         project="runs/train",
-        name="lightdet_HDETR_textaware_dynamic_2",
+        name="lightdet_HDETR_textaware_dynamic_scale_up",
     )
 
 

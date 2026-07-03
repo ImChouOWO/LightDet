@@ -6,7 +6,9 @@ data:
   cache_images: true
   image_cache_dir: /home/soic/Desktop/LightDet/datasets/.cache/images_512_uint8
   prebuild_image_cache: true
-  prefetch_factor: 4
+
+  # train.py 最多只使用 2。
+  prefetch_factor: 2
   cache_workers: 8
 
   pin_memory: true
@@ -35,7 +37,6 @@ train:
 
   channels_last: false
   compile: false
-  compile_mode: reduce-overhead
   startup_smoke_test: true
 
   use_ema: true
@@ -60,80 +61,58 @@ optim:
 
 loss:
   hybrid:
-    # H-DETR-style one-to-many auxiliary regression.
+    # H-DETR one-to-many auxiliary regression。
     aux_loss_weight: 0.28
-    aux_cost_score: 0.0
 
   matcher:
-    # DETR/Rank-DETR-style 2:5:2 matching cost.
+    # DETR / Rank-DETR 2:5:2 Hungarian matching。
     cost_score: 2.0
     cost_bbox: 5.0
     cost_giou: 2.0
 
-    # Focal matching cost used by DETR-family implementations.
     score_cost_type: focal
     focal_alpha: 0.25
-    focal_gamma: 2.0
 
   matcher_schedule:
-    # Reuses the previous ranking schedule concept.
-    # The schedule now increases the score term in Hungarian matching.
+    # 逐步增加文字條件分數對 Hungarian matching 的影響。
     start_epoch: 1
     warmup_epoch: 12
     alpha_min: 0.10
 
   score_sampling:
-    # Only H-DETR auxiliary matching still uses these fields.
-    positive_ratio: 1.0
+    # H-DETR auxiliary branch 的每個 GT 重複配對數。
     max_positive_per_gt: 2
-    aux_positive_label: 0.7
-    expand_cost_bbox: 5.0
-    expand_cost_giou: 2.0
 
   quality:
-    # Minimum IoU for additional H-DETR repeated matches.
+    # Auxiliary 重複配對框的最低 IoU。
     iou_pos_thr: 0.10
 
-    # Matched one-to-one quality target range.
+    # Main matched query 的品質目標範圍。
     quality_min: 0.10
     quality_max: 1.0
     quality_warmup_epoch: 10
 
-    # Auxiliary branch remains regression-only.
+    # Auxiliary branch 僅提供定位監督。
     aux_score_enabled: false
 
   classification:
-    # Align-DETR-style IoU-aware BCE target for matched queries.
+    # Align-DETR 式 IoU-aware BCE。
     type: ia_bce
     ia_bce_alpha: 0.25
-
-    focal_alpha: 0.25
     focal_gamma: 2.0
 
-    # DETR-style normalization by the number of matched GT boxes.
+    # 依 batch 中 GT 數量正規化。
     normalize_by_num_gt: true
 
   text_negative:
-    # Negative captions become empty-target DETR samples:
-    # no positive matching and no bbox/GIoU regression.
+    # 負文字視為 empty-target DETR sample。
     as_empty_target: true
 
-    # Main classification already supervises every query as no-object.
-    # This term only reinforces the highest-scoring negative queries.
+    # 額外抑制負文字下分數最高的預測。
     lambda_text_negative: 0.20
     text_negative_topk: 20
     text_negative_hard_mix: 0.50
     max_query_loss_weight: 4.0
-
-  ranking:
-    # Explicit dense pairwise ranking is removed.
-    enabled: false
-    lambda_rank: 0.0
-
-    # Kept as aliases for older train.py parameter readers.
-    rank_start_epoch: 5
-    rank_warmup_epoch: 12
-    rank_alpha_min: 0.10
 
   weight:
     dynamic: true
@@ -144,29 +123,19 @@ loss:
 
     giou: 2.0
 
-    # Official Rank-DETR classification weight scale.
+    # Classification 維持固定權重。
     score_start: 2.0
     score_end: 2.0
-    score_warm_until: 0.5
-
-  pos_weight:
-    # Retained only for old train.py compatibility; DETR-native loss ignores it.
-    value: 1.0
 
 
 eval:
   val_loss_interval: 2
   eval_interval: 1
-  max_val_batches: null
 
-  score_thr: 0.001
+  score_thr: 0.000
   top_k: 20
+  use_nms: True
 
-  nms_iou_thr: 0.5
-  use_nms: false
-  use_topk_fallback: false
-
-  iou_thresholds: null
   best_metric: map50_95
 
   compute_raw_oracle: true
@@ -177,9 +146,6 @@ eval:
 
 
 log:
-  save_dir: runs/train/lightdet_detr_native_iabce_seed51
-  resume_path: null
-
   save_latest_interval: 1
   save_epoch_interval: 5
 
