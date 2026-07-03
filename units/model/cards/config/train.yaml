@@ -64,6 +64,7 @@ loss:
     # H-DETR one-to-many auxiliary regression。
     aux_loss_weight: 0.28
 
+
   matcher:
     # DETR / Rank-DETR 2:5:2 Hungarian matching。
     cost_score: 2.0
@@ -73,15 +74,22 @@ loss:
     score_cost_type: focal
     focal_alpha: 0.25
 
+
   matcher_schedule:
     # 逐步增加文字條件分數對 Hungarian matching 的影響。
     start_epoch: 1
     warmup_epoch: 12
     alpha_min: 0.10
 
+
   score_sampling:
     # H-DETR auxiliary branch 的每個 GT 重複配對數。
     max_positive_per_gt: 2
+
+    # 每個 GT 最多選取的 hard-negative 比例。
+    # 實際數量仍受 hard_negative.topk 限制。
+    hard_negative_ratio: 5
+
 
   quality:
     # Auxiliary 重複配對框的最低 IoU。
@@ -95,6 +103,7 @@ loss:
     # Auxiliary branch 僅提供定位監督。
     aux_score_enabled: false
 
+
   classification:
     # Align-DETR 式 IoU-aware BCE。
     type: ia_bce
@@ -103,6 +112,52 @@ loss:
 
     # 依 batch 中 GT 數量正規化。
     normalize_by_num_gt: true
+
+    # 未被 Hungarian 配對，但與任一 GT 的 IoU >= 0.50：
+    # 不再使用完整的背景 IA-BCE 壓到 0，
+    # 改交由 duplicate_suppression 處理。
+    negative_iou_ignore_thr: 0.50
+
+
+  duplicate_suppression:
+    # 處理與 GT 高度重疊、但未被 Hungarian 選中的重複框。
+    enabled: true
+
+    # Duplicate Loss 加入總 Loss 的權重。
+    loss_weight: 0.10
+
+    # 要求 matched TP 的 logit 高於 duplicate logit。
+    # z_tp >= z_duplicate + margin
+    margin: 0.25
+
+    # Duplicate 仍保留少量背景抑制，
+    # 避免完全忽略後維持過高分數。
+    background_weight: 0.05
+
+    # 每個 batch 最多處理的 duplicate pairs。
+    max_pairs: 128
+
+    # 前幾個 epoch 定位尚未穩定，先不啟用。
+    start_epoch: 5
+
+
+  hard_negative:
+    # 抑制低 IoU 但置信度過高的真正背景框。
+    enabled: true
+
+    # Hard-negative Loss 加入總 Loss 的權重。
+    loss_weight: 0.05
+
+    # 每筆文字查詢最多選取的高分負樣本數。
+    topk: 10
+
+    # 只有與所有 GT 的最大 IoU <= 0.30，
+    # 才能作為真正 hard negative。
+    max_iou: 0.30
+
+    # Duplicate ranking 穩定後再啟用。
+    start_epoch: 10
+
 
   text_negative:
     # 負文字視為 empty-target DETR sample。
@@ -113,6 +168,7 @@ loss:
     text_negative_topk: 20
     text_negative_hard_mix: 0.50
     max_query_loss_weight: 4.0
+
 
   weight:
     dynamic: true
@@ -132,9 +188,12 @@ eval:
   val_loss_interval: 2
   eval_interval: 1
 
-  score_thr: 0.000
+  # AP 計算時保留完整置信度排序。
+  score_thr: 0.0
   top_k: 20
-  use_nms: True
+
+  # 部署型評估：移除同一文字查詢下的高度重疊框。
+  use_nms: true
 
   best_metric: map50_95
 

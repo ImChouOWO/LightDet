@@ -1663,7 +1663,12 @@ def train_one_epoch(
                 loss_dict.get("lambda_rank_eff", 0.0)
             )
             quality_alpha_item = float(loss_dict.get("quality_alpha", 1.0))
-            score_ignore_thr_item = 0.0
+            score_ignore_thr_item = float(
+                loss_dict.get(
+                    "score_negative_iou_ignore_thr",
+                    criterion.score_negative_iou_ignore_thr,
+                )
+            )
             matcher_score_alpha_item = float(
                 loss_dict.get("matcher_score_alpha", rank_alpha_item)
             )
@@ -1753,7 +1758,93 @@ def train_one_epoch(
                     "quality_alpha": quality_alpha_item,
                     "rank_alpha": rank_alpha_item,
                     "rank_alpha_min": float(rank_alpha_min),
-                    "score_negative_iou_ignore_thr": 0.0,
+                    "score_negative_iou_ignore_thr": (
+                        score_ignore_thr_item
+                    ),
+                    "duplicate_suppression_enabled": bool(
+                        loss_dict.get(
+                            "duplicate_suppression_enabled",
+                            False,
+                        )
+                    ),
+                    "loss_duplicate": float(
+                        loss_dict.get("loss_duplicate", zero)
+                        .detach()
+                        .item()
+                    ),
+                    "loss_duplicate_contrib": float(
+                        loss_dict.get(
+                            "loss_duplicate_contrib",
+                            zero,
+                        )
+                        .detach()
+                        .item()
+                    ),
+                    "duplicate_pair_count": float(
+                        loss_dict.get(
+                            "duplicate_pair_count",
+                            zero,
+                        )
+                        .detach()
+                        .item()
+                    ),
+                    "duplicate_violation_fraction": float(
+                        loss_dict.get(
+                            "duplicate_violation_fraction",
+                            zero,
+                        )
+                        .detach()
+                        .item()
+                    ),
+                    "duplicate_score_gap_mean": float(
+                        loss_dict.get(
+                            "duplicate_score_gap_mean",
+                            zero,
+                        )
+                        .detach()
+                        .item()
+                    ),
+                    "loss_hard_negative": float(
+                        loss_dict.get(
+                            "loss_hard_negative",
+                            zero,
+                        )
+                        .detach()
+                        .item()
+                    ),
+                    "loss_hard_negative_contrib": float(
+                        loss_dict.get(
+                            "loss_hard_negative_contrib",
+                            zero,
+                        )
+                        .detach()
+                        .item()
+                    ),
+                    "hard_neg_count": float(
+                        loss_dict.get("hard_neg_count", zero)
+                        .detach()
+                        .item()
+                    ),
+                    "hard_negative_score_mean": float(
+                        loss_dict.get(
+                            "hard_negative_score_mean",
+                            zero,
+                        )
+                        .detach()
+                        .item()
+                    ),
+                    "ignored_negative_count": float(
+                        loss_dict.get(
+                            "ignored_negative_count",
+                            0.0,
+                        )
+                    ),
+                    "selected_negative_fraction": float(
+                        loss_dict.get(
+                            "selected_negative_fraction",
+                            1.0,
+                        )
+                    ),
                     "matcher_score_alpha": matcher_score_alpha_item,
                     "matcher_cost_score_effective": (
                         matcher_score_cost_item
@@ -1807,7 +1898,34 @@ def train_one_epoch(
             (total_text_negative_contrib_sum / num_batches).item()
         ),
         "train_text_negative_queries": int(total_text_negative_queries),
-        "score_negative_iou_ignore_thr": 0.0,
+        "score_negative_iou_ignore_thr": float(
+            criterion.score_negative_iou_ignore_thr
+        ),
+        "duplicate_suppression_enabled": bool(
+            criterion.duplicate_suppression_enabled
+        ),
+        "duplicate_loss_weight": float(
+            criterion.duplicate_loss_weight
+        ),
+        "duplicate_margin": float(criterion.duplicate_margin),
+        "duplicate_start_epoch": int(
+            criterion.duplicate_start_epoch
+        ),
+        "hard_negative_mining_enabled": bool(
+            criterion.hard_negative_mining_enabled
+        ),
+        "hard_negative_loss_weight": float(
+            criterion.hard_negative_loss_weight
+        ),
+        "hard_negative_topk": int(
+            criterion.hard_negative_topk
+        ),
+        "hard_negative_max_iou": float(
+            criterion.hard_negative_max_iou
+        ),
+        "hard_negative_start_epoch": int(
+            criterion.hard_negative_start_epoch
+        ),
         "matcher_score_alpha": float(
             criterion.resolve_epoch_alpha(
                 current_epoch=epoch,
@@ -2641,7 +2759,15 @@ def validate_one_epoch(
                 (total_text_negative_contrib_sum / denominator).item()
             ),
             "val_text_negative_queries": int(total_text_negative_queries),
-            "val_score_negative_iou_ignore_thr": 0.0,
+            "val_score_negative_iou_ignore_thr": float(
+                criterion.score_negative_iou_ignore_thr
+            ),
+            "val_duplicate_suppression_enabled": bool(
+                criterion.duplicate_suppression_enabled
+            ),
+            "val_hard_negative_mining_enabled": bool(
+                criterion.hard_negative_mining_enabled
+            ),
             "val_matcher_score_alpha": float(
                 criterion.resolve_epoch_alpha(
                     current_epoch=epoch,
@@ -3663,6 +3789,62 @@ def train(args: SimpleNamespace) -> None:
             "descriptions cannot receive bbox/GIoU positive supervision."
         )
 
+    parameter_checks = {
+        "score_negative_iou_ignore_thr": (
+            float(criterion.score_negative_iou_ignore_thr),
+            float(args.score_negative_iou_ignore_thr),
+        ),
+        "duplicate_loss_weight": (
+            float(criterion.duplicate_loss_weight),
+            float(args.duplicate_loss_weight),
+        ),
+        "duplicate_margin": (
+            float(criterion.duplicate_margin),
+            float(args.duplicate_margin),
+        ),
+        "duplicate_background_weight": (
+            float(criterion.duplicate_background_weight),
+            float(args.duplicate_background_weight),
+        ),
+        "hard_negative_loss_weight": (
+            float(criterion.hard_negative_loss_weight),
+            float(args.hard_negative_loss_weight),
+        ),
+        "hard_negative_max_iou": (
+            float(criterion.hard_negative_max_iou),
+            float(args.hard_negative_max_iou),
+        ),
+    }
+    for parameter_name, (effective_value, requested_value) in (
+        parameter_checks.items()
+    ):
+        if abs(effective_value - requested_value) > 1e-12:
+            raise RuntimeError(
+                f"GroundingLoss {parameter_name} mismatch: "
+                f"requested={requested_value}, "
+                f"effective={effective_value}"
+            )
+
+    boolean_checks = {
+        "duplicate_suppression_enabled": (
+            bool(criterion.duplicate_suppression_enabled),
+            bool(args.duplicate_suppression_enabled),
+        ),
+        "hard_negative_mining_enabled": (
+            bool(criterion.hard_negative_mining_enabled),
+            bool(args.hard_negative_mining_enabled),
+        ),
+    }
+    for parameter_name, (effective_value, requested_value) in (
+        boolean_checks.items()
+    ):
+        if effective_value != requested_value:
+            raise RuntimeError(
+                f"GroundingLoss {parameter_name} mismatch: "
+                f"requested={requested_value}, "
+                f"effective={effective_value}"
+            )
+
     if args.ranking_enabled or abs(float(args.lambda_rank)) > 1e-12:
         print(
             "[Warning] Explicit dense pairwise ranking is disabled by the "
@@ -3842,9 +4024,27 @@ def train(args: SimpleNamespace) -> None:
         f"hard_mix={args.text_negative_hard_mix:.3f}"
     )
     print(
+        "[Info] Duplicate suppression: "
+        f"enabled={args.duplicate_suppression_enabled}, "
+        f"ignore_iou={args.score_negative_iou_ignore_thr:.3f}, "
+        f"weight={args.duplicate_loss_weight:.4f}, "
+        f"margin={args.duplicate_margin:.3f}, "
+        f"background_weight={args.duplicate_background_weight:.4f}, "
+        f"max_pairs={args.duplicate_max_pairs}, "
+        f"start_epoch={args.duplicate_start_epoch}"
+    )
+    print(
+        "[Info] Hard-negative mining: "
+        f"enabled={args.hard_negative_mining_enabled}, "
+        f"weight={args.hard_negative_loss_weight:.4f}, "
+        f"topk={args.hard_negative_topk}, "
+        f"max_iou={args.hard_negative_max_iou:.3f}, "
+        f"ratio={args.hard_negative_ratio}, "
+        f"start_epoch={args.hard_negative_start_epoch}"
+    )
+    print(
         "[Info] Removed dense objectives: "
-        "independent_score_assigner=False, hard_negative_mining=False, "
-        "pairwise_ranking=False"
+        "independent_score_assigner=False, pairwise_ranking=False"
     )
 
     if args.resume_path is not None:
@@ -4020,8 +4220,42 @@ def train(args: SimpleNamespace) -> None:
                 args.normalize_classification_by_num_gt
             ),
             "dense_score_assignment_enabled": False,
-            "hard_negative_mining_enabled": False,
             "pairwise_ranking_enabled": False,
+            "duplicate_suppression_enabled": bool(
+                args.duplicate_suppression_enabled
+            ),
+            "duplicate_suppression_active": bool(
+                args.duplicate_suppression_enabled
+                and epoch >= args.duplicate_start_epoch
+            ),
+            "duplicate_loss_weight": float(
+                args.duplicate_loss_weight
+            ),
+            "duplicate_margin": float(args.duplicate_margin),
+            "duplicate_background_weight": float(
+                args.duplicate_background_weight
+            ),
+            "duplicate_max_pairs": int(args.duplicate_max_pairs),
+            "duplicate_start_epoch": int(
+                args.duplicate_start_epoch
+            ),
+            "hard_negative_mining_enabled": bool(
+                args.hard_negative_mining_enabled
+            ),
+            "hard_negative_mining_active": bool(
+                args.hard_negative_mining_enabled
+                and epoch >= args.hard_negative_start_epoch
+            ),
+            "hard_negative_loss_weight": float(
+                args.hard_negative_loss_weight
+            ),
+            "hard_negative_topk": int(args.hard_negative_topk),
+            "hard_negative_max_iou": float(
+                args.hard_negative_max_iou
+            ),
+            "hard_negative_start_epoch": int(
+                args.hard_negative_start_epoch
+            ),
             "lambda_rank_max": 0.0,
             "lambda_aux": float(args.aux_loss_weight),
             "pos_weight": 1.0,
@@ -4037,7 +4271,9 @@ def train(args: SimpleNamespace) -> None:
             "text_negative_hard_mix": float(
                 args.text_negative_hard_mix
             ),
-            "score_negative_iou_ignore_thr": 0.0,
+            "score_negative_iou_ignore_thr": float(
+                args.score_negative_iou_ignore_thr
+            ),
             "matcher_score_alpha": float(
                 criterion.resolve_epoch_alpha(
                     current_epoch=epoch,
@@ -4200,6 +4436,7 @@ DEFAULT_MODEL_CFG = {
         "text_max_length": 32,
         "fusion_token_num": 16,
         "dropout": 0.1,
+        "cnn_layers": 3,
         "freeze_bert": True,
         "precomputed_bert_path": os.path.join(
             CURRENT_DIR,
@@ -4292,6 +4529,7 @@ DEFAULT_TRAIN_CFG = {
             # Only the H-DETR auxiliary repeated-GT matcher uses these fields.
             "positive_ratio": 1.0,
             "max_positive_per_gt": 2,
+            "hard_negative_ratio": 5,
             "aux_positive_label": 0.7,
             "expand_cost_bbox": 5.0,
             "expand_cost_giou": 2.0,
@@ -4309,6 +4547,22 @@ DEFAULT_TRAIN_CFG = {
             "focal_alpha": 0.25,
             "focal_gamma": 2.0,
             "normalize_by_num_gt": True,
+            "negative_iou_ignore_thr": 0.50,
+        },
+        "duplicate_suppression": {
+            "enabled": True,
+            "loss_weight": 0.10,
+            "margin": 0.25,
+            "background_weight": 0.05,
+            "max_pairs": 128,
+            "start_epoch": 5,
+        },
+        "hard_negative": {
+            "enabled": True,
+            "loss_weight": 0.05,
+            "topk": 10,
+            "max_iou": 0.30,
+            "start_epoch": 10,
         },
         "text_negative": {
             "as_empty_target": True,
@@ -4460,6 +4714,8 @@ def cfg_to_args(
     classification_cfg = loss_cfg.get("classification", {})
     matcher_schedule_cfg = loss_cfg.get("matcher_schedule", {})
     text_negative_cfg = loss_cfg.get("text_negative", {})
+    duplicate_cfg = loss_cfg.get("duplicate_suppression", {})
+    hard_negative_cfg = loss_cfg.get("hard_negative", {})
 
     # Backward compatibility: an old fixed threshold becomes a constant
     # schedule unless any dynamic key is explicitly present.
@@ -4653,6 +4909,83 @@ def cfg_to_args(
         normalize_classification_by_num_gt=bool(
             classification_cfg.get("normalize_by_num_gt", True)
         ),
+        score_negative_iou_ignore_thr=float(
+            classification_cfg.get(
+                "negative_iou_ignore_thr",
+                quality_cfg.get(
+                    "score_negative_iou_ignore_thr",
+                    0.50,
+                ),
+            )
+        ),
+
+        # Duplicate-like unmatched queries.
+        duplicate_suppression_enabled=bool(
+            duplicate_cfg.get("enabled", True)
+        ),
+        duplicate_loss_weight=float(
+            duplicate_cfg.get(
+                "loss_weight",
+                duplicate_cfg.get("lambda_duplicate", 0.10),
+            )
+        ),
+        duplicate_margin=float(
+            duplicate_cfg.get("margin", 0.25)
+        ),
+        duplicate_background_weight=float(
+            duplicate_cfg.get("background_weight", 0.05)
+        ),
+        duplicate_max_pairs=int(
+            duplicate_cfg.get("max_pairs", 128)
+        ),
+        duplicate_start_epoch=int(
+            duplicate_cfg.get("start_epoch", 5)
+        ),
+
+        # High-score, low-IoU unmatched queries.
+        hard_negative_mining_enabled=bool(
+            hard_negative_cfg.get(
+                "enabled",
+                score_sampling_cfg.get(
+                    "hard_negative_mining_enabled",
+                    True,
+                ),
+            )
+        ),
+        hard_negative_loss_weight=float(
+            hard_negative_cfg.get(
+                "loss_weight",
+                score_sampling_cfg.get(
+                    "hard_negative_loss_weight",
+                    0.05,
+                ),
+            )
+        ),
+        hard_negative_topk=int(
+            hard_negative_cfg.get(
+                "topk",
+                score_sampling_cfg.get("hard_negative_topk", 10),
+            )
+        ),
+        hard_negative_max_iou=float(
+            hard_negative_cfg.get(
+                "max_iou",
+                score_sampling_cfg.get(
+                    "hard_negative_max_iou",
+                    0.30,
+                ),
+            )
+        ),
+        hard_negative_start_epoch=int(
+            hard_negative_cfg.get(
+                "start_epoch",
+                score_sampling_cfg.get(
+                    "hard_negative_start_epoch",
+                    10,
+                ),
+            )
+        ),
+
         negative_text_as_empty_target=bool(
             text_negative_cfg.get("as_empty_target", True)
         ),
@@ -4784,6 +5117,8 @@ def print_config_summary(
     matcher_schedule = loss.get("matcher_schedule", {})
     score_sampling = loss.get("score_sampling", {})
     text_negative = loss.get("text_negative", {})
+    duplicate = loss.get("duplicate_suppression", {})
+    hard_negative = loss.get("hard_negative", {})
 
     print("\n[LightDet] Training config")
     print(f"  dataset      : {data['dataset_dir']}")
@@ -4838,6 +5173,7 @@ def print_config_summary(
     print(f"  num_layers   : {model['num_layers']}")
     print(f"  num_heads    : {model['num_heads']}")
     print(f"  mlp_ratio    : {model['mlp_ratio']}")
+    print(f"  cnn_layers   : {model.get('cnn_layers', 3)}")
     print(f"  bert_cache   : {model.get('precomputed_bert_path')}")
     print(
         f"  hybrid head  : enabled="
@@ -4881,7 +5217,23 @@ def print_config_summary(
         f"focal_alpha={classification.get('focal_alpha', 0.25)}, "
         f"focal_gamma={classification.get('focal_gamma', 2.0)}, "
         f"norm_gt={classification.get('normalize_by_num_gt', True)}, "
+        f"ignore_iou={classification.get('negative_iou_ignore_thr', 0.50)}, "
         f"quality_warmup={quality.get('quality_warmup_epoch', 10)}"
+    )
+    print(
+        f"  duplicate    : enabled={duplicate.get('enabled', True)}, "
+        f"weight={duplicate.get('loss_weight', 0.10)}, "
+        f"margin={duplicate.get('margin', 0.25)}, "
+        f"bg_weight={duplicate.get('background_weight', 0.05)}, "
+        f"max_pairs={duplicate.get('max_pairs', 128)}, "
+        f"start={duplicate.get('start_epoch', 5)}"
+    )
+    print(
+        f"  hard negative: enabled={hard_negative.get('enabled', True)}, "
+        f"weight={hard_negative.get('loss_weight', 0.05)}, "
+        f"topk={hard_negative.get('topk', 10)}, "
+        f"max_iou={hard_negative.get('max_iou', 0.30)}, "
+        f"start={hard_negative.get('start_epoch', 10)}"
     )
     print(
         f"  matcher sched: start="
@@ -4892,8 +5244,8 @@ def print_config_summary(
         f"{matcher_schedule.get('alpha_min', ranking.get('rank_alpha_min', 0.10))}"
     )
     print(
-        f"  dense losses : pairwise_rank=False, "
-        f"dense_score_assignment=False, hard_negative_mining=False"
+        "  dense losses : pairwise_rank=False, "
+        "dense_score_assignment=False"
     )
     print(f"  pos weight   : {pos_weight.get('value', 1.0)}")
     print(
@@ -5106,8 +5458,8 @@ class LightDet:
                 f"{resolved_resume_path}"
             )
 
-        # Main branch is one-to-one and is evaluated without NMS.
-        train_cfg["eval"]["use_nms"] = False
+        # Respect eval.use_nms from YAML. Use False for standard DETR AP and
+        # True for deployment-oriented duplicate removal.
 
         # Checkpoint mode is controlled only by this function call.
         train_cfg["log"][
