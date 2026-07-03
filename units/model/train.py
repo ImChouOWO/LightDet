@@ -1804,6 +1804,9 @@ def train_one_epoch(
                         .detach()
                         .item()
                     ),
+                    "duplicate_classification_weight": float(
+                        criterion.duplicate_classification_weight
+                    ),
                     "loss_hard_negative": float(
                         loss_dict.get(
                             "loss_hard_negative",
@@ -1908,6 +1911,15 @@ def train_one_epoch(
             criterion.duplicate_loss_weight
         ),
         "duplicate_margin": float(criterion.duplicate_margin),
+        "duplicate_background_weight": float(
+            criterion.duplicate_background_weight
+        ),
+        "duplicate_classification_weight": float(
+            criterion.duplicate_classification_weight
+        ),
+        "duplicate_max_pairs": int(
+            criterion.duplicate_max_pairs
+        ),
         "duplicate_start_epoch": int(
             criterion.duplicate_start_epoch
         ),
@@ -3806,6 +3818,10 @@ def train(args: SimpleNamespace) -> None:
             float(criterion.duplicate_background_weight),
             float(args.duplicate_background_weight),
         ),
+        "duplicate_classification_weight": (
+            float(criterion.duplicate_classification_weight),
+            float(args.duplicate_classification_weight),
+        ),
         "hard_negative_loss_weight": (
             float(criterion.hard_negative_loss_weight),
             float(args.hard_negative_loss_weight),
@@ -4030,6 +4046,8 @@ def train(args: SimpleNamespace) -> None:
         f"weight={args.duplicate_loss_weight:.4f}, "
         f"margin={args.duplicate_margin:.3f}, "
         f"background_weight={args.duplicate_background_weight:.4f}, "
+        f"classification_weight="
+        f"{args.duplicate_classification_weight:.4f}, "
         f"max_pairs={args.duplicate_max_pairs}, "
         f"start_epoch={args.duplicate_start_epoch}"
     )
@@ -4234,6 +4252,9 @@ def train(args: SimpleNamespace) -> None:
             "duplicate_margin": float(args.duplicate_margin),
             "duplicate_background_weight": float(
                 args.duplicate_background_weight
+            ),
+            "duplicate_classification_weight": float(
+                args.duplicate_classification_weight
             ),
             "duplicate_max_pairs": int(args.duplicate_max_pairs),
             "duplicate_start_epoch": int(
@@ -4934,6 +4955,12 @@ def cfg_to_args(
         ),
         duplicate_background_weight=float(
             duplicate_cfg.get("background_weight", 0.05)
+        ),
+        # Duplicate-like unmatched queries remain target=0 negatives in the
+        # main classification loss, but use a reduced weight to avoid
+        # suppressing unstable assignment candidates too aggressively.
+        duplicate_classification_weight=float(
+            duplicate_cfg.get("classification_weight", 0.25)
         ),
         duplicate_max_pairs=int(
             duplicate_cfg.get("max_pairs", 128)

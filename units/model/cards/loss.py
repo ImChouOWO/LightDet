@@ -1108,6 +1108,7 @@ class GroundingLoss(nn.Module):
         duplicate_loss_weight: float = 0.10,
         duplicate_margin: float = 0.25,
         duplicate_background_weight: float = 0.05,
+        duplicate_classification_weight: float = 0.25,
         duplicate_max_pairs: int = 128,
         duplicate_start_epoch: int = 5,
         hard_negative_mining_enabled: bool = True,
@@ -1190,16 +1191,17 @@ class GroundingLoss(nn.Module):
         )
 
         # Main-branch unmatched queries whose IoU with any GT is at or
-        # above this threshold are ignored by the classification loss.
-        # They are not converted into positives and receive no box loss.
+        # above this threshold are treated as duplicate-like negatives.
+        # They are not promoted to positives and receive no box loss, but
+        # they retain partial target=0 classification supervision.
         self.score_negative_iou_ignore_thr = (
             0.0
             if score_negative_iou_ignore_thr is None
             else clamp01(score_negative_iou_ignore_thr)
         )
 
-        # Duplicate-like unmatched queries are not background. They are
-        # ranked below the Hungarian matched query for the same GT.
+        # Duplicate-like unmatched queries are ranked below the Hungarian
+        # matched query and also retain partial target=0 classification loss.
         self.duplicate_suppression_enabled = bool(
             duplicate_suppression_enabled
         )
@@ -1211,6 +1213,9 @@ class GroundingLoss(nn.Module):
         self.duplicate_background_weight = max(
             0.0,
             float(duplicate_background_weight),
+        )
+        self.duplicate_classification_weight = clamp01(
+            duplicate_classification_weight
         )
         self.duplicate_max_pairs = max(1, int(duplicate_max_pairs))
         self.duplicate_start_epoch = max(1, int(duplicate_start_epoch))
@@ -1314,6 +1319,9 @@ class GroundingLoss(nn.Module):
             "duplicate_margin": float(self.duplicate_margin),
             "duplicate_background_weight": float(
                 self.duplicate_background_weight
+            ),
+            "duplicate_classification_weight": float(
+                self.duplicate_classification_weight
             ),
             "duplicate_max_pairs": int(self.duplicate_max_pairs),
             "duplicate_start_epoch": int(self.duplicate_start_epoch),
@@ -1431,6 +1439,10 @@ class GroundingLoss(nn.Module):
             duplicate_background_weight=duplicate.get(
                 "background_weight",
                 0.05,
+            ),
+            duplicate_classification_weight=duplicate.get(
+                "classification_weight",
+                0.25,
             ),
             duplicate_max_pairs=duplicate.get("max_pairs", 128),
             duplicate_start_epoch=duplicate.get("start_epoch", 5),
@@ -1749,8 +1761,9 @@ class GroundingLoss(nn.Module):
 
         Returns:
           ignore_mask:
-            unmatched queries with max IoU >= threshold. They are excluded
-            from background classification.
+            Backward-compatible name for the duplicate mask. It marks
+            unmatched queries with max IoU >= threshold. These predictions
+            retain partial target=0 classification supervision.
           max_iou:
             maximum IoU against any GT in the same sample, shape [B, N, 1].
           nearest_gt_index:
@@ -1857,10 +1870,10 @@ class GroundingLoss(nn.Module):
         """
         Fully vectorized DETR classification over all queries.
 
-        Positive queries are exactly the Hungarian matches. Unmatched
-        queries normally use target 0. Duplicate-like unmatched queries whose
-        IoU with any GT exceeds ``negative_iou_ignore_thr`` are excluded from
-        classification loss, but are not promoted to positives.
+        Positive queries are exactly the Hungarian matches. Every unmatched
+        query uses target 0. Duplicate-like unmatched queries whose IoU with
+        any GT exceeds ``negative_iou_ignore_thr`` retain a configurable
+        partial classification weight instead of being fully ignored.
         """
         logits = pred_score_logit.float()
         probability = logits.sigmoid()
@@ -1928,7 +1941,7 @@ class GroundingLoss(nn.Module):
             positive_target = logits.new_zeros((0,))
 
         (
-            ignore_mask,
+            duplicate_mask,
             max_iou_to_gt,
             nearest_gt_index,
         ) = self._build_high_iou_ignore_mask(
@@ -1937,7 +1950,6 @@ class GroundingLoss(nn.Module):
             packed_targets=packed_targets,
             threshold=negative_iou_ignore_thr,
         )
-        valid_classification_mask = ~ignore_mask
 
         gamma = float(self.focal_gamma)
 
@@ -1958,18 +1970,35 @@ class GroundingLoss(nn.Module):
             pred_score_logit,
             query_loss_weights,
         ).float()
+
+        # Do not fully ignore high-IoU unmatched predictions. They are still
+        # false-positive candidates under one-to-one evaluation, so preserve
+        # a partial target=0 classification gradient. Low-IoU unmatched
+        # predictions keep the full classification weight.
+        classification_weight = torch.ones_like(
+            element_loss,
+            dtype=torch.float32,
+        )
+        classification_weight = classification_weight.masked_fill(
+            duplicate_mask,
+            float(self.duplicate_classification_weight),
+        )
+
         weighted_loss = (
             element_loss
             * query_weight
-            * valid_classification_mask.float()
+            * classification_weight
         )
 
         num_matches = max(assignments.num_matches, 1)
         if self.normalize_classification_by_num_gt:
             loss_score = weighted_loss.sum() / float(num_matches)
         else:
-            valid_count = valid_classification_mask.sum().clamp_min(1)
-            loss_score = weighted_loss.sum() / valid_count.float()
+            total_weight = (
+                query_weight
+                * classification_weight
+            ).sum().clamp_min(1.0)
+            loss_score = weighted_loss.sum() / total_weight
 
         if bool(positive_mask.any()):
             loss_score_pos = element_loss[
@@ -1978,25 +2007,40 @@ class GroundingLoss(nn.Module):
         else:
             loss_score_pos = logits.new_zeros(())
 
-        negative_mask = (~positive_mask) & (~ignore_mask)
+        # All unmatched queries are classification negatives. Duplicate-like
+        # negatives use the reduced classification weight above.
+        negative_mask = ~positive_mask
         if bool(negative_mask.any()):
-            loss_score_neg = element_loss[
-                negative_mask
-            ].mean()
+            negative_element_loss = element_loss[negative_mask]
+            negative_element_weight = classification_weight[negative_mask]
+            loss_score_neg = (
+                negative_element_loss
+                * negative_element_weight
+            ).sum() / negative_element_weight.sum().clamp_min(1.0)
         else:
             loss_score_neg = logits.new_zeros(())
 
+        # Hard-negative mining remains restricted to non-duplicate unmatched
+        # predictions, preventing duplicate and hard-negative objectives from
+        # selecting the same prediction twice.
+        hard_negative_mask = (
+            (~positive_mask)
+            & (~duplicate_mask)
+        )
+
         ignored_score_mean = logits.new_zeros(())
         ignored_iou_mean = logits.new_zeros(())
-        if bool(ignore_mask.any()):
-            ignored_score_mean = probability[ignore_mask].mean()
-            ignored_iou_mean = max_iou_to_gt[ignore_mask].mean()
+        if bool(duplicate_mask.any()):
+            ignored_score_mean = probability[duplicate_mask].mean()
+            ignored_iou_mean = max_iou_to_gt[duplicate_mask].mean()
 
         return loss_score.to(pred_score_logit.dtype), {
             "target": target.to(pred_score_logit.dtype),
             "positive_mask": positive_mask,
-            "ignore_mask": ignore_mask,
-            "valid_negative_mask": negative_mask,
+            # Backward-compatible key. Semantically this is now a duplicate
+            # mask rather than a zero-loss ignore mask.
+            "ignore_mask": duplicate_mask,
+            "valid_negative_mask": hard_negative_mask,
             "max_iou_to_gt": max_iou_to_gt.to(
                 pred_score_logit.dtype
             ),
@@ -2711,6 +2755,9 @@ class GroundingLoss(nn.Module):
             ),
             "hard_negative_max_iou": float(self.hard_negative_max_iou),
             "duplicate_margin": float(self.duplicate_margin),
+            "duplicate_classification_weight": float(
+                self.duplicate_classification_weight
+            ),
             "rank_negative_iou_max": 0.0,
             "lambda_rank": 0.0,
             "lambda_rank_eff": 0.0,
@@ -2966,6 +3013,9 @@ class GroundingLoss(nn.Module):
                 "score_negative_iou_ignore_thr": 0.0,
                 "hard_negative_max_iou": 0.0,
                 "duplicate_margin": 0.0,
+                "duplicate_classification_weight": float(
+                    self.duplicate_classification_weight
+                ),
                 "rank_negative_iou_max": 0.0,
                 "lambda_rank": 0.0,
                 "lambda_rank_eff": 0.0,
@@ -3033,6 +3083,9 @@ class GroundingLoss(nn.Module):
             "classification_type": self.classification_type,
             "score_negative_iou_ignore_thr": float(
                 self.score_negative_iou_ignore_thr
+            ),
+            "duplicate_classification_weight": float(
+                self.duplicate_classification_weight
             ),
 
             # Backward-compatible main aliases.
