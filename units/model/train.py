@@ -192,20 +192,81 @@ def restore_rng_state(rng_state: Any) -> None:
     if not isinstance(rng_state, dict):
         return
 
-    if rng_state.get("torch") is not None:
-        torch.set_rng_state(rng_state["torch"])
-
-    if torch.cuda.is_available() and rng_state.get("cuda") is not None:
-        torch.cuda.set_rng_state_all(rng_state["cuda"])
-
-    if rng_state.get("python") is not None:
-        random.setstate(rng_state["python"])
-
-    if rng_state.get("numpy") is not None:
+    torch_state = rng_state.get("torch")
+    if torch_state is not None:
         try:
-            np.random.set_state(rng_state["numpy"])
-        except Exception:
-            pass
+            if not torch.is_tensor(torch_state):
+                torch_state = torch.as_tensor(
+                    torch_state,
+                    dtype=torch.uint8,
+                    device="cpu",
+                )
+            else:
+                torch_state = torch_state.detach().to(
+                    device="cpu",
+                    dtype=torch.uint8,
+                )
+
+            torch.set_rng_state(torch_state.contiguous())
+        except Exception as error:
+            print(
+                "[Checkpoint] Warning: failed to restore CPU RNG state; "
+                f"continue without it. error={error}"
+            )
+
+    cuda_state = rng_state.get("cuda")
+    if torch.cuda.is_available() and cuda_state is not None:
+        try:
+            normalized_cuda_states = []
+
+            for state in cuda_state:
+                if not torch.is_tensor(state):
+                    state = torch.as_tensor(
+                        state,
+                        dtype=torch.uint8,
+                        device="cpu",
+                    )
+                else:
+                    state = state.detach().to(
+                        device="cpu",
+                        dtype=torch.uint8,
+                    )
+
+                normalized_cuda_states.append(
+                    state.contiguous()
+                )
+
+            torch.cuda.set_rng_state_all(
+                normalized_cuda_states
+            )
+        except Exception as error:
+            print(
+                "[Checkpoint] Warning: failed to restore CUDA RNG state; "
+                f"continue without it. error={error}"
+            )
+
+    python_state = rng_state.get("python")
+    if python_state is not None:
+        try:
+            random.setstate(python_state)
+        except Exception as error:
+            print(
+                "[Checkpoint] Warning: failed to restore Python RNG state; "
+                f"continue without it. error={error}"
+            )
+
+    numpy_state = rng_state.get("numpy")
+    if numpy_state is not None:
+        try:
+            if isinstance(numpy_state, list):
+                numpy_state = tuple(numpy_state)
+
+            np.random.set_state(numpy_state)
+        except Exception as error:
+            print(
+                "[Checkpoint] Warning: failed to restore NumPy RNG state; "
+                f"continue without it. error={error}"
+            )
 
 
 def parse_amp_dtype(value: Any) -> torch.dtype:
@@ -3031,6 +3092,22 @@ def train(args: SimpleNamespace) -> None:
                 args.use_negative_queries_in_val
             ),
         }
+        default_val_loss_metrics = {
+            "val_loss": None,
+            "val_loss_bbox": None,
+            "val_loss_giou": None,
+            "val_loss_score": None,
+            "val_loss_rank_raw": None,
+            "val_loss_rank": None,
+            "val_loss_text_negative": None,
+            "val_loss_text_negative_contrib": None,
+            "val_text_negative_queries": None,
+            "val_score_negative_iou_ignore_thr": None,
+            "val_duplicate_suppression_enabled": None,
+            "val_hard_negative_mining_enabled": None,
+            "val_matcher_score_alpha": None,
+            "val_matcher_cost_score_effective": None,
+        }
 
         epoch_time = time.perf_counter() - epoch_start
 
@@ -3041,6 +3118,7 @@ def train(args: SimpleNamespace) -> None:
             "epoch_time": epoch_time,
             "lr": scheduler.get_lr()[0],
             **train_metrics,
+            **default_val_loss_metrics,
             **val_loss_metrics,
             **eval_metrics,
             **dynamic_config,
@@ -3444,10 +3522,10 @@ def main() -> None:
     os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
     model = LightDet(
-        model=str(DEFAULT_MODEL_CONFIG_PATH),
+        model=str("/home/soic/Desktop/LightDet/units/model/cards/config/model.yaml"),
     )
     model.train(
-        cfg=str(DEFAULT_TRAIN_CONFIG_PATH),
+        cfg=str("/home/soic/Desktop/LightDet/units/model/cards/config/train.yaml"),
     )
 
 

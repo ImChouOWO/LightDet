@@ -10,6 +10,7 @@ from torchvision.ops import batched_nms
 from tqdm import tqdm
 
 from units.model.tool.runtime import (
+    box_iou_xyxy,
     forward_model_batch,
     get_score_logit,
     get_target_boxes_cpu,

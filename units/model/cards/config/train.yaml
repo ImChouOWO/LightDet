@@ -164,7 +164,7 @@ loss:
 
   ranking:
     enabled: false
-    lambda_rank: 0.0
+    lambda_rank: 0.5
     rank_margin: 0.1
     rank_min_quality_gap: 0.1
     rank_max_pairs: 512
@@ -198,7 +198,7 @@ log:
   # weights_path: warm start only; resume_path: full-state resume.
   # Do not enable both at the same time.
   weights_path: null
-  resume_path: null
+  resume_path: "/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_HDETR_object_query/latest.pt"
   prefer_ema: true
 
   save_latest_interval: 1
