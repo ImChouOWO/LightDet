@@ -124,7 +124,7 @@ loss:
     aux_loss_weight: 0.35
     aux_cost_score: 1.0
     warmup_epoch: 3
-    decay_start_ratio: 0.40
+    decay_start_ratio: 0.25
     min_factor: 0.10
     matcher_cost_score: 1.0
     matcher_score_start_epoch: 10
@@ -188,7 +188,7 @@ eval:
   iou_thresholds: null
   compute_raw_oracle: true
   raw_oracle_iou_thresholds: [0.25, 0.50, 0.75]
-  best_metric: map50_95
+  best_metric: map50
 
 log:
   save_dir: units/model/runs/train/lightdet_HDETR_enhance_ranking

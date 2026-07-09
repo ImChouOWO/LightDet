@@ -3525,7 +3525,7 @@ def main() -> None:
         model=str("/home/soic/Desktop/LightDet/units/model/cards/config/model.yaml"),
     )
     model.train(
-        cfg=str("/home/soic/Desktop/LightDet/units/model/cards/config/train.yaml"),
+        cfg=str("/home/soic/Desktop/LightDet/units/model/cards/config/stronger_ranking.yaml"),
     )
 
 
