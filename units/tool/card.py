@@ -397,7 +397,7 @@ class TransformerBlock(nn.Module):
                 main_queries,
             ],
             dim=1,
-        )
+        ) # [Fusion | Image | Text | Main Object Queries]
 
         complete_valid_mask = self._extend_valid_mask(
             context_valid_mask,
