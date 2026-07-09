@@ -671,7 +671,7 @@ def validate_one_epoch(
                     lambda_bbox=lambda_bbox,
                     lambda_giou=lambda_giou,
                     lambda_score=lambda_score,
-                    lambda_rank=0.0,
+                    lambda_rank=lambda_rank,
                     pos_weight=pos_weight,
                     current_epoch=epoch,
                     total_epochs=total_epochs,

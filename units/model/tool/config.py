@@ -11,7 +11,7 @@ import yaml
 
 MODEL_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = MODEL_DIR.parents[1]
-CONFIG_DIR = Path(__file__).resolve().parent / "config"
+CONFIG_DIR = MODEL_DIR / "cards" / "config"
 DEFAULT_MODEL_CONFIG_PATH = CONFIG_DIR / "model.yaml"
 DEFAULT_TRAIN_CONFIG_PATH = CONFIG_DIR / "train.yaml"
 
@@ -110,6 +110,66 @@ def normalize_device(device: Any) -> str:
 
     raise TypeError(f"Unsupported device type: {type(device)}")
 
+
+def _parse_component_schedule(
+    component: str,
+    value: Any,
+    *,
+    legacy_max_lr: float,
+    legacy_min_ratio: float,
+) -> list:
+    if value is None:
+        return [
+            "cosine",
+            float(legacy_max_lr),
+            float(legacy_max_lr) * float(legacy_min_ratio),
+            0.0,
+            1.0,
+        ]
+
+    if not isinstance(value, (list, tuple)) or len(value) != 5:
+        raise ValueError(
+            f"optim.components.{component} must be "
+            "[mode, max_lr, min_lr, start_epoch, end_epoch]"
+        )
+
+    mode = str(value[0]).strip().lower()
+
+    if mode not in {"constant", "linear", "cosine", "freeze"}:
+        raise ValueError(
+            f"Unsupported optimizer mode for {component}: {mode}"
+        )
+
+    max_lr = float(value[1])
+    min_lr = float(value[2])
+    start_epoch = float(value[3])
+    end_epoch = float(value[4])
+
+    if max_lr < 0.0 or min_lr < 0.0:
+        raise ValueError(
+            f"{component} learning rates must be >= 0"
+        )
+
+    if min_lr > max_lr:
+        raise ValueError(
+            f"{component} min_lr must be <= max_lr"
+        )
+
+    if start_epoch < 0.0 or end_epoch < start_epoch:
+        raise ValueError(
+            f"Invalid schedule range for {component}: "
+            f"{start_epoch} -> {end_epoch}"
+        )
+
+    return [
+        mode,
+        max_lr,
+        min_lr,
+        start_epoch,
+        end_epoch,
+    ]
+
+
 def cfg_to_args(
     model_cfg_all: Dict[str, Any],
     train_cfg_all: Dict[str, Any],
@@ -134,6 +194,45 @@ def cfg_to_args(
     text_negative_cfg = loss_cfg.get("text_negative", {})
     duplicate_cfg = loss_cfg.get("duplicate_suppression", {})
     hard_negative_cfg = loss_cfg.get("hard_negative", {})
+
+    legacy_min_lr_ratio = float(
+        optim_cfg.get("min_lr_ratio", 0.05)
+    )
+    component_cfg = optim_cfg.get("components", {})
+    component_schedules = {
+        "vision": _parse_component_schedule(
+            "vision",
+            component_cfg.get("vision"),
+            legacy_max_lr=float(
+                optim_cfg.get("lr_vision", 1e-4)
+            ),
+            legacy_min_ratio=legacy_min_lr_ratio,
+        ),
+        "text": _parse_component_schedule(
+            "text",
+            component_cfg.get("text"),
+            legacy_max_lr=float(
+                optim_cfg.get("lr_text", 1e-5)
+            ),
+            legacy_min_ratio=legacy_min_lr_ratio,
+        ),
+        "transformer": _parse_component_schedule(
+            "transformer",
+            component_cfg.get("transformer"),
+            legacy_max_lr=float(
+                optim_cfg.get("lr_transformer", 1e-4)
+            ),
+            legacy_min_ratio=legacy_min_lr_ratio,
+        ),
+        "head": _parse_component_schedule(
+            "head",
+            component_cfg.get("head"),
+            legacy_max_lr=float(
+                optim_cfg.get("lr_head", 1e-4)
+            ),
+            legacy_min_ratio=legacy_min_lr_ratio,
+        ),
+    }
 
     # Backward compatibility: an old fixed threshold becomes a constant
     # schedule unless any dynamic key is explicitly present.
@@ -256,12 +355,15 @@ def cfg_to_args(
         ),
 
         # optimizer
-        lr_vision=optim_cfg["lr_vision"],
-        lr_text=optim_cfg["lr_text"],
-        lr_transformer=optim_cfg["lr_transformer"],
-        lr_head=optim_cfg["lr_head"],
+        lr_vision=float(component_schedules["vision"][1]),
+        lr_text=float(component_schedules["text"][1]),
+        lr_transformer=float(
+            component_schedules["transformer"][1]
+        ),
+        lr_head=float(component_schedules["head"][1]),
+        component_schedules=component_schedules,
         weight_decay=optim_cfg["weight_decay"],
-        min_lr_ratio=optim_cfg["min_lr_ratio"],
+        min_lr_ratio=legacy_min_lr_ratio,
         max_warmup_steps=optim_cfg.get("max_warmup_steps", 3000),
         fused_optimizer=optim_cfg.get("fused", True),
 
@@ -614,10 +716,24 @@ def print_config_summary(
         f"init_from_main="
         f"{model.get('initialize_aux_from_main', True)}"
     )
-    print(f"  lr_vision    : {optimizer['lr_vision']}")
-    print(f"  lr_text      : {optimizer['lr_text']}")
-    print(f"  lr_trans     : {optimizer['lr_transformer']}")
-    print(f"  lr_head      : {optimizer['lr_head']}")
+    components = optimizer.get("components")
+
+    if isinstance(components, dict):
+        for component in (
+            "vision",
+            "text",
+            "transformer",
+            "head",
+        ):
+            print(
+                f"  lr_{component:<11}: "
+                f"{components.get(component)}"
+            )
+    else:
+        print(f"  lr_vision    : {optimizer['lr_vision']}")
+        print(f"  lr_text      : {optimizer['lr_text']}")
+        print(f"  lr_trans     : {optimizer['lr_transformer']}")
+        print(f"  lr_head      : {optimizer['lr_head']}")
     print(f"  fused AdamW  : {optimizer.get('fused', True)}")
     print(
         f"  hybrid loss  : weight="
@@ -676,8 +792,10 @@ def print_config_summary(
         f"{matcher_schedule.get('alpha_min', ranking.get('rank_alpha_min', 0.10))}"
     )
     print(
-        "  dense losses : pairwise_rank=False, "
-        "dense_score_assignment=False"
+        f"  pairwise rank: enabled={ranking.get('enabled', False)}, "
+        f"lambda={ranking.get('lambda_rank', 0.0)}, "
+        f"start={ranking.get('rank_start_epoch', 5)}, "
+        f"warmup={ranking.get('rank_warmup_epoch', 12)}"
     )
     print(f"  pos weight   : {pos_weight.get('value', 1.0)}")
     print(

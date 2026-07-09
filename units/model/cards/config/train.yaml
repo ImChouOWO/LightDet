@@ -44,13 +44,19 @@ train:
   grad_clip_norm: 1.0
 
 optim:
-  lr_vision: 0.0001
-  lr_text: 0.00001
-  lr_transformer: 0.0001
-  lr_head: 0.0001
-  weight_decay: 0.0001
+  # 格式：
+  # ["mode", max_lr, min_lr, start_epoch, end_epoch]
+  #
+  # start_epoch、end_epoch:
+  #   0.0 ~ 1.0 代表總訓練 epoch 比例
+  #   大於 1.0 代表絕對 epoch
+  components:
+    vision: ["cosine", 0.0001, 0.000005, 0.00, 1.00]
+    text: ["cosine", 0.00001, 0.0000005, 0.00, 1.00]
+    transformer: ["cosine", 0.0001, 0.000005, 0.00, 1.00]
+    head: ["cosine", 0.0001, 0.000005, 0.00, 1.00]
 
-  min_lr_ratio: 0.05
+  weight_decay: 0.0001
   max_warmup_steps: 3000
   fused: true
 
@@ -198,7 +204,7 @@ log:
   # weights_path: warm start only; resume_path: full-state resume.
   # Do not enable both at the same time.
   weights_path: null
-  resume_path: "/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_HDETR_object_query/latest.pt"
+  resume_path: /home/soic/Desktop/LightDet/units/model/runs/train/lightdet_HDETR_object_query/latest.pt
   prefer_ema: true
 
   save_latest_interval: 1

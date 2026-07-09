@@ -44,13 +44,16 @@ train:
   grad_clip_norm: 1.0
 
 optim:
-  lr_vision: 0.0001
-  lr_text: 0.00001
-  lr_transformer: 0.0001
-  lr_head: 0.0001
-  weight_decay: 0.0005
+  components:
+    #[模式, 最高學習率, 最低學習率, 開始比例/epoch, 結束比例/epoch]
+    #模式: constant：固定使用最高 LR linear  ：在指定區間線性下降至最低 LR cosine  ：在指定區間以 cosine 曲線下降至最低 LR freeze  ：先下降至最低 LR，結束後將 LR 設為 0
+    #時間: 0.0～1.0 表示總 epochs 的比例；大於 1 表示實際 epoch。
+    vision: ["freeze", 0.0001, 0.00001, 0.30, 0.55]
+    text: ["cosine", 0.00001, 0.0000002, 0.00, 0.75]
+    transformer: ["cosine", 0.0001, 0.000002, 0.00, 1.00]
+    head: ["cosine", 0.0001, 0.000002, 0.00, 1.00]
 
-  min_lr_ratio: 0.02
+  weight_decay: 0.0005
   max_warmup_steps: 3000
   fused: true
 
@@ -68,18 +71,14 @@ loss:
     bbox: 5.0
     giou: 2.0
     score: 1.0
-
     bbox_start: 5.0
     bbox_end: 3.5
     bbox_decay_until: 0.50
-
     giou_start: 2.0
     giou_end: 2.0
-
     score_start: 1.0
     score_end: 4.0
     score_warm_until: 0.50
-
     start_epoch: 1
     end_epoch: 40
     schedule: cosine
@@ -91,7 +90,6 @@ loss:
     focal_gamma: 2.0
     negative_weight: 0.40
     normalize_by_num_gt: true
-
     negative_iou_ignore_thr: 0.50
     negative_iou_ignore_start: 0.55
     negative_iou_ignore_end: 0.35
@@ -178,25 +176,21 @@ eval:
   val_loss_interval: 5
   eval_interval: 1
   max_val_batches: null
-
   score_thr: 0.001
   top_k: 100
   nms_iou_thr: 0.5
   use_nms: false
   use_topk_fallback: false
-
   iou_thresholds: null
   compute_raw_oracle: true
   raw_oracle_iou_thresholds: [0.25, 0.50, 0.75]
   best_metric: map50
 
 log:
-  save_dir: units/model/runs/train/lightdet_HDETR_enhance_ranking
-
-  weights_path: null 
+  save_dir: units/model/runs/train/lightdet_HDETR_ranking_component_lr
+  weights_path: null
   resume_path: null
   prefer_ema: true
-
   save_latest_interval: 1
   save_epoch_interval: 50
   emit_step_metrics: false

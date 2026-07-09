@@ -39,8 +39,8 @@ from units.model.pipeline.data import (
     QueryBudgetBatchSampler,
     build_dataloaders,
 )
-from units.model.cards.loss import (
-    GroundingLoss,
+from units.model.cards.loss import GroundingLoss
+from units.model.cards.ranking_loss import (
     build_grounding_loss_from_config,
 )
 
@@ -61,6 +61,9 @@ from units.model.tool.config import (
     print_config_summary,
 )
 from units.model.tool.evaluation import validate_one_epoch
+from units.model.tool.component_scheduler import (
+    ComponentLRScheduler,
+)
 from units.model.tool.runtime import (
     build_text_conditioning_probe,
     compact_grounding_collate_fn,
@@ -1191,7 +1194,7 @@ def train_one_epoch(
                 lambda_giou=lambda_giou,
                 lambda_score=lambda_score,
                 lambda_aux=lambda_aux,
-                lambda_rank=0.0,
+                lambda_rank=lambda_rank,
                 pos_weight=pos_weight,
                 current_epoch=epoch,
                 total_epochs=num_epochs,
@@ -2624,11 +2627,19 @@ def train(args: SimpleNamespace) -> None:
                 f"effective={effective_value}"
             )
 
-    if args.ranking_enabled or abs(float(args.lambda_rank)) > 1e-12:
-        print(
-            "[Warning] Explicit dense pairwise ranking is disabled by the "
-            "DETR-native loss. ranking.enabled/lambda_rank are ignored; "
-            "the preserved schedule controls score-aware Hungarian matching."
+    if bool(criterion.enable_pairwise_ranking) != bool(
+        args.ranking_enabled
+    ):
+        raise RuntimeError(
+            "Pairwise ranking configuration mismatch: "
+            f"requested={args.ranking_enabled}, "
+            f"effective={criterion.enable_pairwise_ranking}"
+        )
+
+    if args.ranking_enabled and float(args.lambda_rank) <= 0.0:
+        raise ValueError(
+            "loss.ranking.lambda_rank must be > 0 "
+            "when ranking is enabled"
         )
 
     if args.startup_smoke_test:
@@ -2665,11 +2676,13 @@ def train(args: SimpleNamespace) -> None:
         max_warmup_steps=args.max_warmup_steps,
     )
 
-    scheduler = WarmupCosineScheduler(
+    scheduler = ComponentLRScheduler(
         optimizer=optimizer,
+        component_schedules=args.component_schedules,
         warmup_steps=warmup_steps,
         total_steps=total_steps,
-        min_lr_ratio=args.min_lr_ratio,
+        steps_per_epoch=len(train_loader),
+        total_epochs=args.epochs,
     )
 
     scaler = build_scaler(
@@ -2757,8 +2770,11 @@ def train(args: SimpleNamespace) -> None:
         f"total_steps={total_steps}, "
         f"warmup_requested={requested_warmup_steps}, "
         f"warmup_cap={args.max_warmup_steps}, "
-        f"warmup_effective={warmup_steps}, "
-        f"min_lr_ratio={args.min_lr_ratio}"
+        f"warmup_effective={warmup_steps}"
+    )
+    print(
+        f"[Info] Component LR schedules: "
+        f"{args.component_schedules}"
     )
     print(f"[Info] Model parameters: total={total_params}, trainable={trainable_params}")
     print(f"[Info] Train batches: {len(train_loader)}")
@@ -2824,8 +2840,11 @@ def train(args: SimpleNamespace) -> None:
         f"start_epoch={args.hard_negative_start_epoch}"
     )
     print(
-        "[Info] Removed dense objectives: "
-        "independent_score_assigner=False, pairwise_ranking=False"
+        "[Info] Pairwise ranking: "
+        f"enabled={args.ranking_enabled}, "
+        f"lambda={args.lambda_rank:.4f}, "
+        f"start={criterion.rank_start_epoch}, "
+        f"warmup={criterion.rank_warmup_epoch}"
     )
 
     if args.resume_path is not None:
@@ -2908,6 +2927,11 @@ def train(args: SimpleNamespace) -> None:
         lambda_aux = float(
             loss_forward_kwargs.get("lambda_aux", args.aux_loss_weight)
         )
+        lambda_rank = (
+            float(args.lambda_rank)
+            if bool(args.ranking_enabled)
+            else 0.0
+        )
 
         pos_weight = float(args.pos_weight)
 
@@ -2931,7 +2955,7 @@ def train(args: SimpleNamespace) -> None:
             lambda_giou=lambda_giou,
             lambda_score=lambda_score,
             lambda_aux=lambda_aux,
-            lambda_rank=0.0,
+            lambda_rank=lambda_rank,
             pos_weight=pos_weight,
             quality_warmup_epoch=args.quality_warmup_epoch,
             rank_start_epoch=args.rank_start_epoch,
@@ -2971,7 +2995,7 @@ def train(args: SimpleNamespace) -> None:
             lambda_bbox=lambda_bbox,
             lambda_giou=lambda_giou,
             lambda_score=lambda_score,
-            lambda_rank=0.0,
+            lambda_rank=lambda_rank,
             pos_weight=pos_weight,
             quality_warmup_epoch=args.quality_warmup_epoch,
             rank_start_epoch=args.rank_start_epoch,
@@ -3009,7 +3033,9 @@ def train(args: SimpleNamespace) -> None:
                 args.normalize_classification_by_num_gt
             ),
             "dense_score_assignment_enabled": False,
-            "pairwise_ranking_enabled": False,
+            "pairwise_ranking_enabled": bool(
+                args.ranking_enabled
+            ),
             "duplicate_suppression_enabled": bool(
                 args.duplicate_suppression_enabled
             ),
@@ -3048,7 +3074,7 @@ def train(args: SimpleNamespace) -> None:
             "hard_negative_start_epoch": int(
                 args.hard_negative_start_epoch
             ),
-            "lambda_rank_max": 0.0,
+            "lambda_rank_max": float(args.lambda_rank),
             "lambda_aux": float(lambda_aux),
             "pos_weight": 1.0,
             "quality_warmup_epoch": int(args.quality_warmup_epoch),
@@ -3117,6 +3143,12 @@ def train(args: SimpleNamespace) -> None:
             "epoch": epoch,
             "epoch_time": epoch_time,
             "lr": scheduler.get_lr()[0],
+            **{
+                f"lr_{name}": value
+                for name, value in (
+                    scheduler.get_group_lrs().items()
+                )
+            },
             **train_metrics,
             **default_val_loss_metrics,
             **val_loss_metrics,
