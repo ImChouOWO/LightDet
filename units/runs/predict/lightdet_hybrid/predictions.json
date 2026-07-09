@@ -1,0 +1,91 @@
+{
+  "source": "/home/soic/Desktop/datasetPreTest15000/dataset/datasetPreTest15000_mixed/images/train/2023_08_08_15_26_49_815814_1.jpg",
+  "weights": "/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_HDETR_object_query/epoch_100.pt",
+  "weight_source": "model",
+  "checkpoint_epoch": 100,
+  "stored_best_metric_name": "map50_95",
+  "stored_best_metric": 0.1323390007019043,
+  "device": "cuda:0",
+  "image_size": 1024,
+  "original_size": {
+    "width": 720,
+    "height": 480
+  },
+  "confidence_threshold": 0.64,
+  "top_k": 20,
+  "use_nms": true,
+  "nms_iou_threshold": 0.3,
+  "auxiliary_computed": false,
+  "results": [
+    {
+      "query": "漂浮的浮標",
+      "boxes_norm": [],
+      "boxes_pixel": [],
+      "scores": [],
+      "indices": [],
+      "num_raw_predictions": 100,
+      "num_above_confidence": 0,
+      "num_after_nms": 0,
+      "num_selected": 0
+    },
+    {
+      "query": "一艘船",
+      "boxes_norm": [
+        [
+          0.8021572828292847,
+          0.5562392473220825,
+          0.9999046325683594,
+          0.7312363982200623
+        ],
+        [
+          0.16477379202842712,
+          0.6409609913825989,
+          0.31194981932640076,
+          0.7643364071846008
+        ],
+        [
+          0.10701865702867508,
+          0.656514048576355,
+          0.22054921090602875,
+          0.7741583585739136
+        ]
+      ],
+      "boxes_pixel": [
+        [
+          577.55322265625,
+          266.9948425292969,
+          719.0,
+          350.99346923828125
+        ],
+        [
+          118.63713073730469,
+          307.6612854003906,
+          224.60386657714844,
+          366.8814697265625
+        ],
+        [
+          77.05343627929688,
+          315.1267395019531,
+          158.79542541503906,
+          371.59600830078125
+        ]
+      ],
+      "scores": [
+        0.8454705476760864,
+        0.7281415462493896,
+        0.6460172533988953
+      ],
+      "indices": [
+        92,
+        80,
+        88
+      ],
+      "num_raw_predictions": 100,
+      "num_above_confidence": 4,
+      "num_after_nms": 3,
+      "num_selected": 3
+    }
+  ],
+  "rendered_path": "/home/soic/Desktop/LightDet/units/runs/predict/lightdet_hybrid/prediction.jpg",
+  "elapsed_seconds": 4.353456086944789
+}

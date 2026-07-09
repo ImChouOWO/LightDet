@@ -17,6 +17,8 @@ Example:
         device=0,
         conf=0.001,
         top_k=100,
+        use_nms=True,
+        nms_iou_threshold=0.6,
         project="runs/predict",
         name="exp",
     )
@@ -24,7 +26,8 @@ Example:
 Hybrid inference contract:
     - only the Main One-to-One branch is executed;
     - auxiliary predictions are disabled;
-    - NMS is not used;
+    - NMS can be enabled or disabled;
+    - NMS is executed independently for each text query;
     - one image is encoded only once for multiple text queries.
 """
 
@@ -40,6 +43,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from torchvision import transforms
+from torchvision.ops import nms
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -222,7 +226,9 @@ def build_inference_model(
     )
 
 
-def resolve_inference_device(device: Optional[Any]) -> torch.device:
+def resolve_inference_device(
+    device: Optional[Any],
+) -> torch.device:
     normalized = normalize_device(device)
     resolved = torch.device(normalized)
 
@@ -234,6 +240,7 @@ def resolve_inference_device(device: Optional[Any]) -> torch.device:
         return torch.device("cpu")
 
     index = 0 if resolved.index is None else int(resolved.index)
+
     if index >= torch.cuda.device_count():
         raise ValueError(
             f"Requested cuda:{index}, but only "
@@ -263,7 +270,9 @@ def normalize_queries(
     ]
 
     if not queries:
-        raise ValueError("text must contain at least one non-empty query.")
+        raise ValueError(
+            "text must contain at least one non-empty query."
+        )
 
     return queries
 
@@ -297,6 +306,7 @@ def preprocess_image(
     ])
 
     image_tensor = transform(pil_image).unsqueeze(0)
+
     original_bgr = cv2.cvtColor(
         np.asarray(pil_image),
         cv2.COLOR_RGB2BGR,
@@ -315,10 +325,22 @@ def sanitize_xyxy_boxes(
 ) -> torch.Tensor:
     boxes = boxes.clamp(0.0, 1.0)
 
-    x1 = torch.minimum(boxes[..., 0], boxes[..., 2])
-    y1 = torch.minimum(boxes[..., 1], boxes[..., 3])
-    x2 = torch.maximum(boxes[..., 0], boxes[..., 2])
-    y2 = torch.maximum(boxes[..., 1], boxes[..., 3])
+    x1 = torch.minimum(
+        boxes[..., 0],
+        boxes[..., 2],
+    )
+    y1 = torch.minimum(
+        boxes[..., 1],
+        boxes[..., 3],
+    )
+    x2 = torch.maximum(
+        boxes[..., 0],
+        boxes[..., 2],
+    )
+    y2 = torch.maximum(
+        boxes[..., 1],
+        boxes[..., 3],
+    )
 
     return torch.stack(
         [x1, y1, x2, y2],
@@ -342,10 +364,22 @@ def normalized_xyxy_to_pixels(
 
     pixel_boxes = boxes * scale
 
-    pixel_boxes[..., 0].clamp_(0, max(width - 1, 0))
-    pixel_boxes[..., 1].clamp_(0, max(height - 1, 0))
-    pixel_boxes[..., 2].clamp_(0, max(width - 1, 0))
-    pixel_boxes[..., 3].clamp_(0, max(height - 1, 0))
+    pixel_boxes[..., 0].clamp_(
+        0,
+        max(width - 1, 0),
+    )
+    pixel_boxes[..., 1].clamp_(
+        0,
+        max(height - 1, 0),
+    )
+    pixel_boxes[..., 2].clamp_(
+        0,
+        max(width - 1, 0),
+    )
+    pixel_boxes[..., 3].clamp_(
+        0,
+        max(height - 1, 0),
+    )
 
     return pixel_boxes
 
@@ -357,12 +391,20 @@ def select_main_predictions(
     top_k: int,
     width: int,
     height: int,
+    use_nms: bool = True,
+    nms_iou_threshold: float = 0.6,
 ) -> Dict[str, Any]:
     """
-    Select Main One-to-One predictions by confidence and top-k only.
+    Select Main predictions using:
 
-    NMS is intentionally absent because duplicate suppression is learned by the
-    Main Hungarian One-to-One branch.
+    1. sigmoid score
+    2. confidence threshold
+    3. descending score ordering
+    4. optional NMS
+    5. top-k selection
+
+    NMS is executed independently for each text query because this function
+    receives predictions from only one text query at a time.
     """
     boxes = sanitize_xyxy_boxes(
         boxes.float().reshape(-1, 4)
@@ -380,17 +422,71 @@ def select_main_predictions(
         as_tuple=False,
     ).flatten()
 
+    num_after_nms = 0
+
     if valid_indices.numel() > 0:
-        valid_scores = scores.index_select(0, valid_indices)
+        candidate_boxes = boxes.index_select(
+            0,
+            valid_indices,
+        )
+        candidate_scores = scores.index_select(
+            0,
+            valid_indices,
+        )
+        candidate_indices = valid_indices
+
+        # Sort candidates from highest to lowest confidence.
         order = torch.argsort(
-            valid_scores,
+            candidate_scores,
             descending=True,
             stable=True,
         )
-        order = order[: min(int(top_k), int(order.numel()))]
-        selected_indices = valid_indices.index_select(0, order)
-        selected_boxes_norm = boxes.index_select(0, selected_indices)
-        selected_scores = scores.index_select(0, selected_indices)
+
+        candidate_boxes = candidate_boxes.index_select(
+            0,
+            order,
+        )
+        candidate_scores = candidate_scores.index_select(
+            0,
+            order,
+        )
+        candidate_indices = candidate_indices.index_select(
+            0,
+            order,
+        )
+
+        # Remove duplicate boxes for this text query.
+        if bool(use_nms) and int(candidate_boxes.shape[0]) > 1:
+            keep = nms(
+                boxes=candidate_boxes,
+                scores=candidate_scores,
+                iou_threshold=float(nms_iou_threshold),
+            )
+
+            candidate_boxes = candidate_boxes.index_select(
+                0,
+                keep,
+            )
+            candidate_scores = candidate_scores.index_select(
+                0,
+                keep,
+            )
+            candidate_indices = candidate_indices.index_select(
+                0,
+                keep,
+            )
+
+        num_after_nms = int(candidate_scores.numel())
+
+        keep_count = min(
+            int(top_k),
+            int(candidate_scores.numel()),
+        )
+
+        selected_boxes_norm = candidate_boxes[:keep_count]
+        selected_scores = candidate_scores[:keep_count]
+        selected_indices = candidate_indices[:keep_count]
+
     else:
         selected_indices = torch.empty(
             (0,),
@@ -413,6 +509,7 @@ def select_main_predictions(
         "indices": selected_indices.detach().cpu(),
         "num_raw_predictions": int(scores.numel()),
         "num_above_confidence": int(valid_indices.numel()),
+        "num_after_nms": int(num_after_nms),
         "num_selected": int(selected_scores.numel()),
     }
 
@@ -422,7 +519,9 @@ def select_main_predictions(
 # ---------------------------------------------------------------------------
 
 
-def get_chinese_font(font_size: int = 28) -> ImageFont.ImageFont:
+def get_chinese_font(
+    font_size: int = 28,
+) -> ImageFont.ImageFont:
     candidates = [
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.otf",
@@ -455,7 +554,11 @@ def measure_text(
         text,
         font=font,
     )
-    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+    return (
+        bbox[2] - bbox[0],
+        bbox[3] - bbox[1],
+    )
 
 
 def fit_single_line_text(
@@ -465,12 +568,21 @@ def fit_single_line_text(
     minimum_font_size: int,
     max_width: int,
 ) -> Tuple[str, ImageFont.ImageFont]:
-    preferred_font_size = max(1, int(preferred_font_size))
+    preferred_font_size = max(
+        1,
+        int(preferred_font_size),
+    )
     minimum_font_size = max(
         1,
-        min(int(minimum_font_size), preferred_font_size),
+        min(
+            int(minimum_font_size),
+            preferred_font_size,
+        ),
     )
-    max_width = max(1, int(max_width))
+    max_width = max(
+        1,
+        int(max_width),
+    )
 
     for size in range(
         preferred_font_size,
@@ -478,17 +590,30 @@ def fit_single_line_text(
         -2,
     ):
         font = get_chinese_font(size)
-        if measure_text(draw, text, font)[0] <= max_width:
+
+        if measure_text(
+            draw,
+            text,
+            font,
+        )[0] <= max_width:
             return text, font
 
-    font = get_chinese_font(minimum_font_size)
+    font = get_chinese_font(
+        minimum_font_size
+    )
     ellipsis = "…"
     shortened = text
 
     while shortened:
         candidate = shortened + ellipsis
-        if measure_text(draw, candidate, font)[0] <= max_width:
+
+        if measure_text(
+            draw,
+            candidate,
+            font,
+        )[0] <= max_width:
             return candidate, font
+
         shortened = shortened[:-1]
 
     return ellipsis, font
@@ -506,12 +631,19 @@ def draw_chinese_text(
         image_bgr,
         cv2.COLOR_BGR2RGB,
     )
-    pil_image = Image.fromarray(image_rgb)
-    draw = ImageDraw.Draw(pil_image)
+
+    pil_image = Image.fromarray(
+        image_rgb
+    )
+    draw = ImageDraw.Draw(
+        pil_image
+    )
 
     if max_width is None:
         fitted_text = text
-        font = get_chinese_font(font_size)
+        font = get_chinese_font(
+            font_size
+        )
     else:
         fitted_text, font = fit_single_line_text(
             draw=draw,
@@ -548,37 +680,81 @@ def draw_query_panel(
         image_bgr,
         cv2.COLOR_BGR2RGB,
     )
-    pil_image = Image.fromarray(image_rgb)
-    draw = ImageDraw.Draw(pil_image)
+
+    pil_image = Image.fromarray(
+        image_rgb
+    )
+    draw = ImageDraw.Draw(
+        pil_image
+    )
 
     label = f"查詢文字：{text_query}"
     image_width, image_height = pil_image.size
-    margin = max(6, min(24, image_width // 20))
-    padding = max(6, min(20, image_width // 30))
-    panel_width = max(1, image_width - margin * 2)
-    text_width = max(1, panel_width - padding * 2)
+
+    margin = max(
+        6,
+        min(
+            24,
+            image_width // 20,
+        ),
+    )
+    padding = max(
+        6,
+        min(
+            20,
+            image_width // 30,
+        ),
+    )
+
+    panel_width = max(
+        1,
+        image_width - margin * 2,
+    )
+    text_width = max(
+        1,
+        panel_width - padding * 2,
+    )
 
     fitted_text, font = fit_single_line_text(
         draw=draw,
         text=label,
-        preferred_font_size=max(20, int(image_width * 0.035)),
+        preferred_font_size=max(
+            20,
+            int(image_width * 0.035),
+        ),
         minimum_font_size=14,
         max_width=text_width,
     )
 
-    _, text_height = measure_text(draw, fitted_text, font)
+    _, text_height = measure_text(
+        draw,
+        fitted_text,
+        font,
+    )
+
     panel_height = text_height + padding * 2
+
     x1 = margin
-    y1 = max(margin, image_height - panel_height - margin)
+    y1 = max(
+        margin,
+        image_height - panel_height - margin,
+    )
     x2 = image_width - margin
-    y2 = min(image_height - margin, y1 + panel_height)
+    y2 = min(
+        image_height - margin,
+        y1 + panel_height,
+    )
 
     draw.rectangle(
         [x1, y1, x2, y2],
         fill=(0, 0, 0),
     )
+
     draw.text(
-        (x1 + padding, y1 + padding),
+        (
+            x1 + padding,
+            y1 + padding,
+        ),
         fitted_text,
         font=font,
         fill=(255, 255, 255),
@@ -598,8 +774,15 @@ def draw_predictions(
 ) -> np.ndarray:
     rendered = image_bgr.copy()
 
-    for box, score in zip(boxes_pixel, scores):
-        x1, y1, x2, y2 = np.asarray(box).astype(np.int32).tolist()
+    for box, score in zip(
+        boxes_pixel,
+        scores,
+    ):
+        x1, y1, x2, y2 = (
+            np.asarray(box)
+            .astype(np.int32)
+            .tolist()
+        )
 
         if x2 <= x1 or y2 <= y1:
             continue
@@ -614,11 +797,20 @@ def draw_predictions(
 
         rendered = draw_chinese_text(
             image_bgr=rendered,
-            text=f"{query}: {float(score):.3f}",
-            position=(x1, max(0, y1 - 32)),
+            text=(
+                f"{query}: "
+                f"{float(score):.3f}"
+            ),
+            position=(
+                x1,
+                max(0, y1 - 32),
+            ),
             font_size=26,
             color_bgr=(0, 255, 0),
-            max_width=max(40, rendered.shape[1] - x1 - 8),
+            max_width=max(
+                40,
+                rendered.shape[1] - x1 - 8,
+            ),
         )
 
     return draw_query_panel(
@@ -641,6 +833,8 @@ def predict_image(
     device: torch.device,
     confidence_threshold: float,
     top_k: int,
+    use_nms: bool = True,
+    nms_iou_threshold: float = 0.6,
 ) -> Tuple[List[Dict[str, Any]], List[np.ndarray]]:
     image_tensor = image_tensor.to(
         device=device,
@@ -649,6 +843,7 @@ def predict_image(
     )
 
     query_count = len(queries)
+
     image_indices = torch.zeros(
         query_count,
         dtype=torch.long,
@@ -663,7 +858,10 @@ def predict_image(
         return_aux=False,
     )
 
-    if outputs.get("aux_computed", False):
+    if outputs.get(
+        "aux_computed",
+        False,
+    ):
         raise RuntimeError(
             "Auxiliary branch was unexpectedly computed during inference."
         )
@@ -678,10 +876,12 @@ def predict_image(
         )
 
     height, width = original_bgr.shape[:2]
+
     results: List[Dict[str, Any]] = []
     rendered_images: List[np.ndarray] = []
 
     for index, query in enumerate(queries):
+        # NMS is executed independently for each query.
         selected = select_main_predictions(
             boxes=pred_boxes[index],
             score_logits=pred_score_logits[index],
@@ -689,21 +889,42 @@ def predict_image(
             top_k=top_k,
             width=width,
             height=height,
+            use_nms=use_nms,
+            nms_iou_threshold=nms_iou_threshold,
         )
 
-        boxes_norm_np = selected["boxes_norm"].numpy()
-        boxes_pixel_np = selected["boxes_pixel"].numpy()
-        scores_np = selected["scores"].numpy()
+        boxes_norm_np = selected[
+            "boxes_norm"
+        ].numpy()
+
+        boxes_pixel_np = selected[
+            "boxes_pixel"
+        ].numpy()
+
+        scores_np = selected[
+            "scores"
+        ].numpy()
 
         result = {
             "query": query,
             "boxes_norm": boxes_norm_np.tolist(),
             "boxes_pixel": boxes_pixel_np.tolist(),
             "scores": scores_np.tolist(),
-            "num_raw_predictions": selected["num_raw_predictions"],
-            "num_above_confidence": selected["num_above_confidence"],
-            "num_selected": selected["num_selected"],
+            "indices": selected["indices"].tolist(),
+            "num_raw_predictions": selected[
+                "num_raw_predictions"
+            ],
+            "num_above_confidence": selected[
+                "num_above_confidence"
+            ],
+            "num_after_nms": selected[
+                "num_after_nms"
+            ],
+            "num_selected": selected[
+                "num_selected"
+            ],
         }
+
         results.append(result)
 
         rendered_images.append(
@@ -725,10 +946,12 @@ def predict_image(
 
 class LightDet(ValidateLightDet):
     """
-    Adds YOLO-style predict() to the same LightDet object used by train() and val().
+    Adds YOLO-style predict() to the same LightDet object used by train() and
+    val().
 
     Example:
         model = LightDet(model="/path/to/model.yaml")
+
         results = model.predict(
             weights="/path/to/best.pt",
             source="/path/to/image.jpg",
@@ -737,6 +960,8 @@ class LightDet(ValidateLightDet):
             device=0,
             conf=0.001,
             top_k=100,
+            use_nms=True,
+            nms_iou_threshold=0.6,
             project="runs/predict",
             name="exp",
         )
@@ -751,6 +976,8 @@ class LightDet(ValidateLightDet):
         device: Optional[Any] = None,
         conf: float = 0.001,
         top_k: int = 100,
+        use_nms: bool = True,
+        nms_iou_threshold: float = 0.6,
         project: str = "runs/predict",
         name: str = "exp",
         prefer_ema: bool = True,
@@ -780,30 +1007,63 @@ class LightDet(ValidateLightDet):
                 f"imgsz must be > 0, got {imgsz}"
             )
 
+        if not 0.0 <= float(nms_iou_threshold) <= 1.0:
+            raise ValueError(
+                "nms_iou_threshold must be within [0, 1], "
+                f"got {nms_iou_threshold}"
+            )
+
         queries = normalize_queries(text)
-        source_path = Path(source).expanduser().resolve()
-        checkpoint_path = Path(weights).expanduser().resolve()
+
+        source_path = (
+            Path(source)
+            .expanduser()
+            .resolve()
+        )
+
+        checkpoint_path = (
+            Path(weights)
+            .expanduser()
+            .resolve()
+        )
+
         output_dir = (
             Path(project).expanduser()
             / str(name)
         ).resolve()
 
-        resolved_device = resolve_inference_device(device)
+        resolved_device = resolve_inference_device(
+            device
+        )
 
-        model_cfg = deepcopy_cfg(self.model_cfg)
-        model_cfg["model"]["auxiliary_in_eval"] = False
+        model_cfg = deepcopy_cfg(
+            self.model_cfg
+        )
+        model_cfg["model"][
+            "auxiliary_in_eval"
+        ] = False
 
-        inference_model = build_inference_model(model_cfg)
+        inference_model = build_inference_model(
+            model_cfg
+        )
+
         checkpoint_info = load_checkpoint_for_inference(
             model=inference_model,
             checkpoint_path=checkpoint_path,
             prefer_ema=bool(prefer_ema),
         )
 
-        inference_model = inference_model.to(resolved_device)
+        inference_model = inference_model.to(
+            resolved_device
+        )
         inference_model.eval()
 
-        image_tensor, original_bgr, width, height = preprocess_image(
+        (
+            image_tensor,
+            original_bgr,
+            width,
+            height,
+        ) = preprocess_image(
             source=source_path,
             image_size=int(imgsz),
         )
@@ -819,7 +1079,11 @@ class LightDet(ValidateLightDet):
         print(f"  queries      : {len(queries)}")
         print(f"  confidence   : {float(conf):.6f}")
         print(f"  top-k        : {int(top_k)}")
-        print("  use NMS      : False")
+        print(f"  use NMS      : {bool(use_nms)}")
+        print(
+            f"  NMS IoU      : "
+            f"{float(nms_iou_threshold):.3f}"
+        )
         print("  auxiliary    : disabled")
 
         results, rendered_images = predict_image(
@@ -830,9 +1094,16 @@ class LightDet(ValidateLightDet):
             device=resolved_device,
             confidence_threshold=float(conf),
             top_k=int(top_k),
+            use_nms=bool(use_nms),
+            nms_iou_threshold=float(
+                nms_iou_threshold
+            ),
         )
 
-        elapsed_seconds = time.perf_counter() - start_time
+        elapsed_seconds = (
+            time.perf_counter()
+            - start_time
+        )
 
         rendered_path: Optional[Path] = None
         json_path: Optional[Path] = None
@@ -847,12 +1118,22 @@ class LightDet(ValidateLightDet):
             if len(rendered_images) == 1:
                 combined = rendered_images[0]
             else:
-                combined = cv2.hconcat(rendered_images)
+                combined = cv2.hconcat(
+                    rendered_images
+                )
 
-            rendered_path = output_dir / "prediction.jpg"
-            if not cv2.imwrite(str(rendered_path), combined):
+            rendered_path = (
+                output_dir
+                / "prediction.jpg"
+            )
+
+            if not cv2.imwrite(
+                str(rendered_path),
+                combined,
+            ):
                 raise RuntimeError(
-                    f"Failed to save rendered image: {rendered_path}"
+                    "Failed to save rendered image: "
+                    f"{rendered_path}"
                 )
 
         output: Dict[str, Any] = {
@@ -860,8 +1141,12 @@ class LightDet(ValidateLightDet):
             "weights": checkpoint_info["path"],
             "weight_source": checkpoint_info["source"],
             "checkpoint_epoch": checkpoint_info["epoch"],
-            "stored_best_metric_name": checkpoint_info["best_metric_name"],
-            "stored_best_metric": checkpoint_info["best_metric"],
+            "stored_best_metric_name": checkpoint_info[
+                "best_metric_name"
+            ],
+            "stored_best_metric": checkpoint_info[
+                "best_metric"
+            ],
             "device": str(resolved_device),
             "image_size": int(imgsz),
             "original_size": {
@@ -870,7 +1155,10 @@ class LightDet(ValidateLightDet):
             },
             "confidence_threshold": float(conf),
             "top_k": int(top_k),
-            "use_nms": False,
+            "use_nms": bool(use_nms),
+            "nms_iou_threshold": float(
+                nms_iou_threshold
+            ),
             "auxiliary_computed": False,
             "results": results,
             "rendered_path": (
@@ -882,10 +1170,20 @@ class LightDet(ValidateLightDet):
         }
 
         if save_json:
-            json_path = output_dir / "predictions.json"
-            temporary_path = Path(str(json_path) + ".tmp")
+            json_path = (
+                output_dir
+                / "predictions.json"
+            )
 
-            with open(temporary_path, "w", encoding="utf-8") as file:
+            temporary_path = Path(
+                str(json_path) + ".tmp"
+            )
+
+            with open(
+                temporary_path,
+                "w",
+                encoding="utf-8",
+            ) as file:
                 json.dump(
                     output,
                     file,
@@ -893,17 +1191,25 @@ class LightDet(ValidateLightDet):
                     indent=2,
                 )
 
-            os.replace(temporary_path, json_path)
-            output["json_path"] = str(json_path)
+            os.replace(
+                temporary_path,
+                json_path,
+            )
+
+            output["json_path"] = str(
+                json_path
+            )
         else:
             output["json_path"] = None
 
         print("\n[Prediction result]")
+
         for result in results:
             print(
                 f"  query={result['query']!r}, "
                 f"raw={result['num_raw_predictions']}, "
                 f"above_conf={result['num_above_confidence']}, "
+                f"after_nms={result['num_after_nms']}, "
                 f"selected={result['num_selected']}"
             )
 
@@ -918,23 +1224,37 @@ class LightDet(ValidateLightDet):
                     int(round(value))
                     for value in box
                 ]
+
                 print(
                     f"    rank={rank:02d}, "
                     f"score={float(score):.6f}, "
                     f"box={rounded_box}"
                 )
 
-        print(f"  elapsed      : {elapsed_seconds:.3f}s")
+        print(
+            f"  elapsed      : "
+            f"{elapsed_seconds:.3f}s"
+        )
+
         if rendered_path is not None:
-            print(f"  saved image  : {rendered_path}")
+            print(
+                f"  saved image  : "
+                f"{rendered_path}"
+            )
+
         if json_path is not None:
-            print(f"  saved JSON   : {json_path}")
+            print(
+                f"  saved JSON   : "
+                f"{json_path}"
+            )
 
         return output
 
 
 def main() -> None:
-    os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+    os.environ[
+        "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"
+    ] = "1"
 
     model = LightDet(
         model=(
@@ -947,25 +1267,31 @@ def main() -> None:
         weights=(
             "/home/soic/Desktop/LightDet/"
             "units/model/runs/train/"
-            "lightdet_hybrid_grid10_seed47/"
-            "best_map50_95.pt"
+            "lightdet_HDETR_object_query/"
+            "epoch_100.pt"
         ),
         source=(
-            "/home/soic/Desktop/datasetPreTest15000/"
-            "dataset/datasetPreTest15000_mixed/"
-            "images/train/2021_10_25_13_27_28_01200.jpg"
+            "/home/soic/Desktop/datasetPreTest15000/dataset/datasetPreTest15000_mixed/images/train/2023_08_08_15_26_49_815814_1.jpg"
         ),
         text=[
-            "一台行駛的計程車",
-            "停靠的船",
+            "漂浮的浮標",
+            "一艘船",
         ],
-        imgsz=512,
+        imgsz=1024,
         device=0,
-        conf=0.001,
-        top_k=100,
+        conf=0.64,
+        top_k=20,
+
+        # NMS 設定
+        use_nms=True,
+        nms_iou_threshold=0.3,
+
         project="runs/predict",
         name="lightdet_hybrid",
-        prefer_ema=True,
+
+        
+        prefer_ema=False,
+
         save=True,
         save_json=True,
     )
