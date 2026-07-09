@@ -73,12 +73,12 @@ loss:
     score: 1.0
     bbox_start: 5.0
     bbox_end: 3.5
-    bbox_decay_until: 0.50
+    
     giou_start: 2.0
     giou_end: 2.0
     score_start: 1.0
     score_end: 4.0
-    score_warm_until: 0.50
+    
     start_epoch: 1
     end_epoch: 40
     schedule: cosine
