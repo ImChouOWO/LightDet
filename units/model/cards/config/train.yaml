@@ -64,12 +64,13 @@ loss:
   matcher:
     cost_bbox: 5.0
     cost_giou: 2.0
+    # The matcher consumes localization-quality only, never the fused score.
     cost_score: 2.0
     score_cost_type: focal
     focal_alpha: 0.25
     focal_gamma: 2.0
 
-  # Main loss contribution schedule.
+  # Main localization-quality contribution schedule.
   weight:
     dynamic: true
     bbox: 5.0
@@ -78,21 +79,19 @@ loss:
 
     bbox_start: 5.0
     bbox_end: 3.5
-    
 
     giou_start: 2.0
     giou_end: 2.0
 
     score_start: 1.0
     score_end: 4.0
-    
 
     start_epoch: 1
     end_epoch: 30
     schedule: cosine
 
   classification:
-    # Matched query target = IoU; unmatched query target = 0.
+    # Matched quality target = IoU; unmatched quality target = 0.
     type: iou
     ia_bce_alpha: 0.25
     focal_alpha: 0.25
@@ -114,6 +113,20 @@ loss:
     qfl_beta: 2.0
     quality_warmup_epoch: 10
     aux_score_enabled: true
+
+  # Independent semantic supervision. Positive-text rows supervise high-IoU
+  # regions; negative-text rows supervise alignment only and do not enter the
+  # localization matcher or bbox/quality losses.
+  text_alignment:
+    enabled: true
+    loss_weight: 1.0
+    positive_iou_threshold: 0.50
+    negative_iou_threshold: 0.20
+    negative_weight: 0.25
+    negative_text_weight: 1.0
+    focal_gamma: 2.0
+    start_epoch: 1
+    warmup_epoch: 5
 
   matcher_schedule:
     start_epoch: 5
@@ -138,6 +151,8 @@ loss:
     matcher_score_start_epoch: 5
     matcher_score_warmup_epoch: 10
 
+  # Retained for backward-compatible logging. Semantic negative-text
+  # supervision is now provided by text_alignment.
   text_negative:
     as_empty_target: true
     classification_weight: 1.0
@@ -201,10 +216,10 @@ eval:
 log:
   save_dir: units/model/runs/train/lightdet_HDETR_object_query
 
-  # weights_path: warm start only; resume_path: full-state resume.
-  # Do not enable both at the same time.
-  weights_path: null
-  resume_path: /home/soic/Desktop/LightDet/units/model/runs/train/lightdet_HDETR_object_query/latest.pt
+  # The architecture adds a new trainable head. Use weights-only warm start
+  # for an old checkpoint because its optimizer state has no alignment params.
+  weights_path: /home/soic/Desktop/LightDet/units/model/runs/train/lightdet_HDETR_object_query/latest.pt
+  resume_path: null
   prefer_ema: true
 
   save_latest_interval: 1
