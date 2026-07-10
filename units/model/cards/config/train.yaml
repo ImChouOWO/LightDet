@@ -214,7 +214,7 @@ eval:
   best_metric: map50_95
 
 log:
-  save_dir: units/model/runs/train/lightdet_HDETR_object_query
+  save_dir: units/model/runs/train/lightdet_HDETR_score_decoupled
 
   # The architecture adds a new trainable head. Use weights-only warm start
   # for an old checkpoint because its optimizer state has no alignment params.
