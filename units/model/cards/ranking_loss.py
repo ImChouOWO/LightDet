@@ -65,13 +65,35 @@ class RankingGroundingLoss(_legacy.RankingGroundingLoss):
                 aux_quality._text_alignment_logit = aux_alignment
             kwargs["aux_pred_score_logit"] = aux_quality
 
-        return super().forward(
+        loss, metrics = super().forward(
             pred_bbox,
             quality,
             targets,
             *args,
             **kwargs,
         )
+
+        # Preserve the existing train.py metric names while changing their
+        # semantic source from the old coupled score to text alignment.
+        if bool(metrics.get("score_decoupled", False)):
+            metrics["negative_query_top1_score"] = metrics.get(
+                "text_alignment_negative_top1_score",
+                pred_bbox.new_zeros(()),
+            )
+            metrics["positive_query_top1_score"] = metrics.get(
+                "text_alignment_positive_top1_score",
+                pred_bbox.new_zeros(()),
+            )
+            metrics["positive_negative_score_margin"] = metrics.get(
+                "text_alignment_margin",
+                pred_bbox.new_zeros(()),
+            )
+            metrics["text_negative_count"] = metrics.get(
+                "text_negative_query_rows",
+                0.0,
+            )
+
+        return loss, metrics
 
 
 def build_grounding_loss_from_config(
