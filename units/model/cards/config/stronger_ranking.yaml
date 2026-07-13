@@ -17,7 +17,6 @@ data:
   negative_sample_ratio: 0.15
   use_negative_queries_in_val: true
 
-
 train:
   epochs: 300
   batch_size: 48
@@ -44,10 +43,11 @@ train:
 
   grad_clip_norm: 1.0
 
-
 optim:
   components:
-    vision: ["freeze", 0.0001, 0.00001, 0.30, 0.55]
+    # Image projection must remain trainable. Use cosine decay rather than
+    # freeze so the visual token space can adapt to both Transformer stages.
+    vision: ["cosine", 0.00008, 0.000002, 0.00, 1.00]
     text: ["cosine", 0.00001, 0.0000002, 0.00, 0.75]
     transformer: ["cosine", 0.0001, 0.000002, 0.00, 1.00]
     head: ["cosine", 0.0001, 0.000002, 0.00, 1.00]
@@ -56,39 +56,26 @@ optim:
   max_warmup_steps: 3000
   fused: true
 
-
 loss:
   matcher:
     cost_bbox: 5.0
     cost_giou: 2.0
-
-    # 現在只使用 quality_logit，不使用融合後 final_score。
+    # Matcher consumes quality_logit from the refinement Transformer only.
     cost_score: 1.0
-
     score_cost_type: focal
     focal_alpha: 0.25
     focal_gamma: 2.0
 
-
   weight:
     dynamic: true
-
     bbox: 5.0
     giou: 2.0
-
-    # score 現在代表 localization quality loss。
     score: 1.0
 
     bbox_start: 5.0
     bbox_end: 3.5
-
     giou_start: 2.0
     giou_end: 2.0
-
-    quality_start: 1.0
-    quality_end: 2.5
-
-    # 保留舊參數名稱，供現有程式讀取。
     score_start: 1.0
     score_end: 2.5
 
@@ -96,201 +83,144 @@ loss:
     end_epoch: 40
     schedule: cosine
 
-
   classification:
-    # Quality head 的正樣本目標為 matched bbox IoU。
     type: iou
-
     ia_bce_alpha: 0.25
     focal_alpha: 0.25
     focal_gamma: 2.0
-
-    # 降低 unmatched quality 的壓制，避免所有 quality 偏低。
     negative_weight: 0.30
     normalize_by_num_gt: true
 
     negative_iou_ignore_thr: 0.50
-
     negative_iou_ignore_start: 0.55
     negative_iou_ignore_end: 0.45
-
     negative_iou_ignore_start_epoch: 5
     negative_iou_ignore_end_epoch: 60
     negative_iou_ignore_schedule: cosine
-
 
   quality:
     iou_pos_thr: 0.0
     quality_min: 0.10
     quality_max: 1.0
-
     qfl_beta: 2.0
     quality_warmup_epoch: 10
-
     aux_score_enabled: true
-
 
   text_alignment:
     enabled: true
-
-    # Text alignment 為獨立語意任務。
     loss_weight: 1.5
-
-    # 高 IoU Query 視為語意正樣本。
     positive_iou_threshold: 0.50
-
-    # 低 IoU Query 視為語意負樣本。
     negative_iou_threshold: 0.20
-
-    # 正文字中的低 IoU Query 負樣本權重。
     negative_weight: 0.25
-
-    # 負文字列全部 Query 的負樣本權重。
     negative_text_weight: 1.0
-
     focal_gamma: 2.0
-
     start_epoch: 1
     warmup_epoch: 5
 
+  # Low-weight identity preservation between localization query i and score
+  # refinement query i. The localization feature is detached so this term does
+  # not pull the bbox branch toward the score branch.
+  query_refinement:
+    identity_weight: 0.02
+    detach_localization: true
+    start_epoch: 1
+    warmup_epoch: 10
 
   matcher_schedule:
-    # 前期先由 bbox 與 GIoU 決定 assignment。
     start_epoch: 10
     warmup_epoch: 20
     alpha_min: 0.0
 
-
   score_sampling:
     positive_ratio: 1.0
-
-    # Auxiliary one-to-many 每個 GT 最多匹配三個 Query。
     max_positive_per_gt: 3
-
     hard_negative_ratio: 5
     aux_positive_label: 0.7
-
     expand_cost_bbox: 5.0
     expand_cost_giou: 2.0
 
-
   hybrid:
     aux_loss_weight: 0.35
-
-    # Auxiliary matcher 同樣只使用 quality。
     aux_cost_score: 1.0
-    matcher_cost_score: 1.0
-
     warmup_epoch: 3
-
-    # 300 epochs 時約從第 120 epoch 開始衰減。
     decay_start_ratio: 0.40
     min_factor: 0.10
-
+    matcher_cost_score: 1.0
     matcher_score_start_epoch: 10
     matcher_score_warmup_epoch: 20
 
-
   text_negative:
     as_empty_target: true
-
-    # 保留供既有設定與紀錄程式讀取。
     classification_weight: 1.0
     max_query_loss_weight: 4.0
-
-    # 負文字已由 text_alignment loss 處理，避免重複計算。
+    # Negative-text supervision is handled by text_alignment.
     lambda_text_negative: 0.0
-
     text_negative_topk: 20
     hard_topk: 20
-
     text_negative_hard_mix: 0.50
     hard_mix: 0.50
-
     start_epoch: 1
     warmup_epoch: 5
 
-
   duplicate_suppression:
     enabled: true
-
-    # Duplicate ranking 只操作 quality_logit。
     loss_weight: 0.10
     margin: 0.15
-
     background_weight: 0.05
     classification_weight: 0.25
-
     max_pairs: 128
-
     start_epoch: 5
     warmup_epoch: 10
 
-
   hard_negative:
     enabled: true
-
-    # 只抑制低 IoU、高 quality 的 Query。
     loss_weight: 0.05
     topk: 10
     max_iou: 0.25
-
     start_epoch: 8
     warmup_epoch: 10
 
-
   ranking:
-    # 先關閉全域 IoU pairwise ranking，避免與 duplicate ranking 衝突。
+    # Disable the old global pairwise objective initially. The staged score
+    # branch already has quality QFL, duplicate ranking and hard negatives.
     enabled: false
-
     lambda_rank: 0.10
     rank_margin: 0.10
     rank_min_quality_gap: 0.15
     rank_max_pairs: 256
-
     rank_start_epoch: 15
     rank_warmup_epoch: 15
     rank_alpha_min: 0.0
     rank_negative_iou_max: 0.20
 
-
   pos_weight:
     value: 1.0
-
 
 eval:
   val_loss_interval: 5
   eval_interval: 1
   max_val_batches: null
 
-  # 此分數為 quality 與 text alignment 的融合分數。
   score_thr: 0.001
   top_k: 100
-
   nms_iou_thr: 0.5
   use_nms: false
   use_topk_fallback: false
 
   iou_thresholds: null
-
   compute_raw_oracle: true
   raw_oracle_iou_thresholds: [0.25, 0.50, 0.75]
-
   best_metric: map50
 
-
 log:
-  save_dir: units/model/runs/train/lightdet_HDETR_score_decoupled
-
+  save_dir: units/model/runs/train/lightdet_HDETR_staged_query_refinement
   weights_path: null
   resume_path: null
   prefer_ema: true
 
   save_latest_interval: 1
   save_epoch_interval: 50
-
   emit_step_metrics: false
   log_interval: 50
-
   progress_leave: true
   progress_mininterval: 0.5
