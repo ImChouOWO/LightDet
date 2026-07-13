@@ -5,16 +5,31 @@ model:
   hidden_dim: 512
   image_grid_size: 10
 
-  # Decoder-only object-query branch
+  # Keep the image projection trainable. The vision LR schedule controls its
+  # learning rate; it is not frozen by model construction.
+  freeze_img_projection: false
+
+  # Decoder-only localization query branch
   num_object_queries: 100
   query_group_init_std: 0.02
   fusion_token_num: 16
 
-  # Shared Transformer
+  # Stage 1: localization Transformer
   num_heads: 8
   num_layers: 3
   mlp_ratio: 3.5
   dropout: 0.1
+
+  # Stage 2: quality / text-alignment refinement Transformer
+  staged_query_refinement: true
+  score_num_heads: 8
+  score_num_layers: 2
+  score_mlp_ratio: 3.0
+  score_dropout: 0.1
+  score_bbox_conditioning: true
+  score_bbox_detach: true
+  score_fusion: geometric_mean
+  score_fusion_eps: 0.000001
 
   # Text branch
   text_max_length: 32
