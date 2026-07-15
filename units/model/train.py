@@ -1376,18 +1376,10 @@ def train_one_epoch(
                 "lr": f"{current_lr:.2e}",
                 "loss": f"{loss_item:.4f}",
                 "avg": f"{avg_loss:.4f}",
-                "main": f"{main_loss_item:.4f}",
-                "aux": f"{aux_contrib_item:.4f}",
                 "bbox": f"{bbox_item:.4f}",
                 "giou": f"{giou_item:.4f}",
                 "score": f"{score_item:.4f}",
-                "msa": f"{matcher_score_alpha_item:.4f}",
-                "msc": f"{matcher_score_cost_item:.4f}",
-                "txtneg": f"{text_negative_item:.4f}",
-                "tnc": f"{text_negative_contrib_item:.4f}",
-                "pm": f"{query_score_margin_item:.3f}",
-                "ntm": negative_text_match_item,
-                "nq": text_negative_queries,
+                "rank": f"{rank_contrib_item:.4f}",
             })
 
             if step_metrics_path is not None:
@@ -3242,25 +3234,19 @@ def train(args: SimpleNamespace) -> None:
 
         tqdm.write(
             f"Epoch [{epoch}/{args.epochs}] "
-            f"train_loss={train_metrics.get('train_loss', -1):.4f} "
-            f"val_loss={val_loss_text} "
+            f"train={train_metrics.get('train_loss', -1):.4f} "
+            f"val={val_loss_text} "
             f"mAP50={eval_metrics.get('map50', -1):.4f} "
             f"mAP50-95={eval_metrics.get('map50_95', -1):.4f} "
             f"P={eval_metrics.get('precision', -1):.4f} "
             f"R={eval_metrics.get('recall', -1):.4f} "
+            f"R@1={eval_metrics.get('recall50_at_1', -1):.4f} "
+            f"R@5={eval_metrics.get('recall50_at_5', -1):.4f} "
+            f"R@10={eval_metrics.get('recall50_at_10', -1):.4f} "
             f"Oracle50="
             f"{eval_metrics.get('raw_oracle_recall50', -1):.4f} "
-            f"Gap50="
-            f"{eval_metrics.get('raw_oracle_gap50', -1):.4f} "
-            f"lb={lambda_bbox:.2f} "
-            f"lg={lambda_giou:.2f} "
-            f"ls={lambda_score:.2f} "
-            f"matcher_alpha="
-            f"{dynamic_config.get('matcher_score_alpha', 0.0):.2f} "
-            f"pw={pos_weight:.2f} "
-            f"epoch_time={epoch_time:.2f}s"
+            f"time={epoch_time:.1f}s"
         )
-
 
 
 # Configuration
