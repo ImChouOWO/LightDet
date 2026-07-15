@@ -45,12 +45,10 @@ train:
 
 optim:
   components:
-    # Image projection must remain trainable. Use cosine decay rather than
-    # freeze so the visual token space can adapt to both Transformer stages.
-    vision: ["cosine", 0.00008, 0.000002, 0.00, 1.00]
+    vision: ["cosine", 0.00008, 0.000001, 0.00, 0.70]
     text: ["cosine", 0.00001, 0.0000002, 0.00, 0.75]
-    transformer: ["cosine", 0.0001, 0.000002, 0.00, 1.00]
-    head: ["cosine", 0.0001, 0.000002, 0.00, 1.00]
+    transformer: ["cosine", 0.0001, 0.000003, 0.00, 1.00]
+    head: ["cosine", 0.0001, 0.000005, 0.00, 1.00]
 
   weight_decay: 0.0005
   max_warmup_steps: 3000
@@ -60,8 +58,7 @@ loss:
   matcher:
     cost_bbox: 5.0
     cost_giou: 2.0
-    # Matcher consumes quality_logit from the refinement Transformer only.
-    cost_score: 1.0
+    cost_score: 0.75
     score_cost_type: focal
     focal_alpha: 0.25
     focal_gamma: 2.0
@@ -73,14 +70,14 @@ loss:
     score: 1.0
 
     bbox_start: 5.0
-    bbox_end: 3.5
+    bbox_end: 2.5
     giou_start: 2.0
-    giou_end: 2.0
+    giou_end: 1.25
     score_start: 1.0
-    score_end: 2.5
+    score_end: 3.5
 
-    start_epoch: 1
-    end_epoch: 40
+    start_epoch: 30
+    end_epoch: 180
     schedule: cosine
 
   classification:
@@ -88,14 +85,14 @@ loss:
     ia_bce_alpha: 0.25
     focal_alpha: 0.25
     focal_gamma: 2.0
-    negative_weight: 0.30
+    negative_weight: 0.25
     normalize_by_num_gt: true
 
     negative_iou_ignore_thr: 0.50
     negative_iou_ignore_start: 0.55
     negative_iou_ignore_end: 0.45
-    negative_iou_ignore_start_epoch: 5
-    negative_iou_ignore_end_epoch: 60
+    negative_iou_ignore_start_epoch: 30
+    negative_iou_ignore_end_epoch: 150
     negative_iou_ignore_schedule: cosine
 
   quality:
@@ -103,95 +100,89 @@ loss:
     quality_min: 0.10
     quality_max: 1.0
     qfl_beta: 2.0
-    quality_warmup_epoch: 10
+    quality_warmup_epoch: 30
     aux_score_enabled: true
 
   text_alignment:
     enabled: true
-    loss_weight: 1.5
+    loss_weight: 1.25
     positive_iou_threshold: 0.50
     negative_iou_threshold: 0.20
     negative_weight: 0.25
     negative_text_weight: 1.0
     focal_gamma: 2.0
-    start_epoch: 1
-    warmup_epoch: 5
+    start_epoch: 15
+    warmup_epoch: 30
 
-  # Low-weight identity preservation between localization query i and score
-  # refinement query i. The localization feature is detached so this term does
-  # not pull the bbox branch toward the score branch.
   query_refinement:
     identity_weight: 0.02
     detach_localization: true
     start_epoch: 1
-    warmup_epoch: 10
+    warmup_epoch: 20
 
   matcher_schedule:
-    start_epoch: 10
-    warmup_epoch: 20
+    start_epoch: 30
+    warmup_epoch: 70
     alpha_min: 0.0
 
   score_sampling:
     positive_ratio: 1.0
     max_positive_per_gt: 3
-    hard_negative_ratio: 5
+    hard_negative_ratio: 3
     aux_positive_label: 0.7
     expand_cost_bbox: 5.0
     expand_cost_giou: 2.0
 
   hybrid:
     aux_loss_weight: 0.35
-    aux_cost_score: 1.0
-    warmup_epoch: 3
-    decay_start_ratio: 0.40
-    min_factor: 0.10
-    matcher_cost_score: 1.0
-    matcher_score_start_epoch: 10
-    matcher_score_warmup_epoch: 20
+    aux_cost_score: 0.75
+    warmup_epoch: 5
+    decay_start_ratio: 0.30
+    min_factor: 0.05
+    matcher_cost_score: 0.75
+    matcher_score_start_epoch: 30
+    matcher_score_warmup_epoch: 70
 
   text_negative:
     as_empty_target: true
     classification_weight: 1.0
     max_query_loss_weight: 4.0
-    # Negative-text supervision is handled by text_alignment.
     lambda_text_negative: 0.0
     text_negative_topk: 20
     hard_topk: 20
     text_negative_hard_mix: 0.50
     hard_mix: 0.50
-    start_epoch: 1
-    warmup_epoch: 5
+    start_epoch: 15
+    warmup_epoch: 30
 
   duplicate_suppression:
     enabled: true
-    loss_weight: 0.10
-    margin: 0.15
+    loss_weight: 0.20
+    margin: 0.20
     background_weight: 0.05
     classification_weight: 0.25
-    max_pairs: 128
-    start_epoch: 5
-    warmup_epoch: 10
+    max_pairs: 256
+    start_epoch: 30
+    warmup_epoch: 20
 
   hard_negative:
     enabled: true
     loss_weight: 0.05
     topk: 10
-    max_iou: 0.25
-    start_epoch: 8
-    warmup_epoch: 10
+    max_iou: 0.20
+    start_epoch: 50
+    warmup_epoch: 30
 
   ranking:
-    # Disable the old global pairwise objective initially. The staged score
-    # branch already has quality QFL, duplicate ranking and hard negatives.
-    enabled: false
-    lambda_rank: 0.10
+    enabled: true
+    lambda_rank: 0.3
     rank_margin: 0.10
-    rank_min_quality_gap: 0.15
-    rank_max_pairs: 256
-    rank_start_epoch: 15
-    rank_warmup_epoch: 15
+    rank_min_quality_gap: 0.10
+    rank_max_pairs: 512
+    rank_start_epoch: 40
+    rank_warmup_epoch: 30
     rank_alpha_min: 0.0
-    rank_negative_iou_max: 0.20
+    rank_negative_iou_max: 0.25
 
   pos_weight:
     value: 1.0
@@ -213,9 +204,9 @@ eval:
   best_metric: map50
 
 log:
-  save_dir: units/model/runs/train/lightdet_HDETR_staged_query_refinement
+  save_dir: units/model/runs/train/lightdet_HDETR_transformer_layer_decoupled_v2
   weights_path: null
-  resume_path: null
+  resume_path: /home/soic/Desktop/LightDet/units/model/runs/train/lightdet_HDETR_transformer_layer_decoupled_v2/latest.pt
   prefer_ema: true
 
   save_latest_interval: 1

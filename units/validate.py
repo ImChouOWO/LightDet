@@ -999,10 +999,7 @@ def main() -> None:
             "units/model/cards/config/train.yaml"
         ),
         weights=(
-            "/home/soic/Desktop/LightDet/"
-            "units/model/runs/train/"
-            "lightdet_hybrid_grid10_seed47/"
-            "best_map50_95.pt"
+            "/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_HDETR_transformer_layer_decoupled_v2/epoch_100.pt"
         ),
         data=(
             "/home/soic/Desktop/LightDet/"

@@ -16,7 +16,7 @@ model:
 
   # Stage 1: localization Transformer
   num_heads: 8
-  num_layers: 3
+  num_layers: 2
   mlp_ratio: 3.5
   dropout: 0.1
 

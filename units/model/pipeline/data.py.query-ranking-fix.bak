@@ -167,9 +167,8 @@ class ShipGroundingDataset(Dataset):
         image_dir: str,
         anno_paths: List[str],
         image_size: Tuple[int, int] = (640, 640),
-        use_query_text: bool = True,
-        use_main_colors: bool = False,
-        use_text_aug: bool = False,
+        use_main_colors: bool = True,
+        use_text_aug: bool = True,
         max_text_aug_per_image: Optional[int] = 1,
         random_seed: Optional[int] = None,
         normalize_boxes: bool = True,
@@ -188,9 +187,8 @@ class ShipGroundingDataset(Dataset):
         self.anno_paths = anno_paths
         self.image_size = image_size
 
-        self.use_query_text = bool(use_query_text)
-        self.use_main_colors = bool(use_main_colors)
-        self.use_text_aug = bool(use_text_aug)
+        self.use_main_colors = use_main_colors
+        self.use_text_aug = use_text_aug
         self.max_text_aug_per_image = max_text_aug_per_image
 
         self.normalize_boxes = normalize_boxes
@@ -264,51 +262,32 @@ class ShipGroundingDataset(Dataset):
             self.image_paths.append(image_path)
             self.annos.append(anns)
 
-            query_text_groups = (
-                self.build_query_text_groups(anns)
-                if self.use_query_text
-                else {}
-            )
-            main_color_groups = (
-                self.build_main_color_groups(anns)
-                if self.use_main_colors
-                else {}
-            )
-            text_aug_groups = (
-                self.build_text_aug_groups(
-                    anns,
-                    max_samples_per_object=self.max_text_aug_per_image,
-                )
-                if self.use_text_aug
-                else {}
+            main_color_groups = self.build_main_color_groups(anns)
+            text_aug_groups = self.build_text_aug_groups(anns)
+            text_aug_groups = self.sample_text_aug_groups(
+                text_aug_groups,
+                max_samples=self.max_text_aug_per_image,
             )
 
-            for query_text, obj_indices in query_text_groups.items():
-                if obj_indices:
-                    self.samples.append({
-                        "anno_idx": anno_idx,
-                        "query_text": query_text,
-                        "obj_indices": obj_indices,
-                        "group_source": "query_text",
-                    })
+            if self.use_main_colors:
+                for query_text, obj_indices in main_color_groups.items():
+                    if len(obj_indices) > 0:
+                        self.samples.append({
+                            "anno_idx": anno_idx,
+                            "query_text": query_text,
+                            "obj_indices": obj_indices,
+                            "group_source": "main_colors",
+                        })
 
-            for query_text, obj_indices in main_color_groups.items():
-                if obj_indices:
-                    self.samples.append({
-                        "anno_idx": anno_idx,
-                        "query_text": query_text,
-                        "obj_indices": obj_indices,
-                        "group_source": "main_colors",
-                    })
-
-            for query_text, obj_indices in text_aug_groups.items():
-                if obj_indices:
-                    self.samples.append({
-                        "anno_idx": anno_idx,
-                        "query_text": query_text,
-                        "obj_indices": obj_indices,
-                        "group_source": "query_texts_aug",
-                    })
+            if self.use_text_aug:
+                for query_text, obj_indices in text_aug_groups.items():
+                    if len(obj_indices) > 0:
+                        self.samples.append({
+                            "anno_idx": anno_idx,
+                            "query_text": query_text,
+                            "obj_indices": obj_indices,
+                            "group_source": "query_texts_aug",
+                        })
 
         self.samples_by_anno = [[] for _ in range(len(self.annos))]
         for sample in self.samples:
@@ -535,21 +514,6 @@ class ShipGroundingDataset(Dataset):
 
         return True
 
-    def build_query_text_groups(self, anns):
-        """Bind every query_text to the object that produced it."""
-        query_groups = {}
-        for obj_idx, obj in enumerate(anns):
-            query_text = str(obj.get("query_text", "")).strip()
-            if not self.is_valid_query_text(query_text):
-                continue
-            query_groups.setdefault(query_text, []).append(obj_idx)
-
-        return {
-            query_text: list(dict.fromkeys(obj_indices))
-            for query_text, obj_indices in query_groups.items()
-            if obj_indices
-        }
-
     def extract_colors_from_text(self, text):
         if not isinstance(text, str):
             return []
@@ -596,46 +560,44 @@ class ShipGroundingDataset(Dataset):
 
         return query_groups
 
-    def build_text_aug_groups(
-        self,
-        anns,
-        max_samples_per_object=1,
-    ):
-        """Bind each augmented phrase only to its original object."""
-        query_groups = {}
+    def build_text_aug_groups(self, anns):
+        aug_text_to_colors = {}
 
-        for obj_idx, obj in enumerate(anns):
-            base_text = str(obj.get("query_text", "")).strip()
+        for obj in anns:
             texts_aug = obj.get("query_texts_aug", [])
             if not isinstance(texts_aug, list):
                 continue
 
-            candidates = []
-            seen = set()
             for text in texts_aug:
                 if not self.is_valid_query_text(text):
                     continue
-                text = str(text).strip()
-                if text == base_text or text in seen:
+
+                text = text.strip()
+                mentioned_colors = self.extract_colors_from_text(text)
+
+                if len(mentioned_colors) == 0:
                     continue
-                seen.add(text)
-                candidates.append(text)
 
-            if max_samples_per_object is not None:
-                limit = int(max_samples_per_object)
-                if limit <= 0:
-                    candidates = []
-                elif len(candidates) > limit:
-                    candidates = self.rng.sample(candidates, k=limit)
+                if text not in aug_text_to_colors:
+                    aug_text_to_colors[text] = set()
 
-            for text in candidates:
-                query_groups.setdefault(text, []).append(obj_idx)
+                for color in mentioned_colors:
+                    aug_text_to_colors[text].add(color)
 
-        return {
-            query_text: list(dict.fromkeys(obj_indices))
-            for query_text, obj_indices in query_groups.items()
-            if obj_indices
-        }
+        query_groups = {}
+
+        for aug_text, mentioned_colors in aug_text_to_colors.items():
+            obj_indices = []
+
+            for obj_idx, obj in enumerate(anns):
+                obj_colors = set(self.get_obj_colors(obj))
+                if len(obj_colors.intersection(mentioned_colors)) > 0:
+                    obj_indices.append(obj_idx)
+
+            if len(obj_indices) > 0:
+                query_groups[aug_text] = list(dict.fromkeys(obj_indices))
+
+        return query_groups
 
     def load_boxes_and_labels(self, anns):
         boxes = []
@@ -1301,9 +1263,8 @@ def build_dataloaders(
     num_workers=0,
     max_text_aug_per_image=1,
     random_seed=None,
-    use_query_text=True,
-    use_main_colors=False,
-    use_text_aug=False,
+    use_main_colors=True,
+    use_text_aug=True,
     normalize_boxes=True,
     clip_boxes=True,
     min_box_size=1.0,
@@ -1331,7 +1292,6 @@ def build_dataloaders(
         image_dir=train_image_dir,
         anno_paths=train_anno_paths,
         image_size=image_size,
-        use_query_text=use_query_text,
         use_main_colors=use_main_colors,
         use_text_aug=use_text_aug,
         max_text_aug_per_image=max_text_aug_per_image,
@@ -1353,7 +1313,6 @@ def build_dataloaders(
         image_dir=val_image_dir,
         anno_paths=val_anno_paths,
         image_size=image_size,
-        use_query_text=use_query_text,
         use_main_colors=use_main_colors,
         use_text_aug=use_text_aug,
         max_text_aug_per_image=max_text_aug_per_image,

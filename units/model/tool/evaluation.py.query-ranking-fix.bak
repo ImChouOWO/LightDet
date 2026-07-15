@@ -364,47 +364,6 @@ class BinaryDetectionAPAccumulator:
             "num_pred": int(self.num_pred),
         }
 
-class RankedRecallAtKAccumulator:
-    """Score-ranked Recall@K with one-to-one matching at IoU 0.50."""
-
-    def __init__(self, ks=(1, 5, 10), iou_threshold=0.50):
-        self.ks = tuple(sorted({max(1, int(value)) for value in ks}))
-        self.iou_threshold = float(iou_threshold)
-        self.num_gt = 0
-        self.hits = {value: 0 for value in self.ks}
-
-    def update(self, pred_boxes, pred_scores, gt_boxes):
-        pred_boxes = pred_boxes.detach().float().reshape(-1, 4).cpu()
-        pred_scores = pred_scores.detach().float().reshape(-1).cpu()
-        gt_boxes = gt_boxes.detach().float().reshape(-1, 4).cpu()
-        num_gt = int(gt_boxes.shape[0])
-        self.num_gt += num_gt
-        if num_gt == 0 or pred_boxes.shape[0] == 0:
-            return
-
-        order = torch.argsort(pred_scores, descending=True, stable=True)
-        iou_matrix = box_iou_xyxy(pred_boxes[order], gt_boxes)
-        for top_k in self.ks:
-            matched_gt = torch.zeros((num_gt,), dtype=torch.bool)
-            hit_count = 0
-            for prediction_index in range(min(top_k, iou_matrix.shape[0])):
-                candidate = iou_matrix[prediction_index].masked_fill(
-                    matched_gt, -1.0
-                )
-                best_iou, best_gt = candidate.max(dim=0)
-                if float(best_iou.item()) >= self.iou_threshold:
-                    matched_gt[best_gt] = True
-                    hit_count += 1
-            self.hits[top_k] += hit_count
-
-    def compute(self):
-        denominator = max(1, self.num_gt)
-        result = {"ranking_recall_iou": self.iou_threshold}
-        for top_k in self.ks:
-            result[f"recall50_at_{top_k}"] = self.hits[top_k] / denominator
-        return result
-
-
 class RawOracleRecallAccumulator:
     """
     使用全部 raw prediction 計算候選框覆蓋能力。
@@ -637,10 +596,6 @@ def validate_one_epoch(
         else None
     )
 
-    ranked_recall_metric = (
-        RankedRecallAtKAccumulator() if compute_metrics else None
-    )
-
     sample_count = 0
     skipped_empty_gt = 0
     total_selected = 0
@@ -791,14 +746,6 @@ def validate_one_epoch(
             if pred_scores.ndim == 3:
                 pred_scores = pred_scores.squeeze(-1)
 
-            if ranked_recall_metric is not None:
-                for raw_boxes, raw_scores, gt_boxes in zip(
-                    pred_bbox.detach(), pred_scores.detach(), gt_boxes_cpu
-                ):
-                    ranked_recall_metric.update(
-                        raw_boxes, raw_scores, gt_boxes
-                    )
-
             selected_batch = select_predictions_batch(
                 boxes=pred_bbox.detach(),
                 scores=pred_scores.detach(),
@@ -912,8 +859,6 @@ def validate_one_epoch(
         metric_start = time.perf_counter()
         eval_metrics = metric.compute()
         metric_time = time.perf_counter() - metric_start
-        if ranked_recall_metric is not None:
-            eval_metrics.update(ranked_recall_metric.compute())
 
         raw_oracle_time = 0.0
         if raw_oracle_metric is not None:
@@ -964,9 +909,6 @@ def validate_one_epoch(
             f"mAP50-95={eval_metrics['map50_95']:.4f} "
             f"P={eval_metrics['precision']:.4f} "
             f"R={eval_metrics['recall']:.4f} "
-            f"R@1={eval_metrics.get('recall50_at_1', 0.0):.4f} "
-            f"R@5={eval_metrics.get('recall50_at_5', 0.0):.4f} "
-            f"R@10={eval_metrics.get('recall50_at_10', 0.0):.4f} "
             f"TP={eval_metrics['tp']} "
             f"FP={eval_metrics['fp']} "
             f"GT={eval_metrics['num_gt']} "

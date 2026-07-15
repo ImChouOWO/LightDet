@@ -203,7 +203,7 @@ eval:
   max_val_batches: null
 
   score_thr: 0.001
-  top_k: 100
+  top_k: 20
   nms_iou_thr: 0.5
   use_nms: false
   use_topk_fallback: false
