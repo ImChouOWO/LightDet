@@ -1,7 +1,7 @@
 data:
   dataset_dir: datasets
   image_size: 1024
-  max_text_aug_per_image: 1
+  max_text_aug_per_image: 0
 
   cache_images: true
   image_cache_dir: datasets/.cache/images_1024_uint8
@@ -204,9 +204,9 @@ eval:
   best_metric: map50
 
 log:
-  save_dir: units/model/runs/train/lightdet_HDETR_transformer_layer_decoupled_v2
+  save_dir: units/model/runs/train/lightdet_HDETR_transformer_layer_decoupled_v3
   weights_path: null
-  resume_path: /home/soic/Desktop/LightDet/units/model/runs/train/lightdet_HDETR_transformer_layer_decoupled_v2/latest.pt
+  resume_path: null
   prefer_ema: true
 
   save_latest_interval: 1

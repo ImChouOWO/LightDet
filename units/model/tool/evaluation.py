@@ -637,8 +637,31 @@ def validate_one_epoch(
         else None
     )
 
-    ranked_recall_metric = (
-        RankedRecallAtKAccumulator() if compute_metrics else None
+    quality_recall_metric = (
+        RankedRecallAtKAccumulator(
+            ks=(1, 5, 10),
+            iou_threshold=0.50,
+        )
+        if compute_metrics
+        else None
+    )
+
+    text_recall_metric = (
+        RankedRecallAtKAccumulator(
+            ks=(1, 5, 10),
+            iou_threshold=0.50,
+        )
+        if compute_metrics
+        else None
+    )
+
+    final_recall_metric = (
+        RankedRecallAtKAccumulator(
+            ks=(1, 5, 10),
+            iou_threshold=0.50,
+        )
+        if compute_metrics
+        else None
     )
 
     sample_count = 0
@@ -706,12 +729,54 @@ def validate_one_epoch(
             )
 
             pred_bbox = outputs["bbox"]
-            pred_score_logit = get_score_logit(outputs)
+
+            # 正式 AP 與推論排序仍使用融合後的 final score。
+            final_score_logit = outputs.get(
+                "final_score_logit",
+                get_score_logit(outputs),
+            )
+
+            quality_score_logit = outputs.get(
+                "quality_logit",
+            )
+
+            text_score_logit = outputs.get(
+                "text_alignment_logit",
+            )
+
+            # 相容透過 tensor metadata 傳遞分支輸出的版本。
+            if quality_score_logit is None:
+                quality_score_logit = getattr(
+                    final_score_logit,
+                    "_quality_logit",
+                    None,
+                )
+
+            if text_score_logit is None:
+                text_score_logit = getattr(
+                    final_score_logit,
+                    "_text_alignment_logit",
+                    None,
+                )
+
+            if quality_score_logit is None:
+                raise RuntimeError(
+                    "Model output does not contain quality_logit"
+                )
+
+            if text_score_logit is None:
+                raise RuntimeError(
+                    "Model output does not contain text_alignment_logit"
+                )
+
+            pred_score_logit = final_score_logit
 
             if compute_loss:
                 loss, loss_dict = criterion(
                     pred_bbox=pred_bbox,
                     pred_score_logit=pred_score_logit,
+                    pred_quality_logit=quality_score_logit,
+                    pred_text_alignment_logit=text_score_logit,
                     targets=targets_device,
                     lambda_bbox=lambda_bbox,
                     lambda_giou=lambda_giou,
@@ -786,18 +851,57 @@ def validate_one_epoch(
                         gt_boxes=gt_boxes,
                     )
 
-            pred_scores = pred_score_logit.sigmoid()
+            quality_scores = quality_score_logit.float().sigmoid()
+            text_scores = text_score_logit.float().sigmoid()
+            final_scores = final_score_logit.float().sigmoid()
 
-            if pred_scores.ndim == 3:
-                pred_scores = pred_scores.squeeze(-1)
+            if quality_scores.ndim == 3:
+                quality_scores = quality_scores.squeeze(-1)
 
-            if ranked_recall_metric is not None:
-                for raw_boxes, raw_scores, gt_boxes in zip(
-                    pred_bbox.detach(), pred_scores.detach(), gt_boxes_cpu
+            if text_scores.ndim == 3:
+                text_scores = text_scores.squeeze(-1)
+
+            if final_scores.ndim == 3:
+                final_scores = final_scores.squeeze(-1)
+
+            if (
+                quality_recall_metric is not None
+                and text_recall_metric is not None
+                and final_recall_metric is not None
+            ):
+                for (
+                    raw_boxes,
+                    quality_scores_row,
+                    text_scores_row,
+                    final_scores_row,
+                    gt_boxes,
+                ) in zip(
+                    pred_bbox.detach(),
+                    quality_scores.detach(),
+                    text_scores.detach(),
+                    final_scores.detach(),
+                    gt_boxes_cpu,
                 ):
-                    ranked_recall_metric.update(
-                        raw_boxes, raw_scores, gt_boxes
+                    quality_recall_metric.update(
+                        pred_boxes=raw_boxes,
+                        pred_scores=quality_scores_row,
+                        gt_boxes=gt_boxes,
                     )
+
+                    text_recall_metric.update(
+                        pred_boxes=raw_boxes,
+                        pred_scores=text_scores_row,
+                        gt_boxes=gt_boxes,
+                    )
+
+                    final_recall_metric.update(
+                        pred_boxes=raw_boxes,
+                        pred_scores=final_scores_row,
+                        gt_boxes=gt_boxes,
+                    )
+
+            # 正式 mAP、Precision、Recall 和 Top-K 選框仍使用 final score。
+            pred_scores = final_scores
 
             selected_batch = select_predictions_batch(
                 boxes=pred_bbox.detach(),
@@ -912,8 +1016,44 @@ def validate_one_epoch(
         metric_start = time.perf_counter()
         eval_metrics = metric.compute()
         metric_time = time.perf_counter() - metric_start
-        if ranked_recall_metric is not None:
-            eval_metrics.update(ranked_recall_metric.compute())
+        recall_ks = (1, 5, 10)
+
+        if quality_recall_metric is not None:
+            quality_recall_metrics = quality_recall_metric.compute()
+
+            for top_k_value in recall_ks:
+                eval_metrics[
+                    f"quality_recall50_at_{top_k_value}"
+                ] = quality_recall_metrics[
+                    f"recall50_at_{top_k_value}"
+                ]
+
+        if text_recall_metric is not None:
+            text_recall_metrics = text_recall_metric.compute()
+
+            for top_k_value in recall_ks:
+                eval_metrics[
+                    f"text_recall50_at_{top_k_value}"
+                ] = text_recall_metrics[
+                    f"recall50_at_{top_k_value}"
+                ]
+
+        if final_recall_metric is not None:
+            final_recall_metrics = final_recall_metric.compute()
+
+            for top_k_value in recall_ks:
+                value = final_recall_metrics[
+                    f"recall50_at_{top_k_value}"
+                ]
+
+                eval_metrics[
+                    f"final_recall50_at_{top_k_value}"
+                ] = value
+
+                # 保留原本欄位名稱，避免舊的 train.py 或分析工具失效。
+                eval_metrics[
+                    f"recall50_at_{top_k_value}"
+                ] = value
 
         raw_oracle_time = 0.0
         if raw_oracle_metric is not None:
@@ -954,24 +1094,31 @@ def validate_one_epoch(
         })
 
         tqdm.write(
-            f"[Eval Timing] loop={validation_loop_time:.2f}s "
-            f"metric={metric_time:.2f}s "
-            f"raw_oracle={raw_oracle_time:.2f}s"
-        )
-        tqdm.write(
             f"Eval Epoch [{epoch}] "
             f"mAP50={eval_metrics['map50']:.4f} "
             f"mAP50-95={eval_metrics['map50_95']:.4f} "
             f"P={eval_metrics['precision']:.4f} "
             f"R={eval_metrics['recall']:.4f} "
-            f"R@1={eval_metrics.get('recall50_at_1', 0.0):.4f} "
-            f"R@5={eval_metrics.get('recall50_at_5', 0.0):.4f} "
-            f"R@10={eval_metrics.get('recall50_at_10', 0.0):.4f} "
             f"TP={eval_metrics['tp']} "
             f"FP={eval_metrics['fp']} "
             f"GT={eval_metrics['num_gt']} "
-            f"Pred={eval_metrics['num_pred']} "
-            f"skip_empty={eval_metrics['skipped_empty_gt']}"
+            f"Pred={eval_metrics['num_pred']}"
+        )
+
+        tqdm.write(
+            f"Recall50 [{epoch}] "
+            f"Quality="
+            f"{eval_metrics.get('quality_recall50_at_1', 0.0):.4f}/"
+            f"{eval_metrics.get('quality_recall50_at_5', 0.0):.4f}/"
+            f"{eval_metrics.get('quality_recall50_at_10', 0.0):.4f} "
+            f"Text="
+            f"{eval_metrics.get('text_recall50_at_1', 0.0):.4f}/"
+            f"{eval_metrics.get('text_recall50_at_5', 0.0):.4f}/"
+            f"{eval_metrics.get('text_recall50_at_10', 0.0):.4f} "
+            f"Final="
+            f"{eval_metrics.get('final_recall50_at_1', 0.0):.4f}/"
+            f"{eval_metrics.get('final_recall50_at_5', 0.0):.4f}/"
+            f"{eval_metrics.get('final_recall50_at_10', 0.0):.4f}"
         )
 
         if raw_oracle_metric is not None:
