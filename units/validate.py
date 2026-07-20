@@ -1011,7 +1011,7 @@ def main() -> None:
         workers=8,
         project="runs/val",
         name="lightdet_hybrid_best",
-        prefer_ema=True,
+        prefer_ema=False,
         compute_loss=False,
         save_json=True,
     )

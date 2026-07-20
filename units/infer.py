@@ -1265,21 +1265,18 @@ def main() -> None:
 
     model.predict(
         weights=(
-            "/home/soic/Desktop/LightDet/"
-            "units/model/runs/train/"
-            "lightdet_HDETR_object_query/"
-            "epoch_100.pt"
+            "/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_HDETR_transformer_layer_decoupled_v3/best_map50.pt"
         ),
         source=(
             "/home/soic/Desktop/datasetPreTest15000/dataset/datasetPreTest15000_mixed/images/train/2023_08_08_15_26_49_815814_1.jpg"
         ),
         text=[
-            "漂浮的浮標",
-            "一艘船",
+            "一輛計程車",
+            "一艘白色的船",
         ],
         imgsz=1024,
         device=0,
-        conf=0.64,
+        conf=0.4,
         top_k=20,
 
         # NMS 設定
@@ -1290,7 +1287,7 @@ def main() -> None:
         name="lightdet_hybrid",
 
         
-        prefer_ema=False,
+        prefer_ema=True,
 
         save=True,
         save_json=True,
