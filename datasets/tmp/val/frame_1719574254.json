@@ -1,0 +1,129 @@
+[
+  {
+    "name": "frame_1719574254_000.jpg",
+    "bbox_xyxy": [
+      1675,
+      679,
+      1736,
+      737
+    ],
+    "class_id": 0,
+    "source_name": "frame_1719574254",
+    "source_size": {
+      "width": 3840,
+      "height": 2160
+    },
+    "llm_output": "船體主要顏色：黑色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構",
+    "attributes": {
+      "main_colors": [
+        "黑色"
+      ],
+      "is_multicolor": false
+    },
+    "query_text": "黑色的船",
+    "query_texts_aug": [
+      "黑色的船",
+      "一艘黑色的船",
+      "黑色船隻",
+      "船體是黑色的船"
+    ],
+    "raw_text": "船體主要顏色：黑色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構"
+  },
+  {
+    "name": "frame_1719574254_001.jpg",
+    "bbox_xyxy": [
+      1728,
+      678,
+      1780,
+      743
+    ],
+    "class_id": 0,
+    "source_name": "frame_1719574254",
+    "source_size": {
+      "width": 3840,
+      "height": 2160
+    },
+    "llm_output": "船體主要顏色：灰色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構",
+    "attributes": {
+      "main_colors": [
+        "灰色"
+      ],
+      "is_multicolor": false
+    },
+    "query_text": "灰色的船",
+    "query_texts_aug": [
+      "灰色的船",
+      "一艘灰色的船",
+      "灰色船隻",
+      "船體是灰色的船"
+    ],
+    "raw_text": "船體主要顏色：灰色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構"
+  },
+  {
+    "name": "frame_1719574254_002.jpg",
+    "bbox_xyxy": [
+      1779,
+      665,
+      1838,
+      738
+    ],
+    "class_id": 0,
+    "source_name": "frame_1719574254",
+    "source_size": {
+      "width": 3840,
+      "height": 2160
+    },
+    "llm_output": "船體主要顏色：白色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構",
+    "attributes": {
+      "main_colors": [
+        "白色"
+      ],
+      "is_multicolor": false
+    },
+    "query_text": "白色的船",
+    "query_texts_aug": [
+      "白色的船",
+      "一艘白色的船",
+      "白色船隻",
+      "船體是白色的船"
+    ],
+    "raw_text": "船體主要顏色：白色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構"
+  },
+  {
+    "name": "frame_1719574254_003.jpg",
+    "bbox_xyxy": [
+      1408,
+      225,
+      3345,
+      982
+    ],
+    "class_id": 0,
+    "source_name": "frame_1719574254",
+    "source_size": {
+      "width": 3840,
+      "height": 2160
+    },
+    "llm_output": "船體主要顏色：藍色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：船體上寫有“OPTIC MARINE”字樣。",
+    "attributes": {
+      "main_colors": [
+        "藍色"
+      ],
+      "is_multicolor": false
+    },
+    "query_text": "藍色的船",
+    "query_texts_aug": [
+      "藍色的船",
+      "一艘藍色的船",
+      "藍色船隻",
+      "船體是藍色的船",
+      "有船體上寫有“OPTIC MARINE”字樣的船",
+      "具有船體上寫有“OPTIC MARINE”字樣的船",
+      "船體上寫有“OPTIC MARINE”字樣的船",
+      "藍色的船，有船體上寫有“OPTIC MARINE”字樣",
+      "藍色的船，具有船體上寫有“OPTIC MARINE”字樣",
+      "有船體上寫有“OPTIC MARINE”字樣的藍色的船",
+      "藍色的船，外觀上有船體上寫有“OPTIC MARINE”字樣"
+    ],
+    "raw_text": "船體主要顏色：藍色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：船體上寫有“OPTIC MARINE”字樣。"
+  }
+]

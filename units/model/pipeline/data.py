@@ -1,19 +1,21 @@
-import os
-import json
-import random
+from __future__ import annotations
+
 import hashlib
+import json
 import math
-import bisect
-from typing import Any, Dict, List, Optional, Tuple
+import os
+import random
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
-from torch.utils.data import Dataset, DataLoader, Sampler
 from PIL import Image
+from torch.utils.data import DataLoader, Dataset, Sampler
+from tqdm import tqdm
 
 import torchvision.transforms.functional as TF
 from torchvision.transforms import InterpolationMode
-from tqdm import tqdm
 
 
 IMAGE_EXTS = [
@@ -26,151 +28,427 @@ IMAGE_EXTS = [
     ".webp",
 ]
 
-CACHE_VERSION = "lightdet_uint8_image_cache_v3_gpu_decode"
-DEFAULT_NEGATIVE_QUERY_POOL_FILENAME = "negative_query_pool.json"
-DEFAULT_NEGATIVE_QUERY_POOL_PATH = os.path.abspath(
-    os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "cards",
-        "cache",
-        DEFAULT_NEGATIVE_QUERY_POOL_FILENAME,
-    )
-)
-DEFAULT_NEGATIVE_QUERY_POOL_CONTENT = {
-    "version": 1,
-    "categories": {
-        "hard": {
-            "sampling_weight": 1.0,
-            "loss_weight": 3.0,
-            "queries": [],
-        },
-        "severe": {
-            "sampling_weight": 1.0,
-            "loss_weight": 8.0,
-            "queries": [],
-        },
-    },
-}
+CACHE_VERSION = "lightdet_uint8_image_cache_v4_odvg"
 
 
-def ensure_negative_query_pool_file(path: Optional[str]) -> Optional[str]:
-    """Create an empty JSON query-pool template when the file does not exist."""
-    if path is None:
-        return None
+class ODVGFormatError(ValueError):
+    """Raised when an annotation does not follow the required ODVG schema."""
 
-    path = os.path.abspath(str(path))
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
 
-    if not os.path.exists(path):
-        temporary_path = path + ".tmp"
-        with open(temporary_path, "w", encoding="utf-8") as file:
-            json.dump(
-                DEFAULT_NEGATIVE_QUERY_POOL_CONTENT,
-                file,
-                ensure_ascii=False,
-                indent=2,
+def _clean_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def _as_int(value: Any, *, name: str) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as error:
+        raise ODVGFormatError(f"{name} must be an integer, got {value!r}") from error
+    return result
+
+
+def _parse_bbox_list(value: Any, *, context: str) -> List[List[float]]:
+    """
+    Accept both ODVG bbox forms:
+      [x1, y1, x2, y2]
+      [[x1, y1, x2, y2], ...]
+    """
+    if not isinstance(value, list) or not value:
+        raise ODVGFormatError(f"{context}.bbox must be a non-empty list")
+
+    if len(value) == 4 and all(isinstance(v, (int, float)) for v in value):
+        candidates = [value]
+    else:
+        candidates = value
+
+    boxes: List[List[float]] = []
+    for box_index, box in enumerate(candidates):
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            raise ODVGFormatError(
+                f"{context}.bbox[{box_index}] must have four values, got {box!r}"
             )
-            file.write("\n")
-        os.replace(temporary_path, path)
 
-    return path
+        try:
+            x1, y1, x2, y2 = (float(v) for v in box)
+        except (TypeError, ValueError) as error:
+            raise ODVGFormatError(
+                f"{context}.bbox[{box_index}] contains a non-numeric value: {box!r}"
+            ) from error
+
+        x1, x2 = min(x1, x2), max(x1, x2)
+        y1, y2 = min(y1, y2), max(y1, y2)
+        if x2 <= x1 or y2 <= y1:
+            raise ODVGFormatError(
+                f"{context}.bbox[{box_index}] has zero/negative area: {box!r}"
+            )
+
+        boxes.append([x1, y1, x2, y2])
+
+    return boxes
 
 
-def load_negative_query_pool(path: Optional[str]) -> List[Dict[str, Any]]:
-    """
-    Load the JSON pool once during Dataset initialization.
+def _parse_char_spans(
+    value: Any,
+    *,
+    caption: str,
+    phrase: str,
+    context: str,
+) -> List[List[int]]:
+    if not isinstance(value, list) or not value:
+        raise ODVGFormatError(
+            f"{context}.tokens_positive must be a non-empty list"
+        )
 
-    Preferred schema:
-    {
-      "version": 1,
-      "categories": {
-        "hard": {
-          "sampling_weight": 1.0,
-          "loss_weight": 3.0,
-          "queries": []
-        },
-        "severe": {
-          "sampling_weight": 1.0,
-          "loss_weight": 8.0,
-          "queries": []
-        }
-      }
+    spans: List[List[int]] = []
+    seen = set()
+
+    for span_index, span in enumerate(value):
+        if not isinstance(span, (list, tuple)) or len(span) != 2:
+            raise ODVGFormatError(
+                f"{context}.tokens_positive[{span_index}] must be [start, end]"
+            )
+
+        start = _as_int(span[0], name=f"{context}.tokens_positive[{span_index}][0]")
+        end = _as_int(span[1], name=f"{context}.tokens_positive[{span_index}][1]")
+
+        if not (0 <= start < end <= len(caption)):
+            raise ODVGFormatError(
+                f"{context}.tokens_positive[{span_index}] is outside caption: "
+                f"[{start}, {end}], caption_length={len(caption)}"
+            )
+
+        key = (start, end)
+        if key not in seen:
+            spans.append([start, end])
+            seen.add(key)
+
+    # The converter currently emits one contiguous span per phrase. Enforce the
+    # exact mapping in that common case and still allow standard multi-span ODVG.
+    if len(spans) == 1:
+        start, end = spans[0]
+        actual = caption[start:end]
+        if actual != phrase:
+            raise ODVGFormatError(
+                f"{context}: caption[{start}:{end}]={actual!r} does not match "
+                f"phrase={phrase!r}"
+            )
+
+    return spans
+
+
+def validate_odvg_record(record: Any, *, anno_path: str = "") -> Dict[str, Any]:
+    prefix = f"{anno_path}: " if anno_path else ""
+
+    if not isinstance(record, dict):
+        raise ODVGFormatError(
+            prefix + "annotation root must be an ODVG JSON object, not a list"
+        )
+
+    filename = _clean_text(record.get("filename"))
+    if not filename:
+        raise ODVGFormatError(prefix + "missing filename")
+
+    width = _as_int(record.get("width"), name=prefix + "width")
+    height = _as_int(record.get("height"), name=prefix + "height")
+    if width <= 0 or height <= 0:
+        raise ODVGFormatError(
+            prefix + f"invalid image size: width={width}, height={height}"
+        )
+
+    grounding = record.get("grounding")
+    if not isinstance(grounding, dict):
+        raise ODVGFormatError(prefix + "missing grounding object")
+
+    caption = grounding.get("caption")
+    if not isinstance(caption, str) or not caption.strip():
+        raise ODVGFormatError(prefix + "grounding.caption must be a non-empty string")
+
+    regions = grounding.get("regions")
+    if not isinstance(regions, list) or not regions:
+        raise ODVGFormatError(prefix + "grounding.regions must be a non-empty list")
+
+    normalized_regions: List[Dict[str, Any]] = []
+    for region_index, region in enumerate(regions):
+        context = prefix + f"grounding.regions[{region_index}]"
+        if not isinstance(region, dict):
+            raise ODVGFormatError(context + " must be an object")
+
+        phrase = _clean_text(region.get("phrase"))
+        if not phrase:
+            raise ODVGFormatError(context + ".phrase must be non-empty")
+
+        semantic_key = _clean_text(region.get("semantic_key"))
+        if not semantic_key:
+            # Standard ODVG does not require this field, but the LightDet
+            # converter emits it. Keep a deterministic fallback.
+            semantic_key = f"region:{region_index}:{phrase}"
+
+        spans = _parse_char_spans(
+            region.get("tokens_positive"),
+            caption=caption,
+            phrase=phrase,
+            context=context,
+        )
+        boxes = _parse_bbox_list(region.get("bbox"), context=context)
+
+        for box_index, (x1, y1, x2, y2) in enumerate(boxes):
+            if x1 < 0 or y1 < 0 or x2 > width or y2 > height:
+                raise ODVGFormatError(
+                    f"{context}.bbox[{box_index}] exceeds annotation size "
+                    f"({width}, {height}): {[x1, y1, x2, y2]}"
+                )
+
+        normalized_regions.append(
+            {
+                "region_index": region_index,
+                "semantic_key": semantic_key,
+                "phrase": phrase,
+                "tokens_positive": spans,
+                "bbox": boxes,
+            }
+        )
+
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    return {
+        "filename": filename,
+        "width": width,
+        "height": height,
+        "caption": caption,
+        "regions": normalized_regions,
+        "metadata": metadata,
     }
+
+
+def _bbox_identity(box: Sequence[float], precision: int = 4) -> Tuple[float, ...]:
+    return tuple(round(float(value), precision) for value in box)
+
+
+def merge_regions_to_unique_targets(
+    regions: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
     """
-    path = ensure_negative_query_pool_file(path)
+    Merge repeated physical boxes across phrases.
+
+    Example:
+      exact-color phrase -> box A
+      contains-green phrase -> box A, box B
+
+    The output has unique targets [A, B]. Target A receives both positive
+    character-span groups rather than becoming two duplicate Hungarian GT boxes.
+    """
+    targets: List[Dict[str, Any]] = []
+    box_to_target: Dict[Tuple[float, ...], int] = {}
+    region_to_target_indices: List[List[int]] = []
+
+    for region in regions:
+        target_indices: List[int] = []
+
+        for box in region["bbox"]:
+            box_key = _bbox_identity(box)
+            target_index = box_to_target.get(box_key)
+
+            if target_index is None:
+                target_index = len(targets)
+                box_to_target[box_key] = target_index
+                targets.append(
+                    {
+                        "bbox": list(box),
+                        "positive_char_spans": [],
+                        "phrases": [],
+                        "semantic_keys": [],
+                        "region_indices": [],
+                    }
+                )
+
+            target = targets[target_index]
+
+            for span in region["tokens_positive"]:
+                normalized_span = [int(span[0]), int(span[1])]
+                if normalized_span not in target["positive_char_spans"]:
+                    target["positive_char_spans"].append(normalized_span)
+
+            phrase = region["phrase"]
+            if phrase not in target["phrases"]:
+                target["phrases"].append(phrase)
+
+            semantic_key = region["semantic_key"]
+            if semantic_key not in target["semantic_keys"]:
+                target["semantic_keys"].append(semantic_key)
+
+            region_index = int(region["region_index"])
+            if region_index not in target["region_indices"]:
+                target["region_indices"].append(region_index)
+
+            target_indices.append(target_index)
+
+        region_to_target_indices.append(list(dict.fromkeys(target_indices)))
+
+    if not targets:
+        raise ODVGFormatError("ODVG record produced no target boxes")
+
+    return {
+        "targets": targets,
+        "region_to_target_indices": region_to_target_indices,
+    }
+
+
+def _flatten_negative_phrase_pool(value: Any) -> List[str]:
+    """
+    Accept common JSON pool layouts:
+
+      ["黃色的船", "大型貨輪"]
+      {"phrases": [...]}
+      {"negative_phrases": [...]}
+      {"color": [...], "type": [...]}
+    """
+    collected: List[str] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                collected.append(text)
+            return
+
+        if isinstance(item, dict):
+            preferred_keys = (
+                "phrases",
+                "negative_phrases",
+                "queries",
+                "items",
+                "data",
+            )
+            preferred_found = False
+
+            for key in preferred_keys:
+                if key in item:
+                    visit(item[key])
+                    preferred_found = True
+
+            if not preferred_found:
+                for child in item.values():
+                    visit(child)
+            return
+
+        if isinstance(item, (list, tuple, set)):
+            for child in item:
+                visit(child)
+
+    visit(value)
+
+    unique: List[str] = []
+    seen = set()
+
+    for phrase in collected:
+        if phrase in seen:
+            continue
+        unique.append(phrase)
+        seen.add(phrase)
+
+    return unique
+
+
+def load_negative_phrase_pool(
+    path: Optional[str],
+) -> List[str]:
     if path is None:
         return []
 
-    with open(path, "r", encoding="utf-8") as file:
-        data = json.load(file)
+    resolved = os.path.abspath(str(path))
 
-    if not isinstance(data, dict):
-        raise ValueError(
-            "negative query pool must be a JSON object containing 'categories'"
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(
+            f"ODVG negative phrase pool not found: {resolved}"
         )
 
-    categories = data.get("categories", data)
-    if not isinstance(categories, dict):
-        raise ValueError("negative query pool 'categories' must be a JSON object")
+    with open(
+        resolved,
+        "r",
+        encoding="utf-8",
+    ) as file:
+        value = json.load(file)
 
-    entries: List[Dict[str, Any]] = []
-    seen = set()
+    phrases = _flatten_negative_phrase_pool(value)
 
-    for category, config in categories.items():
-        if isinstance(config, list):
-            queries = config
-            sampling_weight = 1.0
-            loss_weight = 1.0
-        elif isinstance(config, dict):
-            queries = config.get("queries", [])
-            sampling_weight = config.get("sampling_weight", 1.0)
-            loss_weight = config.get("loss_weight", 1.0)
-        else:
-            raise ValueError(
-                f"negative category '{category}' must be an object or list"
+    if not phrases:
+        raise ValueError(
+            "ODVG negative phrase pool contains no usable strings: "
+            f"{resolved}"
+        )
+
+    return phrases
+
+
+def append_negative_phrases_to_caption(
+    caption: str,
+    negative_phrases: Sequence[str],
+    separator: str = "；負向描述：",
+) -> Tuple[str, List[List[int]]]:
+    """
+    Append unmatched phrases to a caption and return their character spans.
+
+    Positive ODVG spans remain unchanged because text is appended only at the
+    end. These phrases receive no target box and therefore become token-level
+    negatives in GroundingLoss.
+    """
+    caption = str(caption)
+    phrases = [
+        str(value).strip()
+        for value in negative_phrases
+        if str(value).strip()
+    ]
+
+    if not phrases:
+        return caption, []
+
+    suffix = str(separator) + "、".join(phrases)
+    extended = caption + suffix
+
+    spans: List[List[int]] = []
+    search_start = len(caption) + len(str(separator))
+
+    for phrase in phrases:
+        position = extended.find(
+            phrase,
+            search_start,
+        )
+
+        if position < 0:
+            raise RuntimeError(
+                f"Failed to locate appended negative phrase: {phrase!r}"
             )
 
-        if not isinstance(queries, list):
-            raise ValueError(
-                f"negative category '{category}'.queries must be a list"
-            )
+        end = position + len(phrase)
+        spans.append([
+            int(position),
+            int(end),
+        ])
+        search_start = end
 
-        sampling_weight = max(0.0, float(sampling_weight))
-        loss_weight = max(1.0, float(loss_weight))
-
-        for query in queries:
-            query = str(query).strip()
-            if not query:
-                continue
-
-            dedup_key = (str(category), query)
-            if dedup_key in seen:
-                continue
-            seen.add(dedup_key)
-
-            entries.append({
-                "query_text": query,
-                "negative_type": str(category),
-                "sampling_weight": sampling_weight,
-                "loss_weight": loss_weight,
-            })
-
-    return entries
+    return extended, spans
 
 
 class ShipGroundingDataset(Dataset):
+    """
+    ODVG-only LightDet dataset.
+
+    Dataset unit:
+      one image + one complete caption + all grounding regions.
+
+    Legacy object-list annotations, query_text grouping, main-color grouping and
+    query_texts_aug sampling are intentionally unsupported.
+    """
+
     def __init__(
         self,
         image_dir: str,
         anno_paths: List[str],
         image_size: Tuple[int, int] = (640, 640),
-        use_query_text: bool = True,
-        use_main_colors: bool = False,
-        use_text_aug: bool = False,
-        max_text_aug_per_image: Optional[int] = 1,
         random_seed: Optional[int] = None,
         normalize_boxes: bool = True,
         clip_boxes: bool = True,
@@ -178,57 +456,63 @@ class ShipGroundingDataset(Dataset):
         image_mean: Optional[Tuple[float, float, float]] = None,
         image_std: Optional[Tuple[float, float, float]] = None,
         strict_image: bool = True,
+        strict_size: bool = True,
         cache_images: bool = False,
         image_cache_dir: Optional[str] = None,
         prebuild_image_cache: bool = False,
-        negative_query_path: Optional[str] = None,
-        negative_sample_ratio: float = 0.05,
-    ):
-        self.image_dir = image_dir
-        self.anno_paths = anno_paths
-        self.image_size = image_size
-
-        self.use_query_text = bool(use_query_text)
-        self.use_main_colors = bool(use_main_colors)
-        self.use_text_aug = bool(use_text_aug)
-        self.max_text_aug_per_image = max_text_aug_per_image
-
-        self.normalize_boxes = normalize_boxes
-        self.clip_boxes = clip_boxes
-        self.min_box_size = min_box_size
-
+        negative_phrase_pool_path: Optional[str] = None,
+        negative_phrase_ratio: float = 0.0,
+        negative_phrase_max_per_image: int = 3,
+        enable_negative_phrases: bool = False,
+        negative_phrase_separator: str = "；負向描述：",
+    ) -> None:
+        self.image_dir = os.path.abspath(str(image_dir))
+        self.anno_paths = [os.path.abspath(str(path)) for path in anno_paths]
+        self.image_size = tuple(int(v) for v in image_size)
+        self.normalize_boxes = bool(normalize_boxes)
+        self.clip_boxes = bool(clip_boxes)
+        self.min_box_size = float(min_box_size)
         self.image_mean = image_mean
         self.image_std = image_std
+        self.strict_image = bool(strict_image)
+        self.strict_size = bool(strict_size)
+        self.random_seed = int(random_seed or 0)
+        self.rng = random.Random(self.random_seed)
 
-        self.strict_image = strict_image
-        self.rng = random.Random(random_seed)
+        self.negative_phrase_pool_path = negative_phrase_pool_path
+        self.negative_phrase_ratio = max(
+            0.0,
+            float(negative_phrase_ratio),
+        )
+        self.negative_phrase_max_per_image = max(
+            0,
+            int(negative_phrase_max_per_image),
+        )
+        self.enable_negative_phrases = bool(
+            enable_negative_phrases
+            and self.negative_phrase_ratio > 0.0
+            and self.negative_phrase_max_per_image > 0
+        )
+        self.negative_phrase_separator = str(
+            negative_phrase_separator
+        )
+        self.negative_phrase_pool = (
+            load_negative_phrase_pool(
+                negative_phrase_pool_path
+            )
+            if self.enable_negative_phrases
+            else []
+        )
 
         self.cache_images = bool(cache_images)
         self.image_cache_dir = image_cache_dir
         self.prebuild_image_cache = bool(prebuild_image_cache)
         self.require_cache_ready = bool(self.cache_images and self.prebuild_image_cache)
-        self.image_level_batching = bool(self.cache_images and self.prebuild_image_cache)
-        self.image_cache_map = {}
 
-        self.negative_query_path = ensure_negative_query_pool_file(
-            negative_query_path
-        )
-        self.negative_sample_ratio = min(
-            max(0.0, float(negative_sample_ratio)),
-            1.0,
-        )
-        self.negative_query_pool = load_negative_query_pool(
-            self.negative_query_path
-        )
-        self.negative_rng = random.Random(
-            None if random_seed is None else int(random_seed) + 1000003
-        )
-        self._negative_sampling_cumulative = []
-        cumulative_weight = 0.0
-        for entry in self.negative_query_pool:
-            cumulative_weight += float(entry["sampling_weight"])
-            self._negative_sampling_cumulative.append(cumulative_weight)
-        self._negative_sampling_total = cumulative_weight
+        # ODVG is always image-level. QueryBudgetBatchSampler uses region count as
+        # an annotation budget so the existing YAML batch_size remains practical.
+        self.image_level_batching = True
+        self.image_cache_map: Dict[str, str] = {}
 
         if self.cache_images:
             if self.image_cache_dir is None:
@@ -237,534 +521,191 @@ class ShipGroundingDataset(Dataset):
                     self.image_dir,
                     f".lightdet_cache_uint8_{target_h}x{target_w}",
                 )
+            self.image_cache_dir = os.path.abspath(str(self.image_cache_dir))
             os.makedirs(self.image_cache_dir, exist_ok=True)
 
-        self.samples = []
-        self.image_paths = []
-        self.annos = []
+        self.records: List[Dict[str, Any]] = []
+        self.annos = self.records  # retained name for existing diagnostics
+        self.image_paths: List[str] = []
+        self.samples: List[Dict[str, Any]] = []
 
         for anno_path in self.anno_paths:
-            with open(anno_path, "r", encoding="utf-8") as f:
-                anns = json.load(f)
+            with open(anno_path, "r", encoding="utf-8") as file:
+                raw_record = json.load(file)
 
-            if not isinstance(anns, list) or len(anns) == 0:
-                continue
+            record = validate_odvg_record(raw_record, anno_path=anno_path)
+            merged = merge_regions_to_unique_targets(record["regions"])
+            record["unique_targets"] = merged["targets"]
+            record["region_to_target_indices"] = merged["region_to_target_indices"]
 
-            source_name = anns[0].get("source_name", "")
-            image_path = self.find_image_path(source_name)
-
+            image_path = self.find_image_path(record["filename"])
             if image_path is None:
                 if self.strict_image:
                     raise FileNotFoundError(
-                        f"Image not found for source_name={source_name}, anno={anno_path}"
+                        f"Image not found: filename={record['filename']}, "
+                        f"image_dir={self.image_dir}, anno={anno_path}"
                     )
                 continue
 
-            anno_idx = len(self.annos)
+            record_index = len(self.records)
+            source_name = _clean_text(record["metadata"].get("source_name"))
+            if not source_name:
+                source_name = os.path.splitext(record["filename"])[0]
+
+            self.records.append(record)
             self.image_paths.append(image_path)
-            self.annos.append(anns)
-
-            query_text_groups = (
-                self.build_query_text_groups(anns)
-                if self.use_query_text
-                else {}
-            )
-            main_color_groups = (
-                self.build_main_color_groups(anns)
-                if self.use_main_colors
-                else {}
-            )
-            text_aug_groups = (
-                self.build_text_aug_groups(
-                    anns,
-                    max_samples_per_object=self.max_text_aug_per_image,
-                )
-                if self.use_text_aug
-                else {}
+            self.samples.append(
+                {
+                    "anno_idx": record_index,
+                    "caption": record["caption"],
+                    # Temporary runtime alias: existing BERT precompute code reads
+                    # sample["query_text"]. The annotation source remains ODVG-only.
+                    "query_text": record["caption"],
+                    "region_count": len(record["regions"]),
+                    "target_count": len(record["unique_targets"]),
+                    "source_name": source_name,
+                }
             )
 
-            for query_text, obj_indices in query_text_groups.items():
-                if obj_indices:
-                    self.samples.append({
-                        "anno_idx": anno_idx,
-                        "query_text": query_text,
-                        "obj_indices": obj_indices,
-                        "group_source": "query_text",
-                    })
+        if not self.records:
+            raise RuntimeError(
+                "No valid ODVG annotations were loaded. "
+                "Expected JSON objects with grounding.caption and grounding.regions."
+            )
 
-            for query_text, obj_indices in main_color_groups.items():
-                if obj_indices:
-                    self.samples.append({
-                        "anno_idx": anno_idx,
-                        "query_text": query_text,
-                        "obj_indices": obj_indices,
-                        "group_source": "main_colors",
-                    })
-
-            for query_text, obj_indices in text_aug_groups.items():
-                if obj_indices:
-                    self.samples.append({
-                        "anno_idx": anno_idx,
-                        "query_text": query_text,
-                        "obj_indices": obj_indices,
-                        "group_source": "query_texts_aug",
-                    })
-
-        self.samples_by_anno = [[] for _ in range(len(self.annos))]
-        for sample in self.samples:
-            self.samples_by_anno[sample["anno_idx"]].append(sample)
-
-        self.add_negative_query_samples()
-
-        self.image_level_indices = [
-            idx for idx, samples in enumerate(self.samples_by_anno)
-            if len(samples) > 0
-        ]
-
+        self.image_level_indices = list(range(len(self.records)))
         self.queries_per_image = max(
             1,
-            int(math.ceil(len(self.samples) / max(1, len(self.image_level_indices))))
+            int(
+                math.ceil(
+                    sum(max(1, len(record["regions"])) for record in self.records)
+                    / len(self.records)
+                )
+            ),
         )
 
-    def sample_negative_query_entry(
-        self,
-        true_queries: set,
-    ) -> Optional[Dict[str, Any]]:
-        if not self.negative_query_pool or self._negative_sampling_total <= 0:
-            return None
-
-        # Most severe negatives never overlap with the positive query set. A few
-        # bounded retries keep selection O(log N) without rebuilding candidates.
-        for _ in range(16):
-            value = self.negative_rng.random() * self._negative_sampling_total
-            index = bisect.bisect_left(
-                self._negative_sampling_cumulative,
-                value,
-            )
-            index = min(index, len(self.negative_query_pool) - 1)
-            entry = self.negative_query_pool[index]
-            if entry["query_text"] not in true_queries:
-                return entry
-
-        # Rare fallback when the pool heavily overlaps the current image.
-        for entry in self.negative_query_pool:
-            if (
-                float(entry["sampling_weight"]) > 0
-                and entry["query_text"] not in true_queries
-            ):
-                return entry
-        return None
-
-    def add_negative_query_samples(self) -> None:
-        """
-        Add exactly about negative_sample_ratio of the current positive queries.
-
-        Negative samples are generated once during Dataset initialization. They
-        therefore add no JSON parsing, candidate construction or random sampling
-        cost inside __getitem__ or the training loop.
-        """
-        if self.negative_sample_ratio <= 0:
-            return
-        if not self.negative_query_pool or self._negative_sampling_total <= 0:
-            return
-
-        positive_count = len(self.samples)
-        if positive_count == 0:
-            return
-
-        negative_count = int(round(positive_count * self.negative_sample_ratio))
-        if negative_count <= 0:
-            return
-
-        if negative_count <= positive_count:
-            selected_indices = self.negative_rng.sample(
-                range(positive_count),
-                k=negative_count,
-            )
-        else:
-            selected_indices = [
-                self.negative_rng.randrange(positive_count)
-                for _ in range(negative_count)
-            ]
-
-        negative_samples = []
-        for sample_index in selected_indices:
-            source_sample = self.samples[sample_index]
-            anno_idx = int(source_sample["anno_idx"])
-            true_queries = {
-                str(sample.get("query_text", "")).strip()
-                for sample in self.samples_by_anno[anno_idx]
-                if str(sample.get("query_text", "")).strip()
-            }
-            entry = self.sample_negative_query_entry(true_queries)
-            if entry is None:
-                continue
-
-            negative_sample = {
-                "anno_idx": anno_idx,
-                "query_text": entry["query_text"],
-                "obj_indices": [],
-                "group_source": "negative_text",
-                "negative_type": entry["negative_type"],
-                "query_loss_weight": float(entry["loss_weight"]),
-                "is_text_negative": True,
-            }
-            negative_samples.append(negative_sample)
-            self.samples_by_anno[anno_idx].append(negative_sample)
-
-        self.samples.extend(negative_samples)
-
-    def __len__(self):
-        if self.image_level_batching:
-            return len(self.image_level_indices)
-        return len(self.samples)
+    def __len__(self) -> int:
+        return len(self.records)
 
     def get_query_count_for_dataset_index(self, idx: int) -> int:
-        if self.image_level_batching:
-            anno_idx = self.image_level_indices[int(idx)]
-            return len(self.samples_by_anno[anno_idx])
-        return 1
+        record = self.records[int(idx)]
+        return max(1, len(record["regions"]))
 
-    def find_image_path(self, source_name: str) -> Optional[str]:
-        if not isinstance(source_name, str) or not source_name.strip():
+    def find_image_path(self, filename: str) -> Optional[str]:
+        filename = _clean_text(filename)
+        if not filename:
             return None
 
-        source_name = source_name.strip()
-        base, ext = os.path.splitext(source_name)
-        candidates = []
+        direct_path = os.path.join(self.image_dir, filename)
+        if os.path.isfile(direct_path):
+            return direct_path
+
+        stem, ext = os.path.splitext(filename)
+        candidates: List[str] = []
 
         if ext:
-            candidates.append(os.path.join(self.image_dir, source_name))
+            candidates.extend(
+                os.path.join(self.image_dir, stem + image_ext)
+                for image_ext in IMAGE_EXTS
+            )
         else:
-            candidates.append(os.path.join(self.image_dir, source_name + ".jpg"))
-            for image_ext in IMAGE_EXTS:
-                candidates.append(os.path.join(self.image_dir, source_name + image_ext))
+            candidates.extend(
+                os.path.join(self.image_dir, filename + image_ext)
+                for image_ext in IMAGE_EXTS
+            )
 
         for path in candidates:
-            if os.path.exists(path):
+            if os.path.isfile(path):
                 return path
 
         return None
 
-    def sample_text_aug_groups(self, text_aug_groups, max_samples=1):
-        if not isinstance(text_aug_groups, dict):
-            return {}
-        if len(text_aug_groups) == 0:
-            return {}
-        if max_samples is None:
-            return text_aug_groups
-        if max_samples <= 0:
-            return {}
-
-        keys = list(text_aug_groups.keys())
-        sampled_keys = self.rng.sample(keys, k=min(max_samples, len(keys)))
-
-        return {key: text_aug_groups[key] for key in sampled_keys}
-
-    def normalize_color(self, color):
-        if not isinstance(color, str):
-            return ""
-
-        color = color.strip()
-
-        alias = {
-            "白": "白色",
-            "黑": "黑色",
-            "紅": "紅色",
-            "藍": "藍色",
-            "綠": "綠色",
-            "黃": "黃色",
-            "灰": "灰色",
-            "橘": "橘色",
-            "棕": "棕色",
-            "紫": "紫色",
-            "銀": "銀色",
-            "金": "金色",
-            "白色": "白色",
-            "黑色": "黑色",
-            "紅色": "紅色",
-            "藍色": "藍色",
-            "綠色": "綠色",
-            "黃色": "黃色",
-            "灰色": "灰色",
-            "橘色": "橘色",
-            "棕色": "棕色",
-            "紫色": "紫色",
-            "銀色": "銀色",
-            "金色": "金色",
-        }
-
-        return alias.get(color, color)
-
-    def get_obj_colors(self, obj):
-        attributes = obj.get("attributes", {})
-        colors = attributes.get("main_colors", [])
-
-        if not isinstance(colors, list):
-            return []
-
-        results = []
-        for color in colors:
-            color = self.normalize_color(color)
-            if color:
-                results.append(color)
-
-        return list(dict.fromkeys(results))
-
-    def is_valid_query_text(self, text):
-        if not isinstance(text, str):
-            return False
-
-        text = text.strip()
-        if not text:
-            return False
-
-        bad_keywords = [
-            "否、未觀察到對應結構",
-            "未觀察到對應結構",
-            "無法判斷",
-            "不確定",
-            "未知",
-            "none",
-            "null",
-        ]
-
-        for kw in bad_keywords:
-            if kw in text:
-                return False
-
-        return True
-
-    def build_query_text_groups(self, anns):
-        """Bind every query_text to the object that produced it."""
-        query_groups = {}
-        for obj_idx, obj in enumerate(anns):
-            query_text = str(obj.get("query_text", "")).strip()
-            if not self.is_valid_query_text(query_text):
-                continue
-            query_groups.setdefault(query_text, []).append(obj_idx)
-
-        return {
-            query_text: list(dict.fromkeys(obj_indices))
-            for query_text, obj_indices in query_groups.items()
-            if obj_indices
-        }
-
-    def extract_colors_from_text(self, text):
-        if not isinstance(text, str):
-            return []
-
-        color_keywords = [
-            "白色", "黑色", "紅色", "藍色", "綠色", "黃色",
-            "灰色", "橘色", "棕色", "紫色", "銀色", "金色",
-            "白", "黑", "紅", "藍", "綠", "黃",
-            "灰", "橘", "棕", "紫", "銀", "金",
-        ]
-
-        found = []
-        for color in color_keywords:
-            if color in text:
-                norm_color = self.normalize_color(color)
-                if norm_color:
-                    found.append(norm_color)
-
-        return list(dict.fromkeys(found))
-
-    def build_main_color_queries(self, color):
-        return [
-            f"{color}的船",
-            f"含{color}的船",
-            f"{color}船隻",
-            f"船體是{color}的船",
-        ]
-
-    def build_main_color_groups(self, anns):
-        color_to_obj_indices = {}
-
-        for obj_idx, obj in enumerate(anns):
-            colors = self.get_obj_colors(obj)
-            for color in colors:
-                if color not in color_to_obj_indices:
-                    color_to_obj_indices[color] = []
-                color_to_obj_indices[color].append(obj_idx)
-
-        query_groups = {}
-        for color, obj_indices in color_to_obj_indices.items():
-            queries = self.build_main_color_queries(color)
-            for query in queries:
-                query_groups[query] = list(dict.fromkeys(obj_indices))
-
-        return query_groups
-
-    def build_text_aug_groups(
-        self,
-        anns,
-        max_samples_per_object=1,
-    ):
-        """Bind each augmented phrase only to its original object."""
-        query_groups = {}
-
-        for obj_idx, obj in enumerate(anns):
-            base_text = str(obj.get("query_text", "")).strip()
-            texts_aug = obj.get("query_texts_aug", [])
-            if not isinstance(texts_aug, list):
-                continue
-
-            candidates = []
-            seen = set()
-            for text in texts_aug:
-                if not self.is_valid_query_text(text):
-                    continue
-                text = str(text).strip()
-                if text == base_text or text in seen:
-                    continue
-                seen.add(text)
-                candidates.append(text)
-
-            if max_samples_per_object is not None:
-                limit = int(max_samples_per_object)
-                if limit <= 0:
-                    candidates = []
-                elif len(candidates) > limit:
-                    candidates = self.rng.sample(candidates, k=limit)
-
-            for text in candidates:
-                query_groups.setdefault(text, []).append(obj_idx)
-
-        return {
-            query_text: list(dict.fromkeys(obj_indices))
-            for query_text, obj_indices in query_groups.items()
-            if obj_indices
-        }
-
-    def load_boxes_and_labels(self, anns):
-        boxes = []
-        labels = []
-
-        for obj in anns:
-            if "bbox_xyxy" not in obj:
-                raise KeyError(
-                    f"Missing bbox_xyxy in object. obj keys={list(obj.keys())}"
-                )
-
-            bbox = obj["bbox_xyxy"]
-
-            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-                raise ValueError(f"Invalid bbox_xyxy: {bbox}")
-
-            boxes.append(bbox)
-            labels.append(obj.get("class_id", 0))
-
-        boxes = torch.tensor(boxes, dtype=torch.float32)
-        labels = torch.tensor(labels, dtype=torch.long)
-
-        return boxes, labels
-
-    def reorder_xyxy(self, boxes):
+    @staticmethod
+    def reorder_xyxy(boxes: torch.Tensor) -> torch.Tensor:
         if boxes.numel() == 0:
-            return boxes
-
+            return boxes.reshape(-1, 4)
         x1 = torch.minimum(boxes[:, 0], boxes[:, 2])
         y1 = torch.minimum(boxes[:, 1], boxes[:, 3])
         x2 = torch.maximum(boxes[:, 0], boxes[:, 2])
         y2 = torch.maximum(boxes[:, 1], boxes[:, 3])
-
         return torch.stack([x1, y1, x2, y2], dim=-1)
 
-    def resize_boxes_xyxy(self, boxes, orig_size, new_size):
+    @staticmethod
+    def resize_boxes_xyxy(
+        boxes: torch.Tensor,
+        orig_size: Tuple[int, int],
+        new_size: Tuple[int, int],
+    ) -> torch.Tensor:
         orig_h, orig_w = orig_size
         new_h, new_w = new_size
-
         if boxes.numel() == 0:
-            return boxes
-
+            return boxes.reshape(-1, 4)
         boxes = boxes.clone()
-        boxes[:, [0, 2]] = boxes[:, [0, 2]] * (new_w / orig_w)
-        boxes[:, [1, 3]] = boxes[:, [1, 3]] * (new_h / orig_h)
-
+        boxes[:, [0, 2]] *= float(new_w) / float(orig_w)
+        boxes[:, [1, 3]] *= float(new_h) / float(orig_h)
         return boxes
 
-    def clip_boxes_xyxy(self, boxes, image_size):
+    @staticmethod
+    def clip_boxes_xyxy(
+        boxes: torch.Tensor,
+        image_size: Tuple[int, int],
+    ) -> torch.Tensor:
         h, w = image_size
-
         if boxes.numel() == 0:
-            return boxes
-
+            return boxes.reshape(-1, 4)
         boxes = boxes.clone()
         boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, w)
         boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, h)
-
         return boxes
 
-    def normalize_xyxy(self, boxes, image_size):
+    @staticmethod
+    def normalize_xyxy(
+        boxes: torch.Tensor,
+        image_size: Tuple[int, int],
+    ) -> torch.Tensor:
         h, w = image_size
-
         if boxes.numel() == 0:
-            return boxes
-
+            return boxes.reshape(-1, 4)
         boxes = boxes.clone()
-        boxes[:, [0, 2]] = boxes[:, [0, 2]] / float(w)
-        boxes[:, [1, 3]] = boxes[:, [1, 3]] / float(h)
-
+        boxes[:, [0, 2]] /= float(w)
+        boxes[:, [1, 3]] /= float(h)
         return boxes.clamp(0.0, 1.0)
 
-    def valid_box_mask_pixel(self, boxes):
+    def valid_box_mask_pixel(self, boxes: torch.Tensor) -> torch.Tensor:
         if boxes.numel() == 0:
             return torch.zeros((0,), dtype=torch.bool)
-
         wh = boxes[:, 2:] - boxes[:, :2]
-        valid = (wh[:, 0] >= self.min_box_size) & (wh[:, 1] >= self.min_box_size)
+        return (wh[:, 0] >= self.min_box_size) & (wh[:, 1] >= self.min_box_size)
 
-        return valid
-
-    def preprocess_image(self, image):
+    def preprocess_image(self, image: Image.Image) -> torch.Tensor:
         target_h, target_w = self.image_size
-
         image = TF.resize(
             image,
             [target_h, target_w],
             interpolation=InterpolationMode.BILINEAR,
             antialias=True,
         )
-
-        image = TF.to_tensor(image)
-
+        image_tensor = TF.to_tensor(image)
         if self.image_mean is not None and self.image_std is not None:
-            image = TF.normalize(
-                image,
+            image_tensor = TF.normalize(
+                image_tensor,
                 mean=list(self.image_mean),
                 std=list(self.image_std),
             )
+        return image_tensor
 
-        return image
-
-    def preprocess_image_u8(self, image):
+    def preprocess_image_u8(self, image: Image.Image) -> torch.Tensor:
         target_h, target_w = self.image_size
-
         image = TF.resize(
             image,
             [target_h, target_w],
             interpolation=InterpolationMode.BILINEAR,
             antialias=True,
         )
-
         return TF.pil_to_tensor(image).contiguous()
-
-    def decode_cached_image(self, image_u8):
-        image = image_u8.float().div_(255.0) if image_u8.dtype == torch.uint8 else image_u8.float()
-
-        if self.image_mean is not None and self.image_std is not None:
-            image = TF.normalize(
-                image,
-                mean=list(self.image_mean),
-                std=list(self.image_std),
-            )
-
-        return image
 
     def get_image_cache_key(self, image_path: str) -> str:
         stat = os.stat(image_path)
-
         payload = {
             "version": CACHE_VERSION,
             "path": os.path.abspath(image_path),
@@ -772,44 +713,40 @@ class ShipGroundingDataset(Dataset):
             "file_size": int(stat.st_size),
             "image_size": tuple(self.image_size),
         }
-
         payload_text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha1(payload_text.encode("utf-8")).hexdigest()
 
     def get_image_cache_path(self, image_path: str) -> str:
         if image_path in self.image_cache_map:
             return self.image_cache_map[image_path]
-
         key = self.get_image_cache_key(image_path)
+        if self.image_cache_dir is None:
+            raise RuntimeError("image_cache_dir is not configured")
         return os.path.join(self.image_cache_dir, f"{key}.pt")
 
-    def load_image_uncached(self, image_path: str):
+    def load_image_uncached(self, image_path: str) -> Tuple[torch.Tensor, int, int]:
         with Image.open(image_path) as image:
             image = image.convert("RGB")
             orig_w, orig_h = image.size
             image_tensor = self.preprocess_image(image)
-
         return image_tensor, int(orig_w), int(orig_h)
 
-    def load_image_u8_uncached(self, image_path: str):
+    def load_image_u8_uncached(self, image_path: str) -> Tuple[torch.Tensor, int, int]:
         with Image.open(image_path) as image:
             image = image.convert("RGB")
             orig_w, orig_h = image.size
             image_u8 = self.preprocess_image_u8(image)
-
         return image_u8, int(orig_w), int(orig_h)
 
-    def load_image_cached(self, image_path: str, allow_build: bool = False):
-        """
-        Cache path returns uint8 CHW tensor intentionally.
-        The uint8 -> float32 / normalization step is done in train.py after GPU transfer.
-        This keeps CPU memory and H2D transfer smaller.
-        """
+    def load_image_cached(
+        self,
+        image_path: str,
+        allow_build: bool = False,
+    ) -> Tuple[torch.Tensor, int, int]:
         if not self.cache_images:
             return self.load_image_uncached(image_path)
 
         cache_path = self.get_image_cache_path(image_path)
-
         if os.path.exists(cache_path):
             try:
                 try:
@@ -817,20 +754,15 @@ class ShipGroundingDataset(Dataset):
                 except TypeError:
                     obj = torch.load(cache_path, map_location="cpu")
 
-                if "image_u8" in obj:
-                    image_tensor = obj["image_u8"].contiguous()
-                elif "image" in obj:
-                    image = obj["image"]
-                    if image.dtype == torch.uint8:
-                        image_tensor = image.contiguous()
-                    else:
-                        image_tensor = image.clamp(0, 1).mul(255).to(torch.uint8).contiguous()
-                else:
-                    raise KeyError(f"Invalid image cache object keys={list(obj.keys())}")
-
+                image_tensor = obj.get("image_u8", obj.get("image"))
+                if image_tensor is None:
+                    raise KeyError(f"Invalid image cache keys={list(obj.keys())}")
+                if image_tensor.dtype != torch.uint8:
+                    image_tensor = (
+                        image_tensor.clamp(0, 1).mul(255).to(torch.uint8)
+                    )
                 orig_h, orig_w = obj["orig_size_hw"]
-                return image_tensor, int(orig_w), int(orig_h)
-
+                return image_tensor.contiguous(), int(orig_w), int(orig_h)
             except Exception:
                 if self.require_cache_ready and not allow_build:
                     raise
@@ -845,7 +777,6 @@ class ShipGroundingDataset(Dataset):
             )
 
         image_u8, orig_w, orig_h = self.load_image_u8_uncached(image_path)
-
         obj = {
             "type": CACHE_VERSION,
             "image_u8": image_u8.cpu(),
@@ -853,215 +784,296 @@ class ShipGroundingDataset(Dataset):
             "image_path": image_path,
             "image_size": tuple(self.image_size),
         }
-
-        tmp_path = cache_path + f".tmp.{os.getpid()}.{random.getrandbits(64)}"
-
+        temporary_path = cache_path + f".tmp.{os.getpid()}.{random.getrandbits(64)}"
         try:
-            torch.save(obj, tmp_path)
-            os.replace(tmp_path, cache_path)
+            torch.save(obj, temporary_path)
+            os.replace(temporary_path, cache_path)
         finally:
-            if os.path.exists(tmp_path):
+            if os.path.exists(temporary_path):
                 try:
-                    os.remove(tmp_path)
+                    os.remove(temporary_path)
                 except OSError:
                     pass
 
         return image_u8, int(orig_w), int(orig_h)
 
-    def build_image_cache_index(self, verify=False):
+    def build_image_cache_index(self, verify: bool = False) -> None:
         if not self.cache_images:
             return
 
-        self.image_cache_map = {}
-        image_paths = list(dict.fromkeys(self.image_paths))
-
-        for image_path in image_paths:
-            cache_path = self.get_image_cache_path(image_path)
-            self.image_cache_map[image_path] = cache_path
+        self.image_cache_map = {
+            image_path: self.get_image_cache_path(image_path)
+            for image_path in dict.fromkeys(self.image_paths)
+        }
 
         if verify:
-            missing = []
-            for image_path, cache_path in self.image_cache_map.items():
-                if not os.path.exists(cache_path):
-                    missing.append((image_path, cache_path))
-
-            if len(missing) > 0:
+            missing = [
+                (image_path, cache_path)
+                for image_path, cache_path in self.image_cache_map.items()
+                if not os.path.exists(cache_path)
+            ]
+            if missing:
                 image_path, cache_path = missing[0]
                 raise FileNotFoundError(
-                    f"Image cache missing: {cache_path}, image={image_path}, missing_count={len(missing)}"
+                    f"Image cache missing: {cache_path}, image={image_path}, "
+                    f"missing_count={len(missing)}"
                 )
 
-    def build_image_cache(self, num_workers=8, desc="[Image Cache]"):
+    def build_image_cache(
+        self,
+        num_workers: int = 8,
+        desc: str = "[Image Cache]",
+    ) -> None:
         if not self.cache_images:
             return
 
         self.build_image_cache_index(verify=False)
         image_paths = list(dict.fromkeys(self.image_paths))
-        total = len(image_paths)
-
-        if total == 0:
+        if not image_paths:
             return
 
-        num_workers = int(num_workers)
-
-        if num_workers <= 1:
-            for image_path in tqdm(image_paths, total=total, desc=desc, dynamic_ncols=True):
-                _ = self.load_image_cached(image_path, allow_build=True)
+        num_workers = max(1, int(num_workers))
+        if num_workers == 1:
+            for image_path in tqdm(
+                image_paths,
+                desc=desc,
+                unit="image",
+                dynamic_ncols=True,
+            ):
+                self.load_image_cached(image_path, allow_build=True)
             return
 
-        def worker(image_path):
-            _ = self.load_image_cached(image_path, allow_build=True)
-            return image_path
+        def worker(path: str) -> str:
+            self.load_image_cached(path, allow_build=True)
+            return path
 
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures = [executor.submit(worker, image_path) for image_path in image_paths]
-
-            for future in tqdm(as_completed(futures), total=total, desc=desc, dynamic_ncols=True):
+            futures = [executor.submit(worker, path) for path in image_paths]
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc=desc,
+                unit="image",
+                dynamic_ncols=True,
+            ):
                 future.result()
 
-    def build_common_image_data(self, anno_idx):
-        image_path = self.image_paths[anno_idx]
-        anno_path = self.anno_paths[anno_idx]
-        anns = self.annos[anno_idx]
+    def build_target(
+        self,
+        record: Dict[str, Any],
+        *,
+        orig_w: int,
+        orig_h: int,
+    ) -> Dict[str, Any]:
+        annotation_w = int(record["width"])
+        annotation_h = int(record["height"])
 
-        image, orig_w, orig_h = self.load_image_cached(image_path)
+        if self.strict_size and (orig_w != annotation_w or orig_h != annotation_h):
+            raise ValueError(
+                "Image/annotation size mismatch: "
+                f"image=({orig_w}, {orig_h}), "
+                f"annotation=({annotation_w}, {annotation_h}), "
+                f"filename={record['filename']}"
+            )
+
         target_h, target_w = self.image_size
+        unique_targets = record["unique_targets"]
 
-        boxes_orig_xyxy, labels = self.load_boxes_and_labels(anns)
-        boxes_orig_xyxy = self.reorder_xyxy(boxes_orig_xyxy)
+        boxes_orig = torch.tensor(
+            [target["bbox"] for target in unique_targets],
+            dtype=torch.float32,
+        ).reshape(-1, 4)
+        boxes_orig = self.reorder_xyxy(boxes_orig)
 
-        boxes_resized_xyxy = self.resize_boxes_xyxy(
-            boxes_orig_xyxy,
+        boxes_pixel = self.resize_boxes_xyxy(
+            boxes_orig,
             orig_size=(orig_h, orig_w),
             new_size=(target_h, target_w),
         )
-        boxes_resized_xyxy = self.reorder_xyxy(boxes_resized_xyxy)
+        boxes_pixel = self.reorder_xyxy(boxes_pixel)
 
         if self.clip_boxes:
-            boxes_resized_xyxy = self.clip_boxes_xyxy(
-                boxes_resized_xyxy,
+            boxes_pixel = self.clip_boxes_xyxy(
+                boxes_pixel,
                 image_size=(target_h, target_w),
             )
 
-        boxes_norm_xyxy = self.normalize_xyxy(
-            boxes_resized_xyxy,
-            image_size=(target_h, target_w),
-        )
+        valid_mask = self.valid_box_mask_pixel(boxes_pixel)
+        boxes_pixel = boxes_pixel[valid_mask]
+        boxes_orig = boxes_orig[valid_mask]
+
+        if self.normalize_boxes:
+            boxes = self.normalize_xyxy(
+                boxes_pixel,
+                image_size=(target_h, target_w),
+            )
+        else:
+            boxes = boxes_pixel.clone()
+
+        kept_indices = torch.nonzero(valid_mask, as_tuple=False).flatten().tolist()
+        positive_char_spans = [
+            unique_targets[index]["positive_char_spans"]
+            for index in kept_indices
+        ]
+        phrases = [unique_targets[index]["phrases"] for index in kept_indices]
+        semantic_keys = [
+            unique_targets[index]["semantic_keys"]
+            for index in kept_indices
+        ]
+        region_indices = [
+            unique_targets[index]["region_indices"]
+            for index in kept_indices
+        ]
+
+        labels = torch.zeros((boxes.shape[0],), dtype=torch.long)
+        target_indices = torch.tensor(kept_indices, dtype=torch.long)
 
         return {
-            "image": image,
-            "image_path": image_path,
-            "anno_path": anno_path,
-            "anns": anns,
-            "orig_w": orig_w,
-            "orig_h": orig_h,
-            "target_h": target_h,
-            "target_w": target_w,
-            "boxes_norm_xyxy": boxes_norm_xyxy,
-            "boxes_resized_xyxy": boxes_resized_xyxy,
+            "boxes": boxes,
+            "boxes_pixel": boxes_pixel,
+            "boxes_orig": boxes_orig,
             "labels": labels,
-        }
-
-    def build_query_record(self, common, sample_info):
-        obj_indices = sample_info["obj_indices"]
-
-        boxes_norm_xyxy = common["boxes_norm_xyxy"]
-        boxes_resized_xyxy = common["boxes_resized_xyxy"]
-        labels = common["labels"]
-        target_h = common["target_h"]
-        target_w = common["target_w"]
-        orig_h = common["orig_h"]
-        orig_w = common["orig_w"]
-
-        obj_indices_tensor = torch.tensor(obj_indices, dtype=torch.long)
-
-        target_boxes_pixel = boxes_resized_xyxy[obj_indices_tensor]
-        target_boxes_norm = boxes_norm_xyxy[obj_indices_tensor]
-        target_labels = labels[obj_indices_tensor]
-
-        valid_target_mask = self.valid_box_mask_pixel(target_boxes_pixel)
-
-        target_boxes_pixel = target_boxes_pixel[valid_target_mask]
-        target_boxes_norm = target_boxes_norm[valid_target_mask]
-        target_labels = target_labels[valid_target_mask]
-        obj_indices_tensor = obj_indices_tensor[valid_target_mask]
-
-        target = {
-            "boxes": target_boxes_norm,
-            "labels": target_labels,
-            "boxes_pixel": target_boxes_pixel,
-            "obj_indices": obj_indices_tensor,
+            "target_indices": target_indices,
+            "positive_char_spans": positive_char_spans,
+            "phrases": phrases,
+            "semantic_keys": semantic_keys,
+            "region_indices": region_indices,
             "image_size": torch.tensor([target_h, target_w], dtype=torch.long),
             "orig_size": torch.tensor([orig_h, orig_w], dtype=torch.long),
+            "annotation_size": torch.tensor(
+                [annotation_h, annotation_w], dtype=torch.long
+            ),
         }
 
-        return {
-            "boxes": boxes_norm_xyxy,
-            "boxes_pixel": boxes_resized_xyxy,
-            "labels": labels,
-            "target_boxes": target_boxes_norm,
-            "target_boxes_pixel": target_boxes_pixel,
-            "target_labels": target_labels,
-            "target": target,
-            "query_text": sample_info["query_text"],
-            "group_source": sample_info["group_source"],
-            "negative_type": sample_info.get("negative_type", ""),
-            "query_loss_weight": float(sample_info.get("query_loss_weight", 1.0)),
-            "is_text_negative": bool(sample_info.get("is_text_negative", False)),
-            "image_size": (target_h, target_w),
-            "orig_size": (orig_h, orig_w),
-            "image_path": common["image_path"],
-            "anno_path": common["anno_path"],
-            "obj_indices": obj_indices_tensor,
-            "source_name": common["anns"][0].get("source_name", ""),
+    def sample_negative_phrases(
+        self,
+        record: Dict[str, Any],
+        dataset_index: int,
+    ) -> List[str]:
+        if (
+            not self.enable_negative_phrases
+            or not self.negative_phrase_pool
+        ):
+            return []
+
+        positive_phrases = {
+            str(region.get("phrase", "")).strip()
+            for region in record["regions"]
+            if str(region.get("phrase", "")).strip()
         }
+        caption = str(record["caption"])
 
-    def get_query_item(self, idx):
-        sample_info = self.samples[idx]
-        common = self.build_common_image_data(sample_info["anno_idx"])
-        query_record = self.build_query_record(common, sample_info)
-        query_record["image"] = common["image"]
-        return query_record
+        candidates = [
+            phrase
+            for phrase in self.negative_phrase_pool
+            if phrase not in positive_phrases
+            and phrase not in caption
+        ]
 
-    def get_image_level_item(self, idx):
-        anno_idx = self.image_level_indices[idx]
-        common = self.build_common_image_data(anno_idx)
-        sample_infos = self.samples_by_anno[anno_idx]
-        queries = [self.build_query_record(common, sample_info) for sample_info in sample_infos]
+        if not candidates:
+            return []
 
-        return {
-            "image_level": True,
-            "image": common["image"],
-            "queries": queries,
-            "image_path": common["image_path"],
-            "anno_path": common["anno_path"],
-            "source_name": common["anns"][0].get("source_name", ""),
-        }
+        positive_count = max(
+            1,
+            len(record["regions"]),
+        )
+        requested = max(
+            1,
+            int(
+                math.ceil(
+                    positive_count
+                    * self.negative_phrase_ratio
+                )
+            ),
+        )
+        requested = min(
+            requested,
+            self.negative_phrase_max_per_image,
+            len(candidates),
+        )
 
-    def __getitem__(self, idx):
-        if self.image_level_batching:
-            return self.get_image_level_item(idx)
-        return self.get_query_item(idx)
+        # Deterministic per-image sampling remains stable across workers.
+        rng = random.Random(
+            self.random_seed
+            + int(dataset_index) * 1_000_003
+        )
+        return rng.sample(
+            candidates,
+            requested,
+        )
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+            record_index = int(idx)
+            record = self.records[record_index]
+            image_path = self.image_paths[record_index]
+            anno_path = self.anno_paths[record_index]
+
+            image, orig_w, orig_h = self.load_image_cached(
+                image_path
+            )
+            target = self.build_target(
+                record,
+                orig_w=orig_w,
+                orig_h=orig_h,
+            )
+
+            negative_phrases = self.sample_negative_phrases(
+                record=record,
+                dataset_index=record_index,
+            )
+            caption, negative_char_spans = (
+                append_negative_phrases_to_caption(
+                    caption=record["caption"],
+                    negative_phrases=negative_phrases,
+                    separator=self.negative_phrase_separator,
+                )
+            )
+
+            source_name = _clean_text(
+                record["metadata"].get("source_name")
+            )
+            if not source_name:
+                source_name = os.path.splitext(
+                    record["filename"]
+                )[0]
+
+            return {
+                "image_level": True,
+                "image": image,
+                "caption": caption,
+                "base_caption": record["caption"],
+                "target": target,
+                "negative_phrases": negative_phrases,
+                "negative_char_spans": negative_char_spans,
+                "regions": record["regions"],
+                "region_to_target_indices": (
+                    record["region_to_target_indices"]
+                ),
+                "image_path": image_path,
+                "anno_path": anno_path,
+                "filename": record["filename"],
+                "source_name": source_name,
+                "metadata": record["metadata"],
+            }
 
 
-class QueryBudgetBatchSampler(Sampler):
+
+class QueryBudgetBatchSampler(Sampler[List[int]]):
     """
-    Image-level sampler with a fixed batch layout.
+    Fixed image batches constrained by an ODVG region budget.
 
-    The layout is constructed once, so __len__ is exact and invariant across
-    epochs. Each epoch only shuffles the batch order and the indices inside each
-    batch. This prevents progress bars, LR schedules and ratio-based parameters
-    from drifting because of a changing number of yielded batches.
+    The class name is retained because train.py imports it directly. The budget
+    now counts grounding regions, not legacy expanded query samples.
     """
 
     def __init__(
         self,
-        dataset,
-        query_budget=48,
-        shuffle=True,
-        drop_last=False,
-        seed=0,
-    ):
+        dataset: ShipGroundingDataset,
+        query_budget: int = 48,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        seed: int = 0,
+    ) -> None:
         self.dataset = dataset
         self.query_budget = max(1, int(query_budget))
         self.shuffle = bool(shuffle)
@@ -1075,46 +1087,41 @@ class QueryBudgetBatchSampler(Sampler):
         ]
         self._base_batches = self._build_fixed_batches()
 
-    def set_epoch(self, epoch):
+    def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
-    def _build_fixed_batches(self):
-        # One deterministic initial shuffle avoids annotation-order bias while
-        # preserving the exact same step count for every epoch.
+    def _build_fixed_batches(self) -> Tuple[Tuple[int, ...], ...]:
         order = list(range(len(self.indices)))
         if self.shuffle:
             random.Random(self.seed).shuffle(order)
 
-        batches = []
-        batch = []
-        query_sum = 0
+        batches: List[List[int]] = []
+        batch: List[int] = []
+        budget_sum = 0
 
         for position in order:
             dataset_index = self.indices[position]
-            query_count = self.query_counts[position]
+            item_cost = self.query_counts[position]
 
-            if batch and query_sum + query_count > self.query_budget:
+            if batch and budget_sum + item_cost > self.query_budget:
                 batches.append(batch)
                 batch = []
-                query_sum = 0
+                budget_sum = 0
 
             batch.append(dataset_index)
-            query_sum += query_count
+            budget_sum += item_cost
 
-        if batch:
-            if not self.drop_last or query_sum >= self.query_budget:
-                batches.append(batch)
+        if batch and (not self.drop_last or budget_sum >= self.query_budget):
+            batches.append(batch)
 
         if not batches and self.indices:
-            # Avoid an empty loader when all data fit in one under-budget batch.
             batches.append(list(self.indices))
 
         return tuple(tuple(batch) for batch in batches)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterable[List[int]]:
         batch_order = list(range(len(self._base_batches)))
         rng = random.Random(self.seed + self.epoch)
-
         if self.shuffle:
             rng.shuffle(batch_order)
 
@@ -1124,139 +1131,172 @@ class QueryBudgetBatchSampler(Sampler):
                 rng.shuffle(batch)
             yield batch
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._base_batches)
 
 
-def _collate_query_items(items):
-    images = torch.stack([item["image"] for item in items], dim=0)
+def grounding_collate_fn(
+    batch: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not batch:
+        raise ValueError(
+            "grounding_collate_fn received an empty batch"
+        )
 
-    query_texts = [item["query_text"] for item in items]
-    targets = [item["target"] for item in items]
-
-    boxes_per_image = [item["boxes"] for item in items]
-    boxes_pixel_per_image = [item["boxes_pixel"] for item in items]
-    labels_per_image = [item["labels"] for item in items]
-
-    target_boxes_per_image = [item["target_boxes"] for item in items]
-    target_boxes_pixel_per_image = [item["target_boxes_pixel"] for item in items]
-    target_labels_per_image = [item["target_labels"] for item in items]
-
-    group_sources = [item["group_source"] for item in items]
-    negative_query_types = [item.get("negative_type", "") for item in items]
-    query_loss_weights = torch.tensor(
-        [float(item.get("query_loss_weight", 1.0)) for item in items],
-        dtype=torch.float32,
+    unique_images = torch.stack(
+        [item["image"] for item in batch],
+        dim=0,
     )
-    text_negative_mask = torch.tensor(
-        [bool(item.get("is_text_negative", False)) for item in items],
-        dtype=torch.bool,
+    captions = [
+        item["caption"]
+        for item in batch
+    ]
+    targets = [
+        item["target"]
+        for item in batch
+    ]
+
+    positive_char_spans = [
+        target["positive_char_spans"]
+        for target in targets
+    ]
+    target_phrases = [
+        target["phrases"]
+        for target in targets
+    ]
+    target_semantic_keys = [
+        target["semantic_keys"]
+        for target in targets
+    ]
+    target_region_indices = [
+        target["region_indices"]
+        for target in targets
+    ]
+
+    negative_phrases = [
+        item.get("negative_phrases", [])
+        for item in batch
+    ]
+    negative_char_spans = [
+        item.get("negative_char_spans", [])
+        for item in batch
+    ]
+
+    batch_size = len(batch)
+    negative_phrase_count = sum(
+        len(values)
+        for values in negative_phrases
     )
-
-    image_sizes = [item["image_size"] for item in items]
-    orig_sizes = [item["orig_size"] for item in items]
-
-    image_paths = [item["image_path"] for item in items]
-    anno_paths = [item["anno_path"] for item in items]
-    obj_indices = [item["obj_indices"] for item in items]
-    source_names = [item["source_name"] for item in items]
 
     return {
-        "images": images,
-        "query_texts": query_texts,
+        "unique_images": unique_images,
+        "captions": captions,
+
+        # Temporary alias retained for current runtime/model helpers.
+        # Every entry is a complete image-level ODVG caption.
+        "query_texts": captions,
+
+        "image_indices": torch.arange(
+            batch_size,
+            dtype=torch.long,
+        ),
         "targets": targets,
-        "boxes_per_image": boxes_per_image,
-        "boxes_pixel_per_image": boxes_pixel_per_image,
-        "labels_per_image": labels_per_image,
-        "target_boxes_per_image": target_boxes_per_image,
-        "target_boxes_pixel_per_image": target_boxes_pixel_per_image,
-        "target_labels_per_image": target_labels_per_image,
-        "group_sources": group_sources,
-        "negative_query_types": negative_query_types,
-        "query_loss_weights": query_loss_weights,
-        "text_negative_mask": text_negative_mask,
-        "image_sizes": image_sizes,
-        "orig_sizes": orig_sizes,
-        "image_paths": image_paths,
-        "anno_paths": anno_paths,
-        "obj_indices": obj_indices,
-        "source_names": source_names,
+        "positive_char_spans": positive_char_spans,
+        "target_phrases": target_phrases,
+        "target_semantic_keys": target_semantic_keys,
+        "target_region_indices": target_region_indices,
+
+        # Negative phrases are appended to captions but have no bbox.
+        "negative_phrases": negative_phrases,
+        "negative_char_spans": negative_char_spans,
+        "odvg_negative_phrase_count": (
+            negative_phrase_count
+        ),
+
+        "regions": [
+            item["regions"]
+            for item in batch
+        ],
+        "region_to_target_indices": [
+            item["region_to_target_indices"]
+            for item in batch
+        ],
+        "image_paths": [
+            item["image_path"]
+            for item in batch
+        ],
+        "anno_paths": [
+            item["anno_path"]
+            for item in batch
+        ],
+        "filenames": [
+            item["filename"]
+            for item in batch
+        ],
+        "source_names": [
+            item["source_name"]
+            for item in batch
+        ],
+        "metadata": [
+            item["metadata"]
+            for item in batch
+        ],
+        "group_sources": [
+            "odvg_caption"
+        ] * batch_size,
+
+        # Legacy whole-caption negative flags are always disabled.
+        "negative_query_types": [
+            ""
+        ] * batch_size,
+        "query_loss_weights": torch.ones(
+            batch_size,
+            dtype=torch.float32,
+        ),
+        "text_negative_mask": torch.zeros(
+            batch_size,
+            dtype=torch.bool,
+        ),
+
+        "num_unique_images": batch_size,
+        "num_queries": batch_size,
+        "num_regions": sum(
+            len(item["regions"])
+            for item in batch
+        ),
+        "num_unique_targets": sum(
+            int(target["boxes"].shape[0])
+            for target in targets
+        ),
     }
 
 
-def grounding_collate_fn(batch):
-    if len(batch) > 0 and not batch[0].get("image_level", False):
-        return _collate_query_items(batch)
 
-    unique_images = []
-    query_texts = []
-    image_indices = []
-    targets = []
+def list_json_files(anno_dir: str) -> List[str]:
+    anno_dir = os.path.abspath(str(anno_dir))
+    if not os.path.isdir(anno_dir):
+        raise NotADirectoryError(f"Annotation directory not found: {anno_dir}")
 
-    image_paths = []
-    anno_paths = []
-    source_names = []
-    group_sources = []
-    negative_query_types = []
-    query_loss_weights = []
-    text_negative_mask = []
-
-    for image_idx, item in enumerate(batch):
-        image = item["image"]
-        unique_images.append(image)
-
-        queries = item["queries"]
-
-        for q in queries:
-            query_texts.append(q["query_text"])
-            targets.append(q["target"])
-            image_indices.append(image_idx)
-
-            image_paths.append(item["image_path"])
-            anno_paths.append(item["anno_path"])
-            source_names.append(item["source_name"])
-            group_sources.append(q.get("group_source", ""))
-            negative_query_types.append(q.get("negative_type", ""))
-            query_loss_weights.append(float(q.get("query_loss_weight", 1.0)))
-            text_negative_mask.append(bool(q.get("is_text_negative", False)))
-
-    return {
-        "unique_images": torch.stack(unique_images, dim=0),
-        "image_indices": torch.tensor(image_indices, dtype=torch.long),
-        "query_texts": query_texts,
-        "targets": targets,
-        "image_paths": image_paths,
-        "anno_paths": anno_paths,
-        "source_names": source_names,
-        "group_sources": group_sources,
-        "negative_query_types": negative_query_types,
-        "query_loss_weights": torch.tensor(query_loss_weights, dtype=torch.float32),
-        "text_negative_mask": torch.tensor(text_negative_mask, dtype=torch.bool),
-        "num_unique_images": len(unique_images),
-        "num_queries": len(query_texts),
-    }
-
-
-def list_json_files(anno_dir):
-    return sorted([
-        os.path.join(anno_dir, f)
-        for f in os.listdir(anno_dir)
-        if f.lower().endswith(".json")
-    ])
+    results: List[str] = []
+    for root, _, filenames in os.walk(anno_dir):
+        for filename in filenames:
+            if filename.lower().endswith(".json"):
+                results.append(os.path.join(root, filename))
+    return sorted(results)
 
 
 def build_dataloader(
-    dataset,
-    batch_size=4,
-    shuffle=True,
-    num_workers=0,
-    pin_memory=True,
-    drop_last=False,
-    prefetch_factor=4,
-    query_budget_batching=True,
-    random_seed=0,
-):
-    kwargs = {
+    dataset: ShipGroundingDataset,
+    batch_size: int = 4,
+    shuffle: bool = True,
+    num_workers: int = 0,
+    pin_memory: bool = True,
+    drop_last: bool = False,
+    prefetch_factor: int = 4,
+    query_budget_batching: bool = True,
+    random_seed: int = 0,
+) -> DataLoader:
+    kwargs: Dict[str, Any] = {
         "dataset": dataset,
         "num_workers": int(num_workers),
         "collate_fn": grounding_collate_fn,
@@ -1268,15 +1308,14 @@ def build_dataloader(
         kwargs["persistent_workers"] = True
         kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
 
-    if getattr(dataset, "image_level_batching", False) and query_budget_batching:
-        batch_sampler = QueryBudgetBatchSampler(
+    if query_budget_batching:
+        kwargs["batch_sampler"] = QueryBudgetBatchSampler(
             dataset=dataset,
             query_budget=batch_size,
             shuffle=shuffle,
             drop_last=drop_last,
             seed=random_seed or 0,
         )
-        kwargs["batch_sampler"] = batch_sampler
         return DataLoader(**kwargs)
 
     kwargs["batch_size"] = int(batch_size)
@@ -1285,56 +1324,51 @@ def build_dataloader(
     return DataLoader(**kwargs)
 
 
-def _resolve_loader_batch_size(dataset, query_batch_size):
-    if getattr(dataset, "image_level_batching", False):
-        return max(1, int(query_batch_size) // max(1, int(dataset.queries_per_image)))
-    return int(query_batch_size)
-
-
 def build_dataloaders(
-    train_image_dir,
-    train_anno_dir,
-    val_image_dir,
-    val_anno_dir,
-    batch_size=4,
-    image_size=(640, 640),
-    num_workers=0,
-    max_text_aug_per_image=1,
-    random_seed=None,
-    use_query_text=True,
-    use_main_colors=False,
-    use_text_aug=False,
-    normalize_boxes=True,
-    clip_boxes=True,
-    min_box_size=1.0,
-    image_mean=None,
-    image_std=None,
-    pin_memory=True,
-    prefetch_factor=4,
-    cache_images=False,
-    image_cache_dir=None,
-    prebuild_image_cache=False,
-    cache_workers=8,
-    query_budget_batching=True,
-    negative_query_path=None,
-    negative_sample_ratio=0.05,
-    use_negative_queries_in_val=False,
-):
-    train_anno_paths = list_json_files(train_anno_dir)
-    val_anno_paths = list_json_files(val_anno_dir)
+    train_image_dir: str,
+    train_anno_dir: str,
+    val_image_dir: str,
+    val_anno_dir: str,
+    batch_size: int = 4,
+    image_size: Tuple[int, int] = (640, 640),
+    num_workers: int = 0,
+    random_seed: Optional[int] = None,
+    normalize_boxes: bool = True,
+    clip_boxes: bool = True,
+    min_box_size: float = 1.0,
+    image_mean: Optional[
+        Tuple[float, float, float]
+    ] = None,
+    image_std: Optional[
+        Tuple[float, float, float]
+    ] = None,
+    pin_memory: bool = True,
+    prefetch_factor: int = 4,
+    cache_images: bool = False,
+    image_cache_dir: Optional[str] = None,
+    prebuild_image_cache: bool = False,
+    cache_workers: int = 8,
+    query_budget_batching: bool = True,
 
-    if negative_query_path is None:
-        negative_query_path = DEFAULT_NEGATIVE_QUERY_POOL_PATH
-    negative_query_path = ensure_negative_query_pool_file(negative_query_path)
+    # Existing configuration names are retained, but their semantics are now
+    # ODVG phrase-level negatives rather than whole-caption negative samples.
+    negative_query_path: Optional[str] = None,
+    negative_sample_ratio: float = 0.0,
+    use_negative_queries_in_val: bool = False,
+    negative_phrase_max_per_image: int = 3,
+    negative_phrase_separator: str = "；負向描述：",
+) -> Tuple[DataLoader, DataLoader]:
+    train_anno_paths = list_json_files(
+        train_anno_dir
+    )
+    val_anno_paths = list_json_files(
+        val_anno_dir
+    )
 
     train_dataset = ShipGroundingDataset(
         image_dir=train_image_dir,
         anno_paths=train_anno_paths,
         image_size=image_size,
-        use_query_text=use_query_text,
-        use_main_colors=use_main_colors,
-        use_text_aug=use_text_aug,
-        max_text_aug_per_image=max_text_aug_per_image,
         random_seed=random_seed,
         normalize_boxes=normalize_boxes,
         clip_boxes=clip_boxes,
@@ -1342,21 +1376,28 @@ def build_dataloaders(
         image_mean=image_mean,
         image_std=image_std,
         strict_image=True,
+        strict_size=True,
         cache_images=cache_images,
         image_cache_dir=image_cache_dir,
         prebuild_image_cache=prebuild_image_cache,
-        negative_query_path=negative_query_path,
-        negative_sample_ratio=negative_sample_ratio,
+        negative_phrase_pool_path=negative_query_path,
+        negative_phrase_ratio=negative_sample_ratio,
+        negative_phrase_max_per_image=(
+            negative_phrase_max_per_image
+        ),
+        enable_negative_phrases=(
+            negative_query_path is not None
+            and float(negative_sample_ratio) > 0.0
+        ),
+        negative_phrase_separator=(
+            negative_phrase_separator
+        ),
     )
 
     val_dataset = ShipGroundingDataset(
         image_dir=val_image_dir,
         anno_paths=val_anno_paths,
         image_size=image_size,
-        use_query_text=use_query_text,
-        use_main_colors=use_main_colors,
-        use_text_aug=use_text_aug,
-        max_text_aug_per_image=max_text_aug_per_image,
         random_seed=random_seed,
         normalize_boxes=normalize_boxes,
         clip_boxes=clip_boxes,
@@ -1364,19 +1405,41 @@ def build_dataloaders(
         image_mean=image_mean,
         image_std=image_std,
         strict_image=True,
+        strict_size=True,
         cache_images=cache_images,
         image_cache_dir=image_cache_dir,
         prebuild_image_cache=prebuild_image_cache,
-        negative_query_path=negative_query_path,
-        negative_sample_ratio=negative_sample_ratio if use_negative_queries_in_val else 0.0,
+        negative_phrase_pool_path=negative_query_path,
+        negative_phrase_ratio=negative_sample_ratio,
+        negative_phrase_max_per_image=(
+            negative_phrase_max_per_image
+        ),
+        enable_negative_phrases=bool(
+            use_negative_queries_in_val
+            and negative_query_path is not None
+            and float(negative_sample_ratio) > 0.0
+        ),
+        negative_phrase_separator=(
+            negative_phrase_separator
+        ),
     )
 
     if prebuild_image_cache:
-        train_dataset.build_image_cache(num_workers=cache_workers, desc="[Image Cache] Train")
-        val_dataset.build_image_cache(num_workers=cache_workers, desc="[Image Cache] Val")
+        train_dataset.build_image_cache(
+            num_workers=cache_workers,
+            desc="[Image Cache] Train",
+        )
+        val_dataset.build_image_cache(
+            num_workers=cache_workers,
+            desc="[Image Cache] Val",
+        )
 
-    train_dataset.build_image_cache_index(verify=train_dataset.require_cache_ready)
-    val_dataset.build_image_cache_index(verify=val_dataset.require_cache_ready)
+    train_dataset.build_image_cache_index(
+        verify=train_dataset.require_cache_ready
+    )
+    val_dataset.build_image_cache_index(
+        verify=val_dataset.require_cache_ready
+    )
 
     train_loader = build_dataloader(
         dataset=train_dataset,
@@ -1386,10 +1449,11 @@ def build_dataloaders(
         pin_memory=pin_memory,
         drop_last=True,
         prefetch_factor=prefetch_factor,
-        query_budget_batching=query_budget_batching,
+        query_budget_batching=(
+            query_budget_batching
+        ),
         random_seed=random_seed or 0,
     )
-
     val_loader = build_dataloader(
         dataset=val_dataset,
         batch_size=batch_size,
@@ -1398,36 +1462,34 @@ def build_dataloaders(
         pin_memory=pin_memory,
         drop_last=False,
         prefetch_factor=prefetch_factor,
-        query_budget_batching=query_budget_batching,
+        query_budget_batching=(
+            query_budget_batching
+        ),
         random_seed=random_seed or 0,
     )
 
     return train_loader, val_loader
 
 
+
 if __name__ == "__main__":
     train_loader, val_loader = build_dataloaders(
-        train_image_dir="path/to/train/images",
-        train_anno_dir="path/to/train/jsons",
-        val_image_dir="path/to/val/images",
-        val_anno_dir="path/to/val/jsons",
+        train_image_dir="path/to/datasets/images/train",
+        train_anno_dir="path/to/datasets/labels/ODVG/train",
+        val_image_dir="path/to/datasets/images/val",
+        val_anno_dir="path/to/datasets/labels/ODVG/val",
         batch_size=48,
         image_size=(512, 512),
         num_workers=0,
-        max_text_aug_per_image=1,
-        random_seed=42,
         pin_memory=False,
-        cache_images=True,
-        image_cache_dir="/tmp/lightdet_image_cache_512",
-        prebuild_image_cache=True,
-        cache_workers=8,
+        cache_images=False,
+        prebuild_image_cache=False,
     )
 
     batch = next(iter(train_loader))
-    if "unique_images" in batch:
-        print("unique_images:", batch["unique_images"].shape)
-        print("query_texts:", len(batch["query_texts"]))
-    else:
-        print("images:", batch["images"].shape)
-        print("query_texts:", len(batch["query_texts"]))
-    print("num targets:", len(batch["targets"]))
+    print("unique_images:", tuple(batch["unique_images"].shape))
+    print("captions:", len(batch["captions"]))
+    print("regions:", batch["num_regions"])
+    print("unique targets:", batch["num_unique_targets"])
+    print("first caption:", batch["captions"][0])
+    print("first positive spans:", batch["positive_char_spans"][0])

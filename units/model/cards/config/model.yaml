@@ -32,7 +32,7 @@ model:
   score_fusion_eps: 0.000001
 
   # Text branch
-  text_max_length: 32
+  text_max_length: 96
   freeze_bert: true
   precomputed_bert_path: units/model/cards/cache/bert_raw_cache.pt
 

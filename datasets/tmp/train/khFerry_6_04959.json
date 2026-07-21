@@ -1,0 +1,122 @@
+[
+  {
+    "name": "khFerry_6_04959_000.jpg",
+    "bbox_xyxy": [
+      106,
+      267,
+      218,
+      315
+    ],
+    "class_id": 0,
+    "source_name": "khFerry_6_04959",
+    "source_size": {
+      "width": 1280,
+      "height": 720
+    },
+    "llm_output": "船體主要顏色：灰色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構",
+    "attributes": {
+      "main_colors": [
+        "灰色"
+      ],
+      "is_multicolor": false
+    },
+    "query_text": "灰色的船",
+    "query_texts_aug": [
+      "灰色的船",
+      "一艘灰色的船",
+      "灰色船隻",
+      "船體是灰色的船"
+    ],
+    "raw_text": "船體主要顏色：灰色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構"
+  },
+  {
+    "name": "khFerry_6_04959_001.jpg",
+    "bbox_xyxy": [
+      639,
+      294,
+      697,
+      320
+    ],
+    "class_id": 0,
+    "source_name": "khFerry_6_04959",
+    "source_size": {
+      "width": 1280,
+      "height": 720
+    },
+    "llm_output": "船體主要顏色：白色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構",
+    "attributes": {
+      "main_colors": [
+        "白色"
+      ],
+      "is_multicolor": false
+    },
+    "query_text": "白色的船",
+    "query_texts_aug": [
+      "白色的船",
+      "一艘白色的船",
+      "白色船隻",
+      "船體是白色的船"
+    ],
+    "raw_text": "船體主要顏色：白色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構"
+  },
+  {
+    "name": "khFerry_6_04959_002.jpg",
+    "bbox_xyxy": [
+      60,
+      281,
+      97,
+      312
+    ],
+    "class_id": 0,
+    "source_name": "khFerry_6_04959",
+    "source_size": {
+      "width": 1280,
+      "height": 720
+    },
+    "llm_output": "船體主要顏色：黑色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構",
+    "attributes": {
+      "main_colors": [
+        "黑色"
+      ],
+      "is_multicolor": false
+    },
+    "query_text": "黑色的船",
+    "query_texts_aug": [
+      "黑色的船",
+      "一艘黑色的船",
+      "黑色船隻",
+      "船體是黑色的船"
+    ],
+    "raw_text": "船體主要顏色：黑色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構"
+  },
+  {
+    "name": "khFerry_6_04959_003.jpg",
+    "bbox_xyxy": [
+      17,
+      270,
+      66,
+      314
+    ],
+    "class_id": 0,
+    "source_name": "khFerry_6_04959",
+    "source_size": {
+      "width": 1280,
+      "height": 720
+    },
+    "llm_output": "船體主要顏色：藍色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構",
+    "attributes": {
+      "main_colors": [
+        "藍色"
+      ],
+      "is_multicolor": false
+    },
+    "query_text": "藍色的船",
+    "query_texts_aug": [
+      "藍色的船",
+      "一艘藍色的船",
+      "藍色船隻",
+      "船體是藍色的船"
+    ],
+    "raw_text": "船體主要顏色：藍色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構"
+  }
+]

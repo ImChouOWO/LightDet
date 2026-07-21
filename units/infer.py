@@ -1,34 +1,43 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 """
-LightDet YOLO-style inference entry.
+LightDet ODVG-style phrase grounding inference.
 
-Example:
+使用方式：
     from units.infer import LightDet
 
-    model = LightDet(model="/path/to/model.yaml")
+    model = LightDet(
+        model="/home/soic/Desktop/LightDet/units/model/cards/config/model.yaml"
+    )
+
     results = model.predict(
         weights="/path/to/best_map50_95.pt",
         source="/path/to/image.jpg",
-        text=["一台行駛的計程車", "停靠的船"],
-        imgsz=512,
+        caption="畫面中包含一艘紅色的船與一艘白色的船",
+        phrases=[
+            "紅色的船",
+            "白色的船",
+        ],
+        imgsz=1024,
         device=0,
-        conf=0.001,
-        top_k=100,
-        use_nms=True,
-        nms_iou_threshold=0.6,
+        conf=0.05,
+        top_k=20,
+        use_nms=False,
         project="runs/predict",
-        name="exp",
+        name="odvg_exp",
     )
 
-Hybrid inference contract:
-    - only the Main One-to-One branch is executed;
-    - auxiliary predictions are disabled;
-    - NMS can be enabled or disabled;
-    - NMS is executed independently for each text query;
-    - one image is encoded only once for multiple text queries.
+ODVG inference contract:
+    - 一張影像只執行一次 Vision Backbone；
+    - 模型輸入為完整 caption；
+    - 每個 phrase 由 caption 內的 character span 映射至 BERT token；
+    - 每個 Object Query 同時輸出：
+        quality_score
+        phrase_alignment_score
+        final_score
+    - final_score 預設為 sqrt(quality * phrase_alignment)；
+    - Auxiliary branch 在推論時停用；
+    - NMS 可選，預設關閉以維持 DETR-style 推論。
 """
 
 import json
@@ -61,6 +70,9 @@ from units.model.train import (  # noqa: E402
 )
 from units.validate import LightDet as ValidateLightDet  # noqa: E402
 from units.tool.card import VisionTextModel  # noqa: E402
+from units.model.tool.runtime import (  # noqa: E402
+    score_queries_for_char_spans,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -156,8 +168,6 @@ def load_checkpoint_for_inference(
         prefer_ema=prefer_ema,
     )
 
-    # VisionTextModel.load_state_dict() handles legacy single-head checkpoints
-    # by copying head.* weights into aux_head.* when needed.
     load_result = model.load_state_dict(
         state_dict,
         strict=True,
@@ -200,28 +210,60 @@ def build_inference_model(
 ) -> VisionTextModel:
     cfg = model_cfg_all["model"]
 
+    image_grid_size = int(
+        cfg.get("image_grid_size", 10)
+    )
+
     return VisionTextModel(
-        img_in_channels=cfg["img_in_channels"],
-        hidden_dim=cfg["hidden_dim"],
-        target_size=(
-            int(cfg["image_grid_size"]),
-            int(cfg["image_grid_size"]),
+        img_in_channels=int(
+            cfg.get("img_in_channels", 1024)
         ),
-        text_max_length=cfg["text_max_length"],
-        fusion_token_num=cfg["fusion_token_num"],
-        num_heads=cfg["num_heads"],
-        num_layers=cfg["num_layers"],
-        mlp_ratio=cfg["mlp_ratio"],
-        dropout=cfg["dropout"],
-        freeze_bert=cfg["freeze_bert"],
-        precomputed_bert_path=cfg.get("precomputed_bert_path"),
+        cnn_layer=int(
+            cfg.get("cnn_layers", 3)
+        ),
+        hidden_dim=int(
+            cfg.get("hidden_dim", 512)
+        ),
+        target_size=(
+            image_grid_size,
+            image_grid_size,
+        ),
+        text_max_length=int(
+            cfg.get("text_max_length", 96)
+        ),
+        fusion_token_num=int(
+            cfg.get("fusion_token_num", 16)
+        ),
+        num_object_queries=int(
+            cfg.get("num_object_queries", 100)
+        ),
+        num_heads=int(
+            cfg.get("num_heads", 8)
+        ),
+        num_layers=int(
+            cfg.get("num_layers", 3)
+        ),
+        mlp_ratio=float(
+            cfg.get("mlp_ratio", 3.5)
+        ),
+        dropout=float(
+            cfg.get("dropout", 0.1)
+        ),
+        freeze_bert=bool(
+            cfg.get("freeze_bert", True)
+        ),
+        precomputed_bert_path=cfg.get(
+            "precomputed_bert_path"
+        ),
         use_auxiliary_head=bool(
             cfg.get("use_auxiliary_head", True)
         ),
-        # Inference always disables auxiliary predictions.
         auxiliary_in_eval=False,
         initialize_aux_from_main=bool(
             cfg.get("initialize_aux_from_main", True)
+        ),
+        query_group_init_std=float(
+            cfg.get("query_group_init_std", 0.02)
         ),
     )
 
@@ -232,49 +274,125 @@ def resolve_inference_device(
     normalized = normalize_device(device)
     resolved = torch.device(normalized)
 
-    if resolved.type != "cuda":
-        return resolved
+    if resolved.type == "cuda":
+        if not torch.cuda.is_available():
+            print("[Warning] CUDA unavailable; falling back to CPU.")
+            return torch.device("cpu")
 
-    if not torch.cuda.is_available():
-        print("[Warning] CUDA unavailable; falling back to CPU.")
-        return torch.device("cpu")
-
-    index = 0 if resolved.index is None else int(resolved.index)
-
-    if index >= torch.cuda.device_count():
-        raise ValueError(
-            f"Requested cuda:{index}, but only "
-            f"{torch.cuda.device_count()} CUDA device(s) are available."
+        index = (
+            0
+            if resolved.index is None
+            else int(resolved.index)
         )
 
-    return torch.device(f"cuda:{index}")
+        if index >= torch.cuda.device_count():
+            raise ValueError(
+                f"Requested cuda:{index}, but only "
+                f"{torch.cuda.device_count()} CUDA device(s) are available."
+            )
+
+        return torch.device(f"cuda:{index}")
+
+    if resolved.type == "mps":
+        if not torch.backends.mps.is_available():
+            print("[Warning] MPS unavailable; falling back to CPU.")
+            return torch.device("cpu")
+
+    return resolved
 
 
 # ---------------------------------------------------------------------------
-# Input / box helpers
+# Text / input helpers
 # ---------------------------------------------------------------------------
 
 
-def normalize_queries(
-    text: str | Sequence[str],
+def normalize_caption(
+    caption: str,
+) -> str:
+    normalized = str(caption).strip()
+
+    if not normalized:
+        raise ValueError(
+            "caption must be a non-empty string."
+        )
+
+    return normalized
+
+
+def normalize_phrases(
+    phrases: str | Sequence[str],
 ) -> List[str]:
-    if isinstance(text, str):
-        candidates = [text]
+    if isinstance(phrases, str):
+        candidates = [phrases]
     else:
-        candidates = list(text)
+        candidates = list(phrases)
 
-    queries = [
-        str(query).strip()
-        for query in candidates
-        if str(query).strip()
-    ]
+    normalized: List[str] = []
+    seen = set()
 
-    if not queries:
+    for raw_phrase in candidates:
+        phrase = str(raw_phrase).strip()
+
+        if not phrase or phrase in seen:
+            continue
+
+        normalized.append(phrase)
+        seen.add(phrase)
+
+    if not normalized:
         raise ValueError(
-            "text must contain at least one non-empty query."
+            "phrases must contain at least one non-empty phrase."
         )
 
-    return queries
+    return normalized
+
+
+def find_phrase_char_spans(
+    caption: str,
+    phrase: str,
+    include_all_occurrences: bool = True,
+) -> List[List[int]]:
+    """
+    Locate phrase occurrences in caption.
+
+    The returned intervals follow Python slicing semantics:
+        caption[start:end] == phrase
+    """
+    if not phrase:
+        raise ValueError("phrase must not be empty")
+
+    spans: List[List[int]] = []
+    start = 0
+
+    while True:
+        position = caption.find(
+            phrase,
+            start,
+        )
+
+        if position < 0:
+            break
+
+        end = position + len(phrase)
+        spans.append([
+            int(position),
+            int(end),
+        ])
+
+        if not include_all_occurrences:
+            break
+
+        start = position + max(
+            len(phrase),
+            1,
+        )
+
+    if not spans:
+        raise ValueError(
+            f"Phrase {phrase!r} is not contained in caption {caption!r}."
+        )
+
+    return spans
 
 
 def preprocess_image(
@@ -299,13 +417,20 @@ def preprocess_image(
 
     transform = transforms.Compose([
         transforms.Resize(
-            (int(image_size), int(image_size)),
-            interpolation=transforms.InterpolationMode.BILINEAR,
+            (
+                int(image_size),
+                int(image_size),
+            ),
+            interpolation=(
+                transforms.InterpolationMode.BILINEAR
+            ),
         ),
         transforms.ToTensor(),
     ])
 
-    image_tensor = transform(pil_image).unsqueeze(0)
+    image_tensor = transform(
+        pil_image
+    ).unsqueeze(0)
 
     original_bgr = cv2.cvtColor(
         np.asarray(pil_image),
@@ -318,6 +443,11 @@ def preprocess_image(
         int(original_width),
         int(original_height),
     )
+
+
+# ---------------------------------------------------------------------------
+# Box / score helpers
+# ---------------------------------------------------------------------------
 
 
 def sanitize_xyxy_boxes(
@@ -353,7 +483,9 @@ def normalized_xyxy_to_pixels(
     width: int,
     height: int,
 ) -> torch.Tensor:
-    boxes = sanitize_xyxy_boxes(boxes)
+    boxes = sanitize_xyxy_boxes(
+        boxes
+    )
 
     scale = boxes.new_tensor([
         float(width),
@@ -384,41 +516,68 @@ def normalized_xyxy_to_pixels(
     return pixel_boxes
 
 
-def select_main_predictions(
+def select_phrase_predictions(
     boxes: torch.Tensor,
-    score_logits: torch.Tensor,
+    final_scores: torch.Tensor,
+    quality_scores: torch.Tensor,
+    alignment_scores: torch.Tensor,
     confidence_threshold: float,
     top_k: int,
     width: int,
     height: int,
-    use_nms: bool = True,
-    nms_iou_threshold: float = 0.6,
+    use_nms: bool = False,
+    nms_iou_threshold: float = 0.5,
 ) -> Dict[str, Any]:
     """
-    Select Main predictions using:
+    Select phrase-specific predictions.
 
-    1. sigmoid score
-    2. confidence threshold
-    3. descending score ordering
-    4. optional NMS
-    5. top-k selection
-
-    NMS is executed independently for each text query because this function
-    receives predictions from only one text query at a time.
+    Selection order:
+        1. final score threshold
+        2. descending final score
+        3. optional NMS
+        4. top-k
     """
     boxes = sanitize_xyxy_boxes(
         boxes.float().reshape(-1, 4)
     )
-    scores = score_logits.float().reshape(-1).sigmoid()
+    final_scores = (
+        final_scores
+        .float()
+        .reshape(-1)
+        .clamp(0.0, 1.0)
+    )
+    quality_scores = (
+        quality_scores
+        .float()
+        .reshape(-1)
+        .clamp(0.0, 1.0)
+    )
+    alignment_scores = (
+        alignment_scores
+        .float()
+        .reshape(-1)
+        .clamp(0.0, 1.0)
+    )
 
-    if int(boxes.shape[0]) != int(scores.shape[0]):
+    count = int(boxes.shape[0])
+
+    if not (
+        final_scores.numel()
+        == quality_scores.numel()
+        == alignment_scores.numel()
+        == count
+    ):
         raise ValueError(
             "Prediction box/score count mismatch: "
-            f"{boxes.shape[0]} != {scores.shape[0]}"
+            f"boxes={count}, "
+            f"final={final_scores.numel()}, "
+            f"quality={quality_scores.numel()}, "
+            f"alignment={alignment_scores.numel()}"
         )
 
     valid_indices = torch.nonzero(
-        scores >= float(confidence_threshold),
+        final_scores
+        >= float(confidence_threshold),
         as_tuple=False,
     ).flatten()
 
@@ -429,15 +588,22 @@ def select_main_predictions(
             0,
             valid_indices,
         )
-        candidate_scores = scores.index_select(
+        candidate_final = final_scores.index_select(
+            0,
+            valid_indices,
+        )
+        candidate_quality = quality_scores.index_select(
+            0,
+            valid_indices,
+        )
+        candidate_alignment = alignment_scores.index_select(
             0,
             valid_indices,
         )
         candidate_indices = valid_indices
 
-        # Sort candidates from highest to lowest confidence.
         order = torch.argsort(
-            candidate_scores,
+            candidate_final,
             descending=True,
             stable=True,
         )
@@ -446,7 +612,15 @@ def select_main_predictions(
             0,
             order,
         )
-        candidate_scores = candidate_scores.index_select(
+        candidate_final = candidate_final.index_select(
+            0,
+            order,
+        )
+        candidate_quality = candidate_quality.index_select(
+            0,
+            order,
+        )
+        candidate_alignment = candidate_alignment.index_select(
             0,
             order,
         )
@@ -455,46 +629,84 @@ def select_main_predictions(
             order,
         )
 
-        # Remove duplicate boxes for this text query.
-        if bool(use_nms) and int(candidate_boxes.shape[0]) > 1:
+        if (
+            bool(use_nms)
+            and int(candidate_boxes.shape[0]) > 1
+        ):
             keep = nms(
                 boxes=candidate_boxes,
-                scores=candidate_scores,
-                iou_threshold=float(nms_iou_threshold),
+                scores=candidate_final,
+                iou_threshold=float(
+                    nms_iou_threshold
+                ),
             )
 
             candidate_boxes = candidate_boxes.index_select(
                 0,
                 keep,
             )
-            candidate_scores = candidate_scores.index_select(
+            candidate_final = candidate_final.index_select(
                 0,
                 keep,
+            )
+            candidate_quality = candidate_quality.index_select(
+                0,
+                keep,
+            )
+            candidate_alignment = (
+                candidate_alignment.index_select(
+                    0,
+                    keep,
+                )
             )
             candidate_indices = candidate_indices.index_select(
                 0,
                 keep,
             )
 
-        num_after_nms = int(candidate_scores.numel())
+        num_after_nms = int(
+            candidate_final.numel()
+        )
 
         keep_count = min(
             int(top_k),
-            int(candidate_scores.numel()),
+            int(candidate_final.numel()),
         )
 
-        selected_boxes_norm = candidate_boxes[:keep_count]
-        selected_scores = candidate_scores[:keep_count]
-        selected_indices = candidate_indices[:keep_count]
+        selected_boxes_norm = candidate_boxes[
+            :keep_count
+        ]
+        selected_final = candidate_final[
+            :keep_count
+        ]
+        selected_quality = candidate_quality[
+            :keep_count
+        ]
+        selected_alignment = candidate_alignment[
+            :keep_count
+        ]
+        selected_indices = candidate_indices[
+            :keep_count
+        ]
 
     else:
         selected_indices = torch.empty(
             (0,),
-            device=scores.device,
+            device=final_scores.device,
             dtype=torch.long,
         )
-        selected_boxes_norm = boxes.new_empty((0, 4))
-        selected_scores = scores.new_empty((0,))
+        selected_boxes_norm = boxes.new_empty(
+            (0, 4)
+        )
+        selected_final = final_scores.new_empty(
+            (0,)
+        )
+        selected_quality = quality_scores.new_empty(
+            (0,)
+        )
+        selected_alignment = alignment_scores.new_empty(
+            (0,)
+        )
 
     selected_boxes_pixel = normalized_xyxy_to_pixels(
         selected_boxes_norm,
@@ -503,14 +715,46 @@ def select_main_predictions(
     )
 
     return {
-        "boxes_norm": selected_boxes_norm.detach().cpu(),
-        "boxes_pixel": selected_boxes_pixel.detach().cpu(),
-        "scores": selected_scores.detach().cpu(),
-        "indices": selected_indices.detach().cpu(),
-        "num_raw_predictions": int(scores.numel()),
-        "num_above_confidence": int(valid_indices.numel()),
-        "num_after_nms": int(num_after_nms),
-        "num_selected": int(selected_scores.numel()),
+        "boxes_norm": (
+            selected_boxes_norm
+            .detach()
+            .cpu()
+        ),
+        "boxes_pixel": (
+            selected_boxes_pixel
+            .detach()
+            .cpu()
+        ),
+        "scores": (
+            selected_final
+            .detach()
+            .cpu()
+        ),
+        "quality_scores": (
+            selected_quality
+            .detach()
+            .cpu()
+        ),
+        "alignment_scores": (
+            selected_alignment
+            .detach()
+            .cpu()
+        ),
+        "indices": (
+            selected_indices
+            .detach()
+            .cpu()
+        ),
+        "num_raw_predictions": count,
+        "num_above_confidence": int(
+            valid_indices.numel()
+        ),
+        "num_after_nms": int(
+            num_after_nms
+        ),
+        "num_selected": int(
+            selected_final.numel()
+        ),
     }
 
 
@@ -589,7 +833,9 @@ def fit_single_line_text(
         minimum_font_size - 1,
         -2,
     ):
-        font = get_chinese_font(size)
+        font = get_chinese_font(
+            size
+        )
 
         if measure_text(
             draw,
@@ -672,9 +918,9 @@ def draw_chinese_text(
     )
 
 
-def draw_query_panel(
+def draw_phrase_panel(
     image_bgr: np.ndarray,
-    text_query: str,
+    phrase: str,
 ) -> np.ndarray:
     image_rgb = cv2.cvtColor(
         image_bgr,
@@ -688,7 +934,7 @@ def draw_query_panel(
         pil_image
     )
 
-    label = f"查詢文字：{text_query}"
+    label = f"查詢片語：{phrase}"
     image_width, image_height = pil_image.size
 
     margin = max(
@@ -769,14 +1015,23 @@ def draw_query_panel(
 def draw_predictions(
     image_bgr: np.ndarray,
     boxes_pixel: np.ndarray,
-    scores: np.ndarray,
-    query: str,
+    final_scores: np.ndarray,
+    quality_scores: np.ndarray,
+    alignment_scores: np.ndarray,
+    phrase: str,
 ) -> np.ndarray:
     rendered = image_bgr.copy()
 
-    for box, score in zip(
+    for (
+        box,
+        final_score,
+        quality_score,
+        alignment_score,
+    ) in zip(
         boxes_pixel,
-        scores,
+        final_scores,
+        quality_scores,
+        alignment_scores,
     ):
         x1, y1, x2, y2 = (
             np.asarray(box)
@@ -795,17 +1050,21 @@ def draw_predictions(
             2,
         )
 
+        label = (
+            f"{phrase} "
+            f"F:{float(final_score):.3f} "
+            f"Q:{float(quality_score):.3f} "
+            f"A:{float(alignment_score):.3f}"
+        )
+
         rendered = draw_chinese_text(
             image_bgr=rendered,
-            text=(
-                f"{query}: "
-                f"{float(score):.3f}"
-            ),
+            text=label,
             position=(
                 x1,
                 max(0, y1 - 32),
             ),
-            font_size=26,
+            font_size=24,
             color_bgr=(0, 255, 0),
             max_width=max(
                 40,
@@ -813,15 +1072,32 @@ def draw_predictions(
             ),
         )
 
-    return draw_query_panel(
+    return draw_phrase_panel(
         image_bgr=rendered,
-        text_query=query,
+        phrase=phrase,
     )
 
 
 # ---------------------------------------------------------------------------
-# Inference core
+# ODVG inference core
 # ---------------------------------------------------------------------------
+
+
+def _resolve_main_output(
+    outputs: Dict[str, Any],
+    keys: Sequence[str],
+    name: str,
+) -> torch.Tensor:
+    for key in keys:
+        value = outputs.get(key)
+
+        if torch.is_tensor(value):
+            return value
+
+    raise KeyError(
+        f"Model output does not contain {name}. "
+        f"Tried keys: {list(keys)}"
+    )
 
 
 @torch.inference_mode()
@@ -829,12 +1105,16 @@ def predict_image(
     model: torch.nn.Module,
     image_tensor: torch.Tensor,
     original_bgr: np.ndarray,
-    queries: Sequence[str],
+    caption: str,
+    phrases: Sequence[str],
     device: torch.device,
     confidence_threshold: float,
     top_k: int,
-    use_nms: bool = True,
-    nms_iou_threshold: float = 0.6,
+    use_nms: bool = False,
+    nms_iou_threshold: float = 0.5,
+    token_reduction: str = "mean",
+    score_fusion: str = "geometric_mean",
+    include_all_occurrences: bool = True,
 ) -> Tuple[List[Dict[str, Any]], List[np.ndarray]]:
     image_tensor = image_tensor.to(
         device=device,
@@ -842,19 +1122,11 @@ def predict_image(
         non_blocking=True,
     )
 
-    query_count = len(queries)
-
-    image_indices = torch.zeros(
-        query_count,
-        dtype=torch.long,
-        device=device,
-    )
-
-    # One source image is encoded once, then expanded to every text query.
+    # A single image and complete caption are forwarded once.
     outputs = model(
         img=image_tensor,
-        texts=list(queries),
-        image_indices=image_indices,
+        texts=[caption],
+        image_indices=None,
         return_aux=False,
     )
 
@@ -866,13 +1138,104 @@ def predict_image(
             "Auxiliary branch was unexpectedly computed during inference."
         )
 
-    pred_boxes = outputs["bbox"]
-    pred_score_logits = outputs["score_logit"]
+    pred_boxes = _resolve_main_output(
+        outputs,
+        (
+            "bbox",
+            "main_bbox",
+        ),
+        "bbox",
+    )
+    quality_logit = _resolve_main_output(
+        outputs,
+        (
+            "quality_logit",
+            "main_quality_logit",
+        ),
+        "quality_logit",
+    )
+    token_alignment_logits = _resolve_main_output(
+        outputs,
+        (
+            "token_alignment_logits",
+            "main_token_alignment_logits",
+            "text_alignment_logit",
+        ),
+        "token_alignment_logits",
+    )
+    token_offsets = _resolve_main_output(
+        outputs,
+        ("token_offsets",),
+        "token_offsets",
+    )
+    alignment_text_mask = _resolve_main_output(
+        outputs,
+        (
+            "alignment_text_mask",
+            "text_mask",
+        ),
+        "alignment_text_mask",
+    )
 
-    if int(pred_boxes.shape[0]) != query_count:
+    if pred_boxes.ndim != 3 or pred_boxes.shape[0] != 1:
         raise RuntimeError(
-            "Prediction/query batch mismatch: "
-            f"{pred_boxes.shape[0]} != {query_count}"
+            "ODVG inference expects bbox shape [1,Q,4], got "
+            f"{tuple(pred_boxes.shape)}"
+        )
+
+    if (
+        quality_logit.ndim != 3
+        or quality_logit.shape[0] != 1
+        or quality_logit.shape[-1] != 1
+    ):
+        raise RuntimeError(
+            "ODVG inference expects quality_logit [1,Q,1], got "
+            f"{tuple(quality_logit.shape)}"
+        )
+
+    if (
+        token_alignment_logits.ndim != 3
+        or token_alignment_logits.shape[0] != 1
+    ):
+        raise RuntimeError(
+            "ODVG inference expects token_alignment_logits [1,Q,L], got "
+            f"{tuple(token_alignment_logits.shape)}"
+        )
+
+    if token_offsets.ndim != 3 or token_offsets.shape[0] != 1:
+        raise RuntimeError(
+            "ODVG inference expects token_offsets [1,L,2], got "
+            f"{tuple(token_offsets.shape)}"
+        )
+
+    if (
+        alignment_text_mask.ndim != 2
+        or alignment_text_mask.shape[0] != 1
+    ):
+        raise RuntimeError(
+            "ODVG inference expects alignment_text_mask [1,L], got "
+            f"{tuple(alignment_text_mask.shape)}"
+        )
+
+    boxes_row = pred_boxes[0]
+    quality_row = quality_logit[0]
+    token_logits_row = token_alignment_logits[0]
+    offsets_row = token_offsets[0]
+    valid_mask_row = alignment_text_mask[0]
+
+    if boxes_row.shape[0] != quality_row.shape[0]:
+        raise RuntimeError(
+            "bbox/quality query count mismatch"
+        )
+
+    if boxes_row.shape[0] != token_logits_row.shape[0]:
+        raise RuntimeError(
+            "bbox/token alignment query count mismatch"
+        )
+
+    if token_logits_row.shape[-1] != offsets_row.shape[0]:
+        raise RuntimeError(
+            "token alignment/token offset length mismatch"
         )
 
     height, width = original_bgr.shape[:2]
@@ -880,37 +1243,95 @@ def predict_image(
     results: List[Dict[str, Any]] = []
     rendered_images: List[np.ndarray] = []
 
-    for index, query in enumerate(queries):
-        # NMS is executed independently for each query.
-        selected = select_main_predictions(
-            boxes=pred_boxes[index],
-            score_logits=pred_score_logits[index],
-            confidence_threshold=confidence_threshold,
+    for phrase in phrases:
+        char_spans = find_phrase_char_spans(
+            caption=caption,
+            phrase=phrase,
+            include_all_occurrences=(
+                include_all_occurrences
+            ),
+        )
+
+        phrase_scores = score_queries_for_char_spans(
+            quality_logit=quality_row,
+            token_alignment_logits=token_logits_row,
+            token_offsets=offsets_row,
+            char_spans=char_spans,
+            valid_token_mask=valid_mask_row,
+            token_reduction=token_reduction,
+            score_fusion=score_fusion,
+            strict=True,
+        )
+
+        selected = select_phrase_predictions(
+            boxes=boxes_row,
+            final_scores=phrase_scores[
+                "final_score"
+            ],
+            quality_scores=phrase_scores[
+                "quality_score"
+            ],
+            alignment_scores=phrase_scores[
+                "phrase_alignment_score"
+            ],
+            confidence_threshold=(
+                confidence_threshold
+            ),
             top_k=top_k,
             width=width,
             height=height,
             use_nms=use_nms,
-            nms_iou_threshold=nms_iou_threshold,
+            nms_iou_threshold=(
+                nms_iou_threshold
+            ),
         )
 
         boxes_norm_np = selected[
             "boxes_norm"
         ].numpy()
-
         boxes_pixel_np = selected[
             "boxes_pixel"
         ].numpy()
-
-        scores_np = selected[
+        final_scores_np = selected[
             "scores"
         ].numpy()
+        quality_scores_np = selected[
+            "quality_scores"
+        ].numpy()
+        alignment_scores_np = selected[
+            "alignment_scores"
+        ].numpy()
+
+        positive_token_indices = torch.nonzero(
+            phrase_scores["token_mask"],
+            as_tuple=False,
+        ).flatten().detach().cpu().tolist()
 
         result = {
-            "query": query,
-            "boxes_norm": boxes_norm_np.tolist(),
-            "boxes_pixel": boxes_pixel_np.tolist(),
-            "scores": scores_np.tolist(),
-            "indices": selected["indices"].tolist(),
+            "phrase": phrase,
+            "caption": caption,
+            "char_spans": char_spans,
+            "positive_token_indices": (
+                positive_token_indices
+            ),
+            "boxes_norm": (
+                boxes_norm_np.tolist()
+            ),
+            "boxes_pixel": (
+                boxes_pixel_np.tolist()
+            ),
+            "scores": (
+                final_scores_np.tolist()
+            ),
+            "quality_scores": (
+                quality_scores_np.tolist()
+            ),
+            "alignment_scores": (
+                alignment_scores_np.tolist()
+            ),
+            "indices": (
+                selected["indices"].tolist()
+            ),
             "num_raw_predictions": selected[
                 "num_raw_predictions"
             ],
@@ -925,14 +1346,18 @@ def predict_image(
             ],
         }
 
-        results.append(result)
+        results.append(
+            result
+        )
 
         rendered_images.append(
             draw_predictions(
                 image_bgr=original_bgr,
                 boxes_pixel=boxes_pixel_np,
-                scores=scores_np,
-                query=query,
+                final_scores=final_scores_np,
+                quality_scores=quality_scores_np,
+                alignment_scores=alignment_scores_np,
+                phrase=phrase,
             )
         )
 
@@ -940,30 +1365,35 @@ def predict_image(
 
 
 # ---------------------------------------------------------------------------
-# YOLO-style interface
+# YOLO-style object interface
 # ---------------------------------------------------------------------------
 
 
 class LightDet(ValidateLightDet):
     """
-    Adds YOLO-style predict() to the same LightDet object used by train() and
-    val().
+    Adds ODVG-style phrase grounding predict() to the same LightDet object used
+    by train() and val().
 
     Example:
-        model = LightDet(model="/path/to/model.yaml")
+        model = LightDet(
+            model="/path/to/model.yaml"
+        )
 
         results = model.predict(
             weights="/path/to/best.pt",
             source="/path/to/image.jpg",
-            text=["ship", "car"],
-            imgsz=512,
+            caption="畫面中包含紅色的船與白色的船",
+            phrases=[
+                "紅色的船",
+                "白色的船",
+            ],
+            imgsz=1024,
             device=0,
-            conf=0.001,
-            top_k=100,
-            use_nms=True,
-            nms_iou_threshold=0.6,
+            conf=0.05,
+            top_k=20,
+            use_nms=False,
             project="runs/predict",
-            name="exp",
+            name="odvg_exp",
         )
     """
 
@@ -971,24 +1401,29 @@ class LightDet(ValidateLightDet):
         self,
         weights: str,
         source: str | Path,
-        text: str | Sequence[str],
-        imgsz: int = 512,
+        caption: str,
+        phrases: str | Sequence[str],
+        imgsz: int = 1024,
         device: Optional[Any] = None,
-        conf: float = 0.001,
-        top_k: int = 100,
-        use_nms: bool = True,
-        nms_iou_threshold: float = 0.6,
+        conf: float = 0.05,
+        top_k: int = 20,
+        use_nms: bool = False,
+        nms_iou_threshold: float = 0.5,
+        token_reduction: str = "mean",
+        score_fusion: str = "geometric_mean",
+        include_all_occurrences: bool = True,
         project: str = "runs/predict",
-        name: str = "exp",
+        name: str = "odvg_exp",
         prefer_ema: bool = True,
         save: bool = True,
         save_json: bool = True,
     ) -> Dict[str, Any]:
         """
-        Run Main One-to-One inference on one image and one or more text queries.
+        Run Main One-to-One ODVG inference for one image.
 
-        Frequently changed runtime values remain in predict(). Model structure
-        and BERT cache paths are read from model.yaml.
+        The model receives one complete caption. Every requested phrase is
+        scored from the corresponding caption token span without running the
+        backbone or Transformer again.
         """
         start_time = time.perf_counter()
 
@@ -1007,26 +1442,41 @@ class LightDet(ValidateLightDet):
                 f"imgsz must be > 0, got {imgsz}"
             )
 
-        if not 0.0 <= float(nms_iou_threshold) <= 1.0:
+        if not 0.0 <= float(
+            nms_iou_threshold
+        ) <= 1.0:
             raise ValueError(
                 "nms_iou_threshold must be within [0, 1], "
                 f"got {nms_iou_threshold}"
             )
 
-        queries = normalize_queries(text)
+        normalized_caption = normalize_caption(
+            caption
+        )
+        normalized_phrases = normalize_phrases(
+            phrases
+        )
+
+        # Validate every phrase before loading the model.
+        for phrase in normalized_phrases:
+            find_phrase_char_spans(
+                caption=normalized_caption,
+                phrase=phrase,
+                include_all_occurrences=(
+                    include_all_occurrences
+                ),
+            )
 
         source_path = (
             Path(source)
             .expanduser()
             .resolve()
         )
-
         checkpoint_path = (
             Path(weights)
             .expanduser()
             .resolve()
         )
-
         output_dir = (
             Path(project).expanduser()
             / str(name)
@@ -1068,35 +1518,48 @@ class LightDet(ValidateLightDet):
             image_size=int(imgsz),
         )
 
-        print("\n[LightDet] Prediction config")
-        print(f"  source       : {source_path}")
-        print(f"  weights      : {checkpoint_info['path']}")
-        print(f"  source state : {checkpoint_info['source']}")
-        print(f"  epoch        : {checkpoint_info['epoch']}")
-        print(f"  device       : {resolved_device}")
-        print(f"  image size   : {imgsz}")
-        print(f"  original     : {width}x{height}")
-        print(f"  queries      : {len(queries)}")
-        print(f"  confidence   : {float(conf):.6f}")
-        print(f"  top-k        : {int(top_k)}")
-        print(f"  use NMS      : {bool(use_nms)}")
+        print("\n[LightDet ODVG] Prediction config")
+        print(f"  source          : {source_path}")
+        print(f"  weights         : {checkpoint_info['path']}")
+        print(f"  source state    : {checkpoint_info['source']}")
+        print(f"  epoch           : {checkpoint_info['epoch']}")
+        print(f"  device          : {resolved_device}")
+        print(f"  image size      : {imgsz}")
+        print(f"  original        : {width}x{height}")
+        print(f"  caption         : {normalized_caption}")
+        print(f"  phrases         : {len(normalized_phrases)}")
+        print(f"  confidence      : {float(conf):.6f}")
+        print(f"  top-k           : {int(top_k)}")
+        print(f"  token reduction : {token_reduction}")
+        print(f"  score fusion    : {score_fusion}")
+        print(f"  use NMS         : {bool(use_nms)}")
         print(
-            f"  NMS IoU      : "
+            f"  NMS IoU         : "
             f"{float(nms_iou_threshold):.3f}"
         )
-        print("  auxiliary    : disabled")
+        print("  auxiliary       : disabled")
 
         results, rendered_images = predict_image(
             model=inference_model,
             image_tensor=image_tensor,
             original_bgr=original_bgr,
-            queries=queries,
+            caption=normalized_caption,
+            phrases=normalized_phrases,
             device=resolved_device,
             confidence_threshold=float(conf),
             top_k=int(top_k),
             use_nms=bool(use_nms),
             nms_iou_threshold=float(
                 nms_iou_threshold
+            ),
+            token_reduction=str(
+                token_reduction
+            ),
+            score_fusion=str(
+                score_fusion
+            ),
+            include_all_occurrences=bool(
+                include_all_occurrences
             ),
         )
 
@@ -1153,8 +1616,16 @@ class LightDet(ValidateLightDet):
                 "width": width,
                 "height": height,
             },
+            "caption": normalized_caption,
+            "phrases": normalized_phrases,
             "confidence_threshold": float(conf),
             "top_k": int(top_k),
+            "token_reduction": str(
+                token_reduction
+            ),
+            "score_fusion": str(
+                score_fusion
+            ),
             "use_nms": bool(use_nms),
             "nms_iou_threshold": float(
                 nms_iou_threshold
@@ -1206,17 +1677,25 @@ class LightDet(ValidateLightDet):
 
         for result in results:
             print(
-                f"  query={result['query']!r}, "
+                f"  phrase={result['phrase']!r}, "
+                f"spans={result['char_spans']}, "
                 f"raw={result['num_raw_predictions']}, "
                 f"above_conf={result['num_above_confidence']}, "
                 f"after_nms={result['num_after_nms']}, "
                 f"selected={result['num_selected']}"
             )
 
-            for rank, (box, score) in enumerate(
+            for rank, (
+                box,
+                final_score,
+                quality_score,
+                alignment_score,
+            ) in enumerate(
                 zip(
                     result["boxes_pixel"],
                     result["scores"],
+                    result["quality_scores"],
+                    result["alignment_scores"],
                 ),
                 start=1,
             ):
@@ -1227,24 +1706,26 @@ class LightDet(ValidateLightDet):
 
                 print(
                     f"    rank={rank:02d}, "
-                    f"score={float(score):.6f}, "
+                    f"final={float(final_score):.6f}, "
+                    f"quality={float(quality_score):.6f}, "
+                    f"alignment={float(alignment_score):.6f}, "
                     f"box={rounded_box}"
                 )
 
         print(
-            f"  elapsed      : "
+            f"  elapsed        : "
             f"{elapsed_seconds:.3f}s"
         )
 
         if rendered_path is not None:
             print(
-                f"  saved image  : "
+                f"  saved image    : "
                 f"{rendered_path}"
             )
 
         if json_path is not None:
             print(
-                f"  saved JSON   : "
+                f"  saved JSON     : "
                 f"{json_path}"
             )
 
@@ -1265,30 +1746,46 @@ def main() -> None:
 
     model.predict(
         weights=(
-            "/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_HDETR_transformer_layer_decoupled_v3/best_map50.pt"
+            "/home/soic/Desktop/LightDet/"
+            "units/model/runs/train/"
+            "lightdet_odvg/best_map50_95.pt"
         ),
         source=(
-            "/home/soic/Desktop/datasetPreTest15000/dataset/datasetPreTest15000_mixed/images/train/2023_08_08_15_26_49_815814_1.jpg"
+            "/home/soic/Desktop/LightDet/"
+            "datasets/images/val/example.jpg"
         ),
-        text=[
-            "一輛計程車",
-            "一艘紅色的船",
+
+        # 完整 caption 只輸入模型一次。
+        caption=(
+            "畫面中包含一艘紅色的船、"
+            "一艘白色的船與一艘藍白相間的船"
+        ),
+
+        # 每個 phrase 必須是 caption 中的完整子字串。
+        phrases=[
+            "紅色的船",
+            "白色的船",
+            "藍白相間的船",
         ],
+
         imgsz=1024,
         device=0,
-        conf=0.4,
+        conf=0.05,
         top_k=20,
 
-        # NMS 設定
-        use_nms=True,
-        nms_iou_threshold=0.3,
+        # DETR-style 預設不使用 NMS。
+        use_nms=False,
+        nms_iou_threshold=0.5,
+
+        # Phrase token 與 quality 的聚合方式。
+        token_reduction="mean",
+        score_fusion="geometric_mean",
+        include_all_occurrences=True,
 
         project="runs/predict",
-        name="lightdet_hybrid",
+        name="lightdet_odvg",
 
-        
         prefer_ema=True,
-
         save=True,
         save_json=True,
     )

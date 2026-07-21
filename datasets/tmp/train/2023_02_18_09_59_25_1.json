@@ -1,0 +1,28 @@
+[
+  {
+    "name": "2023_02_18_09_59_25_1_000.jpg",
+    "bbox_xyxy": [
+      2,
+      84,
+      488,
+      513
+    ],
+    "class_id": 0,
+    "source_name": "2023_02_18_09_59_25_1",
+    "source_size": {
+      "width": 1280,
+      "height": 720
+    },
+    "llm_output": "否，未觀察到對應結構。",
+    "attributes": {
+      "main_colors": [],
+      "is_multicolor": false
+    },
+    "query_text": "船",
+    "query_texts_aug": [
+      "船",
+      "一艘船"
+    ],
+    "raw_text": "否，未觀察到對應結構。"
+  }
+]

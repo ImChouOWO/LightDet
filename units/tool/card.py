@@ -1,18 +1,1253 @@
 from __future__ import annotations
-
-from pathlib import Path
+import math
 from typing import Any, Dict, Optional
+import yaml
+
+import os
+import warnings
+from pathlib import Path
+
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"torch\.cuda")
+warnings.filterwarnings("ignore", category=UserWarning, module=r"huggingface_hub")
+warnings.filterwarnings("ignore", category=UserWarning, module=r"transformers")
 
 import torch
 import torch.nn as nn
-import yaml
+import torch.nn.functional as F
+from torchvision.models import ResNet50_Weights, resnet50
+from torchvision.models.feature_extraction import create_feature_extractor
+from transformers import BertModel, BertTokenizerFast
+from transformers.utils import logging as transformers_logging
+from huggingface_hub import logging as hub_logging
+from huggingface_hub.utils import disable_progress_bars
 
-from . import card_legacy as _legacy
-from .card_legacy import *  # noqa: F401,F403
+transformers_logging.set_verbosity_error()
+hub_logging.set_verbosity_error()
+disable_progress_bars()
+
+CARD_ROOT = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "../../../",
+    )
+)
+print("Card Root :", CARD_ROOT)
+
+
+def make_group_norm(
+    channels: int,
+    max_groups: int = 32,
+) -> nn.GroupNorm:
+    num_groups = min(max_groups, channels)
+
+    while channels % num_groups != 0:
+        num_groups -= 1
+
+    return nn.GroupNorm(
+        num_groups=num_groups,
+        num_channels=channels,
+    )
+
+
+class FusionBlock(nn.Module):
+    def __init__(
+        self,
+        hidden_dim=256,
+        fusion_token_num=16,
+    ):
+        super().__init__()
+
+        self.fusion_tokens = nn.Parameter(
+            torch.randn(
+                1,
+                fusion_token_num,
+                hidden_dim,
+            )
+        )
+
+        self.img_adapter = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(
+        self,
+        img_tokens,
+        text_tokens,
+        text_mask,
+    ):
+        """
+        img_tokens:
+            [B, num_image, hidden_dim]
+
+        text_tokens:
+            [B, num_text, hidden_dim]
+        """
+        img_global = img_tokens.mean(dim=1)
+
+        fusion_tokens = self.fusion_tokens.expand(
+            img_tokens.shape[0],
+            -1,
+            -1,
+        )
+        fusion_tokens = (
+            fusion_tokens
+            + self.img_adapter(
+                img_global
+            ).unsqueeze(1)
+        )
+
+        x = torch.cat(
+            [
+                fusion_tokens,
+                img_tokens,
+                text_tokens,
+            ],
+            dim=1,
+        )
+
+        if text_mask is not None:
+            fusion_mask = torch.ones(
+                img_tokens.shape[0],
+                fusion_tokens.shape[1],
+                device=img_tokens.device,
+                dtype=text_mask.dtype,
+            )
+
+            img_mask = torch.ones(
+                img_tokens.shape[0],
+                img_tokens.shape[1],
+                device=img_tokens.device,
+                dtype=text_mask.dtype,
+            )
+
+            attention_mask = torch.cat(
+                [
+                    fusion_mask,
+                    img_mask,
+                    text_mask,
+                ],
+                dim=1,
+            )
+        else:
+            attention_mask = None
+
+        return x, attention_mask
+
+
+class TransformerBlock(nn.Module):
+    """
+    Unified decoder-only Transformer for multimodal object queries.
+
+    Context sequence:
+        [Fusion Tokens, Image Tokens, Text Tokens]
+
+    Prediction sequence:
+        [Context Tokens, Object Queries]
+
+    Main and auxiliary branches:
+      - share Transformer weights;
+      - use different learnable object-query embeddings;
+      - are stacked along the batch dimension;
+      - cannot attend to each other because self-attention never crosses
+        different batch elements.
+
+    Prefix-style attention:
+      - context tokens may attend only to context tokens;
+      - object queries may attend to all context tokens and all object queries.
+
+    This preserves a single self-attention stack while giving object queries
+    decoder-like access to image, text, and fusion information.
+    """
+
+    MAIN_GROUP = 0
+    AUX_GROUP = 1
+
+    def __init__(
+        self,
+        hidden_dim=512,
+        fusion_token_num=16,
+        num_heads=8,
+        num_layers=1,
+        mlp_ratio=4.0,
+        dropout=0.1,
+        query_group_init_std=0.02,
+    ):
+        super().__init__()
+
+        self.hidden_dim = int(hidden_dim)
+
+        self.fuse = FusionBlock(
+            hidden_dim=hidden_dim,
+            fusion_token_num=fusion_token_num,
+        )
+
+        # The group embedding is applied only to object queries. Context
+        # tokens remain identical between Main and Aux branches.
+        self.query_group_embeddings = nn.Parameter(
+            torch.zeros(
+                2,
+                1,
+                self.hidden_dim,
+            )
+        )
+
+        if float(query_group_init_std) > 0.0:
+            nn.init.normal_(
+                self.query_group_embeddings.data[
+                    self.AUX_GROUP
+                ],
+                mean=0.0,
+                std=float(query_group_init_std),
+            )
+
+        transformer_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=int(
+                hidden_dim * mlp_ratio
+            ),
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+
+        # PyTorch calls this TransformerEncoder, but here it is used as one
+        # unified decoder-only self-attention stack over context + queries.
+        self.transformer = nn.TransformerEncoder(
+            transformer_layer,
+            num_layers=num_layers,
+        )
+
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    @staticmethod
+    def _build_padding_mask(
+        valid_mask: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """
+        Convert valid-token mask (1=valid) to Transformer padding mask
+        (True=masked).
+        """
+        if valid_mask is None:
+            return None
+        return torch.eq(valid_mask, 0)
+
+    @staticmethod
+    def _build_prefix_attention_mask(
+        context_length: int,
+        query_length: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Prefix-style attention mask.
+
+        Rows are readers and columns are keys/values.
+
+        Context -> Context: allowed
+        Context -> Query  : blocked
+        Query   -> Context: allowed
+        Query   -> Query  : allowed
+        """
+        context_length = int(context_length)
+        query_length = int(query_length)
+        total_length = context_length + query_length
+
+        attention_mask = torch.zeros(
+            total_length,
+            total_length,
+            dtype=torch.bool,
+            device=device,
+        )
+
+        attention_mask[
+            :context_length,
+            context_length:,
+        ] = True
+
+        return attention_mask
+
+    def _validate_queries(
+        self,
+        name: str,
+        queries: torch.Tensor,
+        *,
+        batch_size: int,
+    ) -> None:
+        if queries.ndim != 3:
+            raise ValueError(
+                f"{name} must have shape [B, Q, C], "
+                f"got {tuple(queries.shape)}"
+            )
+
+        if int(queries.shape[0]) != int(batch_size):
+            raise ValueError(
+                f"{name} batch size mismatch: "
+                f"{queries.shape[0]} != {batch_size}"
+            )
+
+        if int(queries.shape[-1]) != self.hidden_dim:
+            raise ValueError(
+                f"{name} hidden dimension mismatch: "
+                f"{queries.shape[-1]} != {self.hidden_dim}"
+            )
+
+        if int(queries.shape[1]) <= 0:
+            raise ValueError(
+                f"{name} must contain at least one object query"
+            )
+
+    def _add_group_embedding(
+        self,
+        queries: torch.Tensor,
+        group_index: int,
+    ) -> torch.Tensor:
+        return (
+            queries
+            + self.query_group_embeddings[
+                int(group_index)
+            ].to(
+                device=queries.device,
+                dtype=queries.dtype,
+            )
+        )
+
+    @staticmethod
+    def _extend_valid_mask(
+        context_valid_mask: torch.Tensor | None,
+        *,
+        batch_size: int,
+        query_length: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if context_valid_mask is None:
+            return None
+
+        query_valid_mask = torch.ones(
+            int(batch_size),
+            int(query_length),
+            dtype=context_valid_mask.dtype,
+            device=device,
+        )
+
+        return torch.cat(
+            [
+                context_valid_mask,
+                query_valid_mask,
+            ],
+            dim=1,
+        )
+
+    def forward(
+        self,
+        img_token: torch.Tensor,
+        text_token: torch.Tensor,
+        text_mask: torch.Tensor | None,
+        main_queries: torch.Tensor,
+        aux_queries: torch.Tensor | None = None,
+        return_aux: bool = False,
+    ):
+        """
+        Args:
+            img_token:
+                [B, N_image, C]
+            text_token:
+                [B, N_text, C]
+            text_mask:
+                [B, N_text], 1 for valid text token.
+            main_queries:
+                [B, N_query, C]
+            aux_queries:
+                [B, N_query, C] when return_aux=True.
+
+        Returns:
+            main_out:
+                [B, N_context + N_query, C]
+            aux_out:
+                [B, N_context + N_query, C] or None
+        """
+        context, context_valid_mask = self.fuse(
+            img_token,
+            text_token,
+            text_mask,
+        )
+
+        batch_size = int(context.shape[0])
+        context_length = int(context.shape[1])
+
+        self._validate_queries(
+            "main_queries",
+            main_queries,
+            batch_size=batch_size,
+        )
+
+        query_length = int(main_queries.shape[1])
+
+        main_queries = self._add_group_embedding(
+            main_queries,
+            self.MAIN_GROUP,
+        )
+        main_sequence = torch.cat(
+            [
+                context,
+                main_queries,
+            ],
+            dim=1,
+        ) # [Fusion | Image | Text | Main Object Queries]
+
+        complete_valid_mask = self._extend_valid_mask(
+            context_valid_mask,
+            batch_size=batch_size,
+            query_length=query_length,
+            device=context.device,
+        )
+        padding_mask = self._build_padding_mask(
+            complete_valid_mask
+        )
+
+        attention_mask = self._build_prefix_attention_mask(
+            context_length=context_length,
+            query_length=query_length,
+            device=context.device,
+        )
+
+        if not bool(return_aux):
+            main_out = self.transformer(
+                main_sequence,
+                mask=attention_mask,
+                src_key_padding_mask=padding_mask,
+            )
+            return self.norm(main_out), None
+
+        if aux_queries is None:
+            raise ValueError(
+                "aux_queries is required when return_aux=True"
+            )
+
+        self._validate_queries(
+            "aux_queries",
+            aux_queries,
+            batch_size=batch_size,
+        )
+
+        if int(aux_queries.shape[1]) != query_length:
+            raise ValueError(
+                "Main and Aux query counts must match for "
+                "batch-axis grouping: "
+                f"{query_length} != {aux_queries.shape[1]}"
+            )
+
+        aux_queries = self._add_group_embedding(
+            aux_queries,
+            self.AUX_GROUP,
+        )
+        aux_sequence = torch.cat(
+            [
+                context,
+                aux_queries,
+            ],
+            dim=1,
+        )
+
+        # Main and Aux sequences are isolated by the batch dimension while
+        # still sharing exactly the same Transformer parameters.
+        grouped_sequence = torch.cat(
+            [
+                main_sequence,
+                aux_sequence,
+            ],
+            dim=0,
+        )
+
+        if padding_mask is None:
+            grouped_padding_mask = None
+        else:
+            grouped_padding_mask = torch.cat(
+                [
+                    padding_mask,
+                    padding_mask,
+                ],
+                dim=0,
+            )
+
+        grouped_out = self.transformer(
+            grouped_sequence,
+            mask=attention_mask,
+            src_key_padding_mask=grouped_padding_mask,
+        )
+        grouped_out = self.norm(grouped_out)
+
+        main_out = grouped_out[:batch_size]
+        aux_out = grouped_out[batch_size:]
+
+        return main_out, aux_out
+
+
+class Bert(nn.Module):
+    def __init__(
+        self,
+        local_model_dir=(
+            f"{CARD_ROOT}/LightDet/units/model/bert"
+        ),
+        out_dim=512,
+        max_length=32,
+        max_cache_size=20000,
+        freeze_bert=True,
+        precomputed_bert_path=None,
+    ):
+        super().__init__()
+
+        local_model_dir = Path(
+            local_model_dir
+        )
+
+        if not local_model_dir.exists():
+            raise FileNotFoundError(
+                "找不到本機 BERT 模型資料夾: "
+                f"{local_model_dir}"
+            )
+
+        self.tokenizer = (
+            BertTokenizerFast.from_pretrained(
+                str(local_model_dir),
+                local_files_only=True,
+            )
+        )
+
+        self.model = BertModel.from_pretrained(
+            str(local_model_dir),
+            local_files_only=True,
+        )
+
+        self.max_length = max_length
+        self.max_cache_size = max_cache_size
+        self.cache = {}
+        self.precomputed_bert_path = (
+            precomputed_bert_path
+        )
+        self.precomputed_cache = None
+
+        bert_dim = (
+            self.model.config.hidden_size
+        )
+
+        self.proj = nn.Sequential(
+            nn.Linear(
+                bert_dim,
+                out_dim,
+            ),
+            nn.LayerNorm(out_dim),
+            nn.GELU(),
+        )
+
+        if freeze_bert:
+            self.model.eval()
+            for parameter in self.model.parameters():
+                parameter.requires_grad_(False)
+        else:
+            self.model.train()
+
+        if (
+            precomputed_bert_path is not None
+            and os.path.exists(
+                precomputed_bert_path
+            )
+        ):
+            try:
+                obj = torch.load(
+                    precomputed_bert_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+            except TypeError:
+                obj = torch.load(
+                    precomputed_bert_path,
+                    map_location="cpu",
+                )
+
+            self.precomputed_cache = obj[
+                "cache"
+            ]
+
+            print(
+                "[BERT] Loaded precomputed "
+                "raw cache: "
+                f"{len(self.precomputed_cache)} "
+                "texts"
+            )
+
+    def clear_cache(self):
+        self.cache.clear()
+
+    @staticmethod
+    def _normalize_texts(texts):
+        if isinstance(texts, str):
+            texts = [texts]
+
+        return [
+            str(text).strip()
+            for text in texts
+        ]
+
+    def _encode_texts(
+        self,
+        texts,
+        device,
+    ):
+        inputs = self.tokenizer(
+            texts,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+
+        inputs = {
+            key: value.to(device)
+            for key, value in inputs.items()
+        }
+
+        bert_trainable = any(
+            parameter.requires_grad
+            for parameter
+            in self.model.parameters()
+        )
+
+        if bert_trainable:
+            outputs = self.model(
+                **inputs
+            )
+        else:
+            with torch.no_grad():
+                outputs = self.model(
+                    **inputs
+                )
+
+        return {
+            "last_hidden_state": (
+                outputs.last_hidden_state
+            ),
+            "attention_mask": (
+                inputs["attention_mask"]
+            ),
+        }
+
+    @torch.no_grad()
+    def encode_raw(
+        self,
+        texts,
+        device=None,
+    ):
+        texts = self._normalize_texts(
+            texts
+        )
+
+        if device is None:
+            device = next(
+                self.model.parameters()
+            ).device
+
+        encoded = self._encode_texts(
+            texts,
+            device,
+        )
+
+        return {
+            "last_hidden_state": (
+                encoded[
+                    "last_hidden_state"
+                ]
+            ),
+            "attention_mask": (
+                encoded[
+                    "attention_mask"
+                ]
+            ),
+        }
+
+    def forward(
+        self,
+        texts,
+    ):
+        texts = self._normalize_texts(
+            texts
+        )
+
+        device = next(
+            self.proj.parameters()
+        ).device
+
+        bert_trainable = any(
+            parameter.requires_grad
+            for parameter
+            in self.model.parameters()
+        )
+
+        if bert_trainable:
+            encoded = self._encode_texts(
+                texts,
+                device,
+            )
+
+            text_tokens = self.proj(
+                encoded[
+                    "last_hidden_state"
+                ]
+            )
+
+            return {
+                "text_tokens": text_tokens,
+                "text_mask": encoded[
+                    "attention_mask"
+                ],
+            }
+
+        missing = []
+
+        for text in texts:
+            in_precomputed = (
+                self.precomputed_cache
+                is not None
+                and text
+                in self.precomputed_cache
+            )
+
+            in_runtime_cache = (
+                text in self.cache
+            )
+
+            if (
+                not in_precomputed
+                and not in_runtime_cache
+            ):
+                missing.append(text)
+
+        if missing:
+            encoded = self._encode_texts(
+                missing,
+                device,
+            )
+
+            for index, text in enumerate(
+                missing
+            ):
+                if (
+                    len(self.cache)
+                    >= self.max_cache_size
+                ):
+                    self.cache.clear()
+
+                self.cache[text] = {
+                    "last_hidden_state": (
+                        encoded[
+                            "last_hidden_state"
+                        ][index]
+                        .detach()
+                        .cpu()
+                    ),
+                    "attention_mask": (
+                        encoded[
+                            "attention_mask"
+                        ][index]
+                        .detach()
+                        .cpu()
+                    ),
+                }
+
+        hidden_states = []
+        masks = []
+
+        for text in texts:
+            if (
+                self.precomputed_cache
+                is not None
+                and text
+                in self.precomputed_cache
+            ):
+                item = (
+                    self.precomputed_cache[
+                        text
+                    ]
+                )
+            else:
+                item = self.cache[text]
+
+            hidden_states.append(
+                item[
+                    "last_hidden_state"
+                ]
+            )
+            masks.append(
+                item["attention_mask"]
+            )
+
+        hidden_states = torch.stack(
+            hidden_states,
+            dim=0,
+        ).to(
+            device=device,
+            dtype=torch.float32,
+        )
+
+        masks = torch.stack(
+            masks,
+            dim=0,
+        ).to(device)
+
+        text_tokens = self.proj(
+            hidden_states
+        )
+
+        return {
+            "text_tokens": text_tokens,
+            "text_mask": masks,
+        }
+
+
+class ResNet50Extractor(nn.Module):
+    def __init__(
+        self,
+        weights=ResNet50_Weights.DEFAULT,
+    ):
+        super().__init__()
+
+        torch.hub.set_dir(
+            f"{CARD_ROOT}/LightDet/"
+            "units/model/resnet"
+        )
+
+        model = resnet50(
+            weights=weights
+        )
+        model.eval()
+
+        for parameter in model.parameters():
+            parameter.requires_grad_(
+                False
+            )
+
+        return_nodes = {
+            "layer2": "feat_layer2",
+            "layer4": "feat_layer4",
+            "fc": "logits",
+        }
+
+        self.feature_extractor = (
+            create_feature_extractor(
+                model,
+                return_nodes=return_nodes,
+            )
+        )
+
+    def forward(
+        self,
+        x,
+    ):
+        outputs = (
+            self.feature_extractor(x)
+        )
+
+        return (
+            outputs["feat_layer2"],
+            outputs["feat_layer4"],
+            outputs["logits"],
+        )
+
+
+class ConvGNAct(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=1,
+        stride=1,
+        groups=1,
+        act=True,
+    ):
+        super().__init__()
+
+        padding = kernel_size // 2
+
+        layers = [
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                groups=groups,
+                bias=False,
+            ),
+            make_group_norm(
+                out_channels
+            ),
+        ]
+
+        if act:
+            layers.append(
+                nn.SiLU(
+                    inplace=True
+                )
+            )
+
+        self.block = nn.Sequential(
+            *layers
+        )
+
+    def forward(
+        self,
+        x,
+    ):
+        return self.block(x)
+
+
+class MobileNetV4ConvBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        stride=1,
+        expand_ratio=2.0,
+        start_dw=True,
+        middle_dw=True,
+        kernel_size=3,
+        use_residual=True,
+    ):
+        super().__init__()
+
+        hidden_channels = int(
+            in_channels * expand_ratio
+        )
+
+        self.use_residual = (
+            use_residual
+            and stride == 1
+            and in_channels
+            == out_channels
+        )
+
+        self.start_dw = (
+            ConvGNAct(
+                in_channels=in_channels,
+                out_channels=in_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                groups=in_channels,
+                act=True,
+            )
+            if start_dw
+            else nn.Identity()
+        )
+
+        self.expand = ConvGNAct(
+            in_channels=in_channels,
+            out_channels=hidden_channels,
+            kernel_size=1,
+            stride=1,
+            groups=1,
+            act=True,
+        )
+
+        self.middle_dw = (
+            ConvGNAct(
+                in_channels=hidden_channels,
+                out_channels=hidden_channels,
+                kernel_size=kernel_size,
+                stride=(
+                    1
+                    if start_dw
+                    else stride
+                ),
+                groups=hidden_channels,
+                act=True,
+            )
+            if middle_dw
+            else nn.Identity()
+        )
+
+        self.project = ConvGNAct(
+            in_channels=hidden_channels,
+            out_channels=out_channels,
+            kernel_size=1,
+            stride=1,
+            groups=1,
+            act=False,
+        )
+
+    def forward(
+        self,
+        x,
+    ):
+        identity = x
+
+        x = self.start_dw(x)
+        x = self.expand(x)
+        x = self.middle_dw(x)
+        x = self.project(x)
+
+        if self.use_residual:
+            x = x + identity
+
+        return x
+
+
+class ImgProjector(nn.Module):
+    def __init__(
+        self,
+        in_channels=1024,
+        out_channels=512,
+        layer_num=3,
+        expand_ratio=2.0,
+        target_size=(40, 40),
+    ):
+        super().__init__()
+
+        self.target_size = (
+            target_size
+        )
+
+        self.larger_view = (
+            self._make_layers(
+                in_channels,
+                out_channels,
+                layer_num,
+                expand_ratio,
+            )
+        )
+
+        self.middle_view = (
+            self._make_layers(
+                in_channels,
+                out_channels,
+                layer_num,
+                expand_ratio,
+            )
+        )
+
+        self.smaller_view = (
+            self._make_layers(
+                in_channels,
+                out_channels,
+                layer_num,
+                expand_ratio,
+            )
+        )
+
+        self.resize_view = nn.Sequential(
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=False,
+            ),
+            make_group_norm(
+                out_channels
+            ),
+            nn.SiLU(
+                inplace=True
+            ),
+        )
+
+    @staticmethod
+    def _make_layers(
+        in_channels,
+        out_channels,
+        layer_num,
+        expand_ratio,
+    ):
+        layers = []
+
+        for index in range(
+            layer_num
+        ):
+            layers.append(
+                MobileNetV4ConvBlock(
+                    in_channels=(
+                        in_channels
+                        if index == 0
+                        else out_channels
+                    ),
+                    out_channels=(
+                        out_channels
+                    ),
+                    stride=1,
+                    expand_ratio=(
+                        expand_ratio
+                    ),
+                    start_dw=True,
+                    middle_dw=True,
+                    kernel_size=3,
+                )
+            )
+
+        return nn.Sequential(
+            *layers
+        )
+
+    def forward(
+        self,
+        x,
+    ):
+        large_x = x
+
+        middle_x = F.interpolate(
+            x,
+            scale_factor=0.5,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        small_x = F.interpolate(
+            x,
+            scale_factor=0.25,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        large_feat = self.larger_view(
+            large_x
+        )
+        middle_feat = (
+            self.middle_view(
+                middle_x
+            )
+        )
+        small_feat = self.smaller_view(
+            small_x
+        )
+
+        target_size = self.target_size
+
+        large_feat = F.interpolate(
+            large_feat,
+            size=target_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        middle_feat = F.interpolate(
+            middle_feat,
+            size=target_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        small_feat = F.interpolate(
+            small_feat,
+            size=target_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        large_feat = self.resize_view(
+            large_feat
+        )
+        middle_feat = self.resize_view(
+            middle_feat
+        )
+        small_feat = self.resize_view(
+            small_feat
+        )
+
+        return (
+            large_feat
+            + middle_feat
+            + small_feat
+        )
+
+
+class BackBone(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels=1024,
+        target_size=(40, 40),
+        layer_num=3,
+    ):
+        super().__init__()
+
+        self.backbone = ImgProjector(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            layer_num=layer_num,
+            expand_ratio=2.0,
+            target_size=target_size,
+        )
+
+    def forward(
+        self,
+        x,
+    ):
+        x = self.backbone(x)
+        return x.flatten(
+            2
+        ).transpose(
+            1,
+            2,
+        )
+
+
+class BottleNet(nn.Module):
+    def __init__(
+        self,
+        in_channels=3,
+        out_channels=1024,
+    ):
+        super().__init__()
+
+        self.stem = nn.Sequential(
+            ConvGNAct(
+                in_channels,
+                64,
+                kernel_size=3,
+                stride=2,
+            ),
+            ConvGNAct(
+                64,
+                128,
+                kernel_size=3,
+                stride=2,
+            ),
+            ConvGNAct(
+                128,
+                256,
+                kernel_size=3,
+                stride=2,
+            ),
+            ConvGNAct(
+                256,
+                512,
+                kernel_size=3,
+                stride=2,
+            ),
+            ConvGNAct(
+                512,
+                out_channels,
+                kernel_size=1,
+                stride=1,
+            ),
+        )
+
+    def forward(
+        self,
+        x,
+    ):
+        return self.stem(x)
 
 
 class QueryHead(nn.Module):
-    """BBox, localization-quality and text-alignment prediction head."""
+    """BBox, localization-quality and token-level text-alignment head."""
 
     SUPPORTED_FUSIONS = {"geometric_mean", "product"}
 
@@ -21,32 +1256,50 @@ class QueryHead(nn.Module):
         hidden_dim: int = 512,
         score_fusion: str = "geometric_mean",
         fusion_eps: float = 1e-6,
+        alignment_temperature: float = 0.07,
     ) -> None:
         super().__init__()
+
+        self.hidden_dim = int(hidden_dim)
+
         self.bbox_head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 4),
         )
-        # Keep the legacy parameter name for checkpoint compatibility. This is
-        # now the localization-quality branch.
+
+        # Scalar localization-quality branch.
+        # Keep the historical parameter name for checkpoint compatibility.
         self.score_head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
-        self.text_alignment_head = nn.Sequential(
+
+        # Phrase Grounding alignment projections:
+        # object query [B,Q,C] x text token [B,L,C] -> [B,Q,L].
+        self.query_alignment_proj = nn.Sequential(
             nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, hidden_dim, bias=False),
         )
-        self.text_alignment_head.load_state_dict(
-            self.score_head.state_dict(),
-            strict=True,
+        self.token_alignment_proj = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim, bias=False),
         )
+
+        nn.init.eye_(self.query_alignment_proj[-1].weight)
+        nn.init.eye_(self.token_alignment_proj[-1].weight)
+
+        temperature = max(float(alignment_temperature), 1e-4)
+        self.alignment_logit_scale = nn.Parameter(
+            torch.tensor(
+                math.log(1.0 / temperature),
+                dtype=torch.float32,
+            )
+        )
+
         self.score_fusion = self._normalize_fusion(score_fusion)
         self.fusion_eps = max(float(fusion_eps), 1e-8)
 
@@ -79,54 +1332,750 @@ class QueryHead(nn.Module):
         y2 = torch.maximum(bbox_raw[..., 1], bbox_raw[..., 3])
         return torch.stack([x1, y1, x2, y2], dim=-1)
 
-    def predict_bbox(self, query_tokens: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _validate_query_tokens(
+        query_tokens: torch.Tensor,
+    ) -> None:
+        if query_tokens.ndim != 3:
+            raise ValueError(
+                "QueryHead input must have shape [B, Q, C], got "
+                f"{tuple(query_tokens.shape)}"
+            )
+
+    def predict_bbox(
+        self,
+        query_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        self._validate_query_tokens(query_tokens)
         return self.decode_xyxy(self.bbox_head(query_tokens))
+
+    def predict_quality(
+        self,
+        query_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        self._validate_query_tokens(query_tokens)
+        return self.score_head(query_tokens)
+
+    def predict_token_alignment(
+        self,
+        query_tokens: torch.Tensor,
+        text_tokens: torch.Tensor,
+        text_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Return token-level alignment logits with shape [B, Q, L].
+
+        text_mask must be true only for real caption tokens. Special tokens
+        and padding are masked before returning.
+        """
+        self._validate_query_tokens(query_tokens)
+
+        if text_tokens.ndim != 3:
+            raise ValueError(
+                "text_tokens must have shape [B, L, C], got "
+                f"{tuple(text_tokens.shape)}"
+            )
+        if text_mask.ndim != 2:
+            raise ValueError(
+                "text_mask must have shape [B, L], got "
+                f"{tuple(text_mask.shape)}"
+            )
+        if query_tokens.shape[0] != text_tokens.shape[0]:
+            raise ValueError(
+                "query/text batch mismatch: "
+                f"{query_tokens.shape[0]} != {text_tokens.shape[0]}"
+            )
+        if text_tokens.shape[:2] != text_mask.shape:
+            raise ValueError(
+                "text token/mask mismatch: "
+                f"{tuple(text_tokens.shape[:2])} != "
+                f"{tuple(text_mask.shape)}"
+            )
+        if query_tokens.shape[-1] != self.hidden_dim:
+            raise ValueError(
+                "query hidden dimension mismatch: "
+                f"{query_tokens.shape[-1]} != {self.hidden_dim}"
+            )
+        if text_tokens.shape[-1] != self.hidden_dim:
+            raise ValueError(
+                "text hidden dimension mismatch: "
+                f"{text_tokens.shape[-1]} != {self.hidden_dim}"
+            )
+
+        query_features = F.normalize(
+            self.query_alignment_proj(query_tokens).float(),
+            dim=-1,
+        )
+        token_features = F.normalize(
+            self.token_alignment_proj(text_tokens).float(),
+            dim=-1,
+        )
+
+        logit_scale = self.alignment_logit_scale.exp().clamp(
+            min=1.0,
+            max=100.0,
+        )
+
+        alignment_logits = torch.einsum(
+            "bqc,blc->bql",
+            query_features,
+            token_features,
+        )
+        alignment_logits = alignment_logits * logit_scale
+
+        valid_mask = text_mask.to(
+            device=alignment_logits.device,
+            dtype=torch.bool,
+        )
+        alignment_logits = alignment_logits.masked_fill(
+            ~valid_mask[:, None, :],
+            -1.0e4,
+        )
+
+        return alignment_logits
 
     def predict_scores(
         self,
         query_tokens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        quality_logit = self.score_head(query_tokens)
-        text_alignment_logit = self.text_alignment_head(query_tokens)
-        final_score_logit = self.fuse_logits(
-            quality_logit,
-            text_alignment_logit,
+        text_tokens: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+    ]:
+        quality_logit = self.predict_quality(query_tokens)
+
+        token_alignment_logits = None
+        if text_tokens is not None or text_mask is not None:
+            if text_tokens is None or text_mask is None:
+                raise ValueError(
+                    "text_tokens and text_mask must be provided together"
+                )
+            token_alignment_logits = self.predict_token_alignment(
+                query_tokens,
+                text_tokens,
+                text_mask,
+            )
+
+        # Phrase-specific score fusion requires a selected positive token map.
+        # Until matcher/loss performs that reduction, score_logit remains the
+        # localization-quality logit.
+        final_score_logit = quality_logit
+        final_score_logit._quality_logit = quality_logit
+        final_score_logit._token_alignment_logits = (
+            token_alignment_logits
         )
-        return quality_logit, text_alignment_logit, final_score_logit
+
+        return (
+            quality_logit,
+            token_alignment_logits,
+            final_score_logit,
+        )
 
     def fuse_logits(
         self,
         quality_logit: torch.Tensor,
-        text_alignment_logit: torch.Tensor,
+        phrase_alignment_logit: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        Fuse quality with an already reduced phrase-alignment scalar.
+        """
         quality = quality_logit.float().sigmoid()
-        alignment = text_alignment_logit.float().sigmoid()
+        alignment = phrase_alignment_logit.float().sigmoid()
+
         if self.score_fusion == "product":
             probability = quality * alignment
         else:
-            probability = torch.sqrt((quality * alignment).clamp_min(0.0))
+            probability = torch.sqrt(
+                (quality * alignment).clamp_min(0.0)
+            )
+
         probability = probability.clamp(
             min=self.fusion_eps,
             max=1.0 - self.fusion_eps,
         )
-        fused_logit = torch.logit(probability).to(quality_logit.dtype)
-        fused_logit._quality_logit = quality_logit
-        fused_logit._text_alignment_logit = text_alignment_logit
-        return fused_logit
+        return torch.logit(probability).to(quality_logit.dtype)
 
-    def forward(self, query_tokens: torch.Tensor):
-        if query_tokens.ndim != 3:
-            raise ValueError(
-                "QueryHead input must have shape [B, N_query, C], got "
-                f"{tuple(query_tokens.shape)}"
-            )
+    def forward(
+        self,
+        query_tokens: torch.Tensor,
+        text_tokens: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
+    ):
         bbox = self.predict_bbox(query_tokens)
-        _, _, final_score_logit = self.predict_scores(query_tokens)
+        _, _, final_score_logit = self.predict_scores(
+            query_tokens,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+        )
         return bbox, final_score_logit
 
 
-_legacy.QueryHead = QueryHead
+class _BaseVisionTextModel(nn.Module):
+    """
+    Decoder-only, object-query-based LightDet model.
 
+    Shared context:
+        BottleNet -> image projector -> Image Tokens
+        BERT -> Text Tokens
+        FusionBlock -> Fusion Tokens
+
+    Unified Transformer input:
+        [Fusion, Image, Text, Object Queries]
+
+    Main branch:
+        Main object queries
+        One-to-one Hungarian matching
+        Used for validation and inference
+
+    Auxiliary branch:
+        Auxiliary object queries
+        Repeated-GT one-to-many matching
+        Used during training by default
+
+    Main and Aux share the Transformer weights but remain attention-isolated
+    by batch-axis grouping. Their QueryHead parameters are independent.
+    """
+
+    def __init__(
+        self,
+        img_in_channels=1024,
+        hidden_dim=512,
+        target_size=(20, 20),
+        text_max_length=32,
+        fusion_token_num=16,
+        num_object_queries=100,
+        num_heads=8,
+        num_layers=1,
+        mlp_ratio=4.0,
+        dropout=0.1,
+        freeze_bert=True,
+        precomputed_bert_path=None,
+        use_auxiliary_head=True,
+        auxiliary_in_eval=False,
+        initialize_aux_from_main=True,
+        query_init_std=0.02,
+        query_group_init_std=0.02,
+        cnn_layer=3,
+    ):
+        super().__init__()
+
+        if len(target_size) != 2:
+            raise ValueError(
+                "target_size must contain two dimensions, "
+                f"got {target_size}"
+            )
+
+        self.hidden_dim = int(hidden_dim)
+        self.target_size = (
+            int(target_size[0]),
+            int(target_size[1]),
+        )
+        self.fusion_token_num = int(
+            fusion_token_num
+        )
+        self.num_object_queries = int(
+            num_object_queries
+        )
+
+        if self.num_object_queries <= 0:
+            raise ValueError(
+                "num_object_queries must be > 0, "
+                f"got {self.num_object_queries}"
+            )
+
+        self.num_image = (
+            self.target_size[0]
+            * self.target_size[1]
+        )
+        self.num_text = int(
+            text_max_length
+        )
+
+        self.use_auxiliary_head = bool(
+            use_auxiliary_head
+        )
+        self.auxiliary_in_eval = bool(
+            auxiliary_in_eval
+        )
+
+        self.bottle_net = BottleNet(
+            in_channels=3,
+            out_channels=img_in_channels,
+        )
+
+        self.img_model = BackBone(
+            in_channels=img_in_channels,
+            out_channels=hidden_dim,
+            target_size=self.target_size,
+            layer_num=cnn_layer,
+        )
+
+        # Learned 2D-grid position embedding after flattening the projected
+        # target_size feature map. This gives object queries explicit spatial
+        # information when reading image tokens.
+        self.image_position_embeddings = nn.Parameter(
+            torch.zeros(
+                1,
+                self.num_image,
+                self.hidden_dim,
+            )
+        )
+        nn.init.normal_(
+            self.image_position_embeddings,
+            mean=0.0,
+            std=0.02,
+        )
+
+        self.text_model = Bert(
+            out_dim=hidden_dim,
+            max_length=text_max_length,
+            freeze_bert=freeze_bert,
+            precomputed_bert_path=precomputed_bert_path,
+        )
+
+        # Independent learned search slots for Main and Aux branches.
+        self.main_object_queries = nn.Embedding(
+            self.num_object_queries,
+            self.hidden_dim,
+        )
+        self.aux_object_queries = (
+            nn.Embedding(
+                self.num_object_queries,
+                self.hidden_dim,
+            )
+            if self.use_auxiliary_head
+            else None
+        )
+
+        nn.init.normal_(
+            self.main_object_queries.weight,
+            mean=0.0,
+            std=float(query_init_std),
+        )
+        if self.aux_object_queries is not None:
+            nn.init.normal_(
+                self.aux_object_queries.weight,
+                mean=0.0,
+                std=float(query_init_std),
+            )
+
+        self.transformer = TransformerBlock(
+            hidden_dim=hidden_dim,
+            fusion_token_num=fusion_token_num,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            mlp_ratio=mlp_ratio,
+            dropout=dropout,
+            query_group_init_std=query_group_init_std,
+        )
+
+        # Keep the "head.*" namespace for checkpoint compatibility. The
+        # parameter names inside QueryHead match the previous DenseHead.
+        self.head = QueryHead(
+            hidden_dim=hidden_dim,
+        )
+
+        self.aux_head = (
+            QueryHead(
+                hidden_dim=hidden_dim,
+            )
+            if self.use_auxiliary_head
+            else None
+        )
+
+        if (
+            self.aux_head is not None
+            and bool(initialize_aux_from_main)
+        ):
+            self.initialize_auxiliary_head_from_main()
+
+    @property
+    def main_head(self):
+        return self.head
+
+    @torch.no_grad()
+    def initialize_auxiliary_head_from_main(
+        self,
+    ) -> None:
+        """
+        Initialize the auxiliary prediction branch from Main.
+
+        The object-query table is copied once, but remains an independent
+        parameter afterwards. The Aux group embedding still breaks symmetry.
+        """
+        if self.aux_head is None:
+            return
+
+        self.aux_head.load_state_dict(
+            self.head.state_dict(),
+            strict=True,
+        )
+
+        if self.aux_object_queries is not None:
+            self.aux_object_queries.weight.copy_(
+                self.main_object_queries.weight
+            )
+
+    def set_auxiliary_in_eval(
+        self,
+        enabled: bool,
+    ) -> None:
+        self.auxiliary_in_eval = bool(
+            enabled
+        )
+
+    def _resolve_return_aux(
+        self,
+        return_aux,
+    ) -> bool:
+        if (
+            not self.use_auxiliary_head
+            or self.aux_head is None
+            or self.aux_object_queries is None
+        ):
+            return False
+
+        if return_aux is not None:
+            return bool(return_aux)
+
+        if self.training:
+            return True
+
+        return bool(self.auxiliary_in_eval)
+
+    @staticmethod
+    def _expand_object_queries(
+        query_embedding: nn.Embedding,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Expand learned query table:
+            [N_query, C] -> [B, N_query, C]
+        """
+        query_weight = query_embedding.weight.to(
+            device=device,
+            dtype=dtype,
+        )
+
+        return (
+            query_weight
+            .unsqueeze(0)
+            .expand(
+                int(batch_size),
+                -1,
+                -1,
+            )
+        )
+
+    def _prepare_legacy_state_dict(
+        self,
+        state_dict,
+    ):
+        """
+        Load older dense checkpoints as initialization.
+
+        Existing backbone, Transformer, bbox-head, and score-head weights are
+        reused. Newly introduced object queries and image position embeddings
+        are initialized from the current model when absent.
+        """
+        prepared = state_dict.copy()
+
+        default_keys = {
+            "transformer.query_group_embeddings": (
+                self.transformer
+                .query_group_embeddings
+                .detach()
+                .clone()
+            ),
+            "image_position_embeddings": (
+                self.image_position_embeddings
+                .detach()
+                .clone()
+            ),
+            "main_object_queries.weight": (
+                self.main_object_queries
+                .weight
+                .detach()
+                .clone()
+            ),
+        }
+
+        if self.aux_object_queries is not None:
+            default_keys[
+                "aux_object_queries.weight"
+            ] = (
+                self.aux_object_queries
+                .weight
+                .detach()
+                .clone()
+            )
+
+        for key, value in default_keys.items():
+            if key not in prepared:
+                prepared[key] = value
+
+        if self.aux_head is None:
+            return {
+                key: value
+                for key, value in prepared.items()
+                if (
+                    not str(key).startswith("aux_head.")
+                    and not str(key).startswith(
+                        "aux_object_queries."
+                    )
+                )
+            }
+
+        has_auxiliary_weights = any(
+            str(key).startswith("aux_head.")
+            for key in prepared.keys()
+        )
+
+        if not has_auxiliary_weights:
+            main_prefix = "head."
+            aux_prefix = "aux_head."
+
+            for key, value in list(
+                prepared.items()
+            ):
+                key_text = str(key)
+
+                if not key_text.startswith(
+                    main_prefix
+                ):
+                    continue
+
+                suffix = key_text[
+                    len(main_prefix):
+                ]
+                aux_key = aux_prefix + suffix
+
+                if aux_key not in prepared:
+                    prepared[aux_key] = value
+
+        return prepared
+
+    def load_state_dict(
+        self,
+        state_dict,
+        strict=True,
+        assign=False,
+    ):
+        prepared = self._prepare_legacy_state_dict(
+            state_dict
+        )
+
+        try:
+            return super().load_state_dict(
+                prepared,
+                strict=strict,
+                assign=assign,
+            )
+        except TypeError:
+            return super().load_state_dict(
+                prepared,
+                strict=strict,
+            )
+
+    def forward(
+        self,
+        img,
+        texts,
+        image_indices=None,
+        return_aux=None,
+    ):
+        img = self.bottle_net(img)
+        img_token = self.img_model(img)
+
+        if int(img_token.shape[1]) != self.num_image:
+            raise RuntimeError(
+                "Image token count does not match configured target_size: "
+                f"{img_token.shape[1]} != {self.num_image}"
+            )
+
+        img_token = (
+            img_token
+            + self.image_position_embeddings.to(
+                device=img_token.device,
+                dtype=img_token.dtype,
+            )
+        )
+
+        if image_indices is not None:
+            if not torch.is_tensor(
+                image_indices
+            ):
+                image_indices = torch.tensor(
+                    image_indices,
+                    dtype=torch.long,
+                    device=img_token.device,
+                )
+            else:
+                image_indices = image_indices.to(
+                    device=img_token.device,
+                    dtype=torch.long,
+                    non_blocking=True,
+                )
+
+            image_indices = image_indices.reshape(-1)
+
+            if image_indices.numel() > 0:
+                minimum_index = int(
+                    image_indices.min().item()
+                )
+                maximum_index = int(
+                    image_indices.max().item()
+                )
+
+                if minimum_index < 0:
+                    raise IndexError(
+                        "image_indices contains a negative index: "
+                        f"{minimum_index}"
+                    )
+
+                if maximum_index >= int(
+                    img_token.shape[0]
+                ):
+                    raise IndexError(
+                        "image_indices exceeds image batch: "
+                        f"max_index={maximum_index}, "
+                        f"image_batch={img_token.shape[0]}"
+                    )
+
+            img_token = img_token.index_select(
+                0,
+                image_indices,
+            )
+
+        text_out = self.text_model(texts)
+        text_token = text_out["text_tokens"]
+        text_mask = text_out["text_mask"]
+
+        if int(img_token.shape[0]) != int(
+            text_token.shape[0]
+        ):
+            raise ValueError(
+                "Image-query batch size mismatch: "
+                f"image={img_token.shape[0]}, "
+                f"text={text_token.shape[0]}"
+            )
+
+        compute_auxiliary = self._resolve_return_aux(
+            return_aux
+        )
+        batch_size = int(img_token.shape[0])
+
+        main_queries = self._expand_object_queries(
+            self.main_object_queries,
+            batch_size=batch_size,
+            device=img_token.device,
+            dtype=img_token.dtype,
+        )
+
+        aux_queries = None
+        if compute_auxiliary:
+            if self.aux_object_queries is None:
+                raise RuntimeError(
+                    "Auxiliary queries are not initialized"
+                )
+
+            aux_queries = self._expand_object_queries(
+                self.aux_object_queries,
+                batch_size=batch_size,
+                device=img_token.device,
+                dtype=img_token.dtype,
+            )
+
+        (
+            main_transformer_out,
+            aux_transformer_out,
+        ) = self.transformer(
+            img_token=img_token,
+            text_token=text_token,
+            text_mask=text_mask,
+            main_queries=main_queries,
+            aux_queries=aux_queries,
+            return_aux=compute_auxiliary,
+        )
+
+        # Object queries are appended after all context tokens.
+        main_query_out = main_transformer_out[
+            :,
+            -self.num_object_queries:,
+            :,
+        ]
+
+        (
+            main_bbox,
+            main_score_logit,
+        ) = self.head(main_query_out)
+
+        aux_bbox = None
+        aux_score_logit = None
+        aux_query_out = None
+
+        if compute_auxiliary:
+            if aux_transformer_out is None:
+                raise RuntimeError(
+                    "Auxiliary output was requested but "
+                    "Transformer returned None"
+                )
+
+            aux_query_out = aux_transformer_out[
+                :,
+                -self.num_object_queries:,
+                :,
+            ]
+
+            (
+                aux_bbox,
+                aux_score_logit,
+            ) = self.aux_head(aux_query_out)
+
+        return {
+            # Backward-compatible Main aliases.
+            "bbox": main_bbox,
+            "score_logit": main_score_logit,
+
+            # Explicit hybrid predictions.
+            "main_bbox": main_bbox,
+            "main_score_logit": main_score_logit,
+            "aux_bbox": aux_bbox,
+            "aux_score_logit": aux_score_logit,
+            "aux_computed": bool(compute_auxiliary),
+
+            # Final object-query representations.
+            "main_object_query_out": main_query_out,
+            "aux_object_query_out": aux_query_out,
+
+            # Initial learned queries expanded to the current batch.
+            "main_object_queries": main_queries,
+            "aux_object_queries": aux_queries,
+
+            # Full decoder-only sequence outputs for diagnostics.
+            "transformer_out": main_transformer_out,
+            "main_transformer_out": main_transformer_out,
+            "aux_transformer_out": aux_transformer_out,
+
+            "query_groups_isolated": True,
+            "query_group_batching": "batch_axis",
+            "prediction_source": "object_queries",
+            "decoder_only": True,
+
+            "img_token": img_token,
+            "text_token": text_token,
+            "text_mask": text_mask,
+        }
+
+
+# ------------------------------------------------------------------
+# Public LightDet interface
+# ------------------------------------------------------------------
 
 def _read_model_defaults() -> Dict[str, Any]:
     config_path = (
@@ -143,7 +2092,7 @@ def _read_model_defaults() -> Dict[str, Any]:
     return dict(config.get("model", {}))
 
 
-class VisionTextModel(_legacy.VisionTextModel):
+class VisionTextModel(_BaseVisionTextModel):
     """Two-stage object-query model.
 
     Stage 1 uses the original Transformer to produce localization queries and
@@ -213,7 +2162,7 @@ class VisionTextModel(_legacy.VisionTextModel):
         self.score_fusion = self.head.score_fusion
         self.score_fusion_eps = self.head.fusion_eps
 
-        self.score_transformer = _legacy.TransformerBlock(
+        self.score_transformer = TransformerBlock(
             hidden_dim=self.hidden_dim,
             fusion_token_num=int(defaults.get(
                 "fusion_token_num",
@@ -257,28 +2206,32 @@ class VisionTextModel(_legacy.VisionTextModel):
         for parameter in self.img_model.parameters():
             parameter.requires_grad_(not self.freeze_img_projection)
 
+
     def _prepare_legacy_state_dict(self, state_dict):
         prepared = super()._prepare_legacy_state_dict(state_dict)
         current_state = self.state_dict()
 
+        # Old scalar text-alignment parameters do not match the new
+        # token-level projection heads.
+        prepared = {
+            key: value
+            for key, value in prepared.items()
+            if key in current_state
+        }
+
+        # Preserve compatible tensors and initialize new/changed tensors from
+        # the current model definition.
         for key, default_value in current_state.items():
-            if ".text_alignment_head." in key and key not in prepared:
-                source_key = key.replace(
-                    ".text_alignment_head.",
-                    ".score_head.",
-                )
-                source_value = prepared.get(source_key)
-                if (
-                    torch.is_tensor(source_value)
-                    and tuple(source_value.shape) == tuple(default_value.shape)
-                ):
-                    prepared[key] = source_value.detach().clone()
-                    continue
+            source_value = prepared.get(key)
+
             if (
-                key.startswith("score_transformer.")
-                or key.startswith("bbox_query_encoder.")
-            ) and key not in prepared:
+                source_value is None
+                or not torch.is_tensor(source_value)
+                or tuple(source_value.shape)
+                != tuple(default_value.shape)
+            ):
                 prepared[key] = default_value.detach().clone()
+
         return prepared
 
     def _condition_score_queries(
@@ -348,6 +2301,7 @@ class VisionTextModel(_legacy.VisionTextModel):
         )
         return main_score_query, aux_score_query
 
+
     def forward(
         self,
         img,
@@ -362,20 +2316,81 @@ class VisionTextModel(_legacy.VisionTextModel):
             return_aux=return_aux,
         )
 
-        if not self.staged_query_refinement:
-            main_score = outputs["main_score_logit"]
-            main_quality = getattr(main_score, "_quality_logit", main_score)
-            main_alignment = getattr(
-                main_score,
-                "_text_alignment_logit",
-                main_score,
+        # Preserve each BERT token's character interval for ODVG span mapping.
+        normalized_texts = self.text_model._normalize_texts(texts)
+        tokenized_text = self.text_model.tokenizer(
+            normalized_texts,
+            padding="max_length",
+            truncation=True,
+            max_length=self.num_text,
+            return_offsets_mapping=True,
+            return_tensors="pt",
+        )
+        token_offsets = tokenized_text["offset_mapping"].to(
+            device=outputs["text_mask"].device,
+            dtype=torch.long,
+            non_blocking=True,
+        )
+        token_attention_mask = tokenized_text["attention_mask"].to(
+            device=outputs["text_mask"].device,
+            dtype=outputs["text_mask"].dtype,
+            non_blocking=True,
+        )
+
+        if not torch.equal(
+            token_attention_mask,
+            outputs["text_mask"],
+        ):
+            raise RuntimeError(
+                "ODVG tokenizer attention mask differs from BERT text mask"
             )
+
+        # [CLS], [SEP] and padding have offset [0, 0].
+        alignment_text_mask = (
+            outputs["text_mask"].to(dtype=torch.bool)
+            & (token_offsets[..., 1] > token_offsets[..., 0])
+        )
+
+        outputs["token_offsets"] = token_offsets
+        outputs["alignment_text_mask"] = alignment_text_mask
+
+        if not self.staged_query_refinement:
+            main_query = outputs["main_object_query_out"]
+            main_quality = self.head.predict_quality(main_query)
+            main_token_alignment = (
+                self.head.predict_token_alignment(
+                    main_query,
+                    outputs["text_token"],
+                    alignment_text_mask,
+                )
+            )
+            main_final = main_quality
+
+            for tensor in (
+                main_quality,
+                main_token_alignment,
+                main_final,
+            ):
+                self._attach_stage_metadata(
+                    tensor,
+                    main_query,
+                    main_query,
+                )
+
             outputs.update({
+                "score_logit": main_final,
+                "main_score_logit": main_final,
                 "quality_logit": main_quality,
-                "text_alignment_logit": main_alignment,
-                "final_score_logit": main_score,
+                "text_alignment_logit": main_token_alignment,
+                "token_alignment_logits": main_token_alignment,
+                "final_score_logit": main_final,
+                "main_quality_logit": main_quality,
+                "main_text_alignment_logit": main_token_alignment,
+                "main_token_alignment_logits": main_token_alignment,
+                "main_final_score_logit": main_final,
                 "score_decoupled": True,
                 "query_stage_separated": False,
+                "phrase_score_fusion_deferred": True,
             })
             return outputs
 
@@ -383,7 +2398,9 @@ class VisionTextModel(_legacy.VisionTextModel):
         aux_local_query = outputs.get("aux_object_query_out")
         main_bbox = outputs["main_bbox"]
         aux_bbox = outputs.get("aux_bbox")
-        compute_auxiliary = bool(outputs.get("aux_computed", False))
+        compute_auxiliary = bool(
+            outputs.get("aux_computed", False)
+        )
 
         main_score_query, aux_score_query = self._score_stage(
             img_token=outputs["img_token"],
@@ -396,29 +2413,51 @@ class VisionTextModel(_legacy.VisionTextModel):
             compute_auxiliary=compute_auxiliary,
         )
 
-        (
-            main_quality,
-            main_alignment,
-            main_final,
-        ) = self.head.predict_scores(main_score_query)
+        main_quality = self.head.predict_quality(
+            main_score_query
+        )
+        main_token_alignment = (
+            self.head.predict_token_alignment(
+                main_score_query,
+                outputs["text_token"],
+                alignment_text_mask,
+            )
+        )
+        main_final = main_quality
 
         aux_quality = None
-        aux_alignment = None
+        aux_token_alignment = None
         aux_final = None
-        if compute_auxiliary and self.aux_head is not None:
-            (
-                aux_quality,
-                aux_alignment,
-                aux_final,
-            ) = self.aux_head.predict_scores(aux_score_query)
 
-        for tensor in (main_quality, main_alignment, main_final):
+        if compute_auxiliary and self.aux_head is not None:
+            aux_quality = self.aux_head.predict_quality(
+                aux_score_query
+            )
+            aux_token_alignment = (
+                self.aux_head.predict_token_alignment(
+                    aux_score_query,
+                    outputs["text_token"],
+                    alignment_text_mask,
+                )
+            )
+            aux_final = aux_quality
+
+        for tensor in (
+            main_quality,
+            main_token_alignment,
+            main_final,
+        ):
             self._attach_stage_metadata(
                 tensor,
                 main_local_query,
                 main_score_query,
             )
-        for tensor in (aux_quality, aux_alignment, aux_final):
+
+        for tensor in (
+            aux_quality,
+            aux_token_alignment,
+            aux_final,
+        ):
             self._attach_stage_metadata(
                 tensor,
                 aux_local_query,
@@ -426,30 +2465,40 @@ class VisionTextModel(_legacy.VisionTextModel):
             )
 
         outputs.update({
-            # Backward-compatible inference aliases.
+            # Existing scalar localization-quality interface.
             "score_logit": main_final,
             "main_score_logit": main_final,
             "aux_score_logit": aux_final,
 
-            # Explicit stage outputs.
+            # ODVG token-level alignment interface.
             "quality_logit": main_quality,
-            "text_alignment_logit": main_alignment,
+            "text_alignment_logit": main_token_alignment,
+            "token_alignment_logits": main_token_alignment,
             "final_score_logit": main_final,
+
             "main_quality_logit": main_quality,
-            "main_text_alignment_logit": main_alignment,
+            "main_text_alignment_logit": main_token_alignment,
+            "main_token_alignment_logits": main_token_alignment,
             "main_final_score_logit": main_final,
+
             "aux_quality_logit": aux_quality,
-            "aux_text_alignment_logit": aux_alignment,
+            "aux_text_alignment_logit": aux_token_alignment,
+            "aux_token_alignment_logits": aux_token_alignment,
             "aux_final_score_logit": aux_final,
+
             "main_localization_query_out": main_local_query,
             "main_score_query_out": main_score_query,
             "aux_localization_query_out": aux_local_query,
             "aux_score_query_out": aux_score_query,
             "score_transformer_out": main_score_query,
+
             "score_decoupled": True,
             "query_stage_separated": True,
             "score_bbox_conditioning": self.score_bbox_conditioning,
             "score_bbox_detach": self.score_bbox_detach,
             "score_fusion": self.score_fusion,
+            "phrase_score_fusion_deferred": True,
         })
+
         return outputs
+

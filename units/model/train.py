@@ -65,7 +65,6 @@ from units.model.tool.component_scheduler import (
     ComponentLRScheduler,
 )
 from units.model.tool.runtime import (
-    build_text_conditioning_probe,
     compact_grounding_collate_fn,
     forward_model_batch,
     get_score_logit,
@@ -346,17 +345,21 @@ def run_startup_smoke_test(
     args: SimpleNamespace,
 ) -> None:
     """
-    使用真實 DataLoader batch 驗證 cache dtype、image-level mapping、model forward
-    與 loss contract。只執行一次，不更新權重或 BatchNorm running statistics。
+    Validate one real ODVG batch without updating model parameters.
     """
-    print("[Startup Check] Running one real-batch forward/loss smoke test...")
+    print(
+        "[Startup Check] Running one real ODVG "
+        "forward/loss smoke test..."
+    )
 
-    # Build one batch synchronously from dataset indices. This avoids spawning
-    # the persistent Train worker pool before the real epoch begins.
     try:
-        first_indices = next(iter(train_loader.batch_sampler))
+        first_indices = next(
+            iter(train_loader.batch_sampler)
+        )
     except StopIteration as error:
-        raise RuntimeError("Training DataLoader is empty") from error
+        raise RuntimeError(
+            "Training DataLoader is empty"
+        ) from error
 
     if isinstance(first_indices, torch.Tensor):
         first_indices = first_indices.tolist()
@@ -365,201 +368,300 @@ def run_startup_smoke_test(
     else:
         first_indices = list(first_indices)
 
-    items = [train_loader.dataset[int(index)] for index in first_indices]
-    collate_fn = train_loader.collate_fn or compact_grounding_collate_fn
+    items = [
+        train_loader.dataset[int(index)]
+        for index in first_indices
+    ]
+    collate_fn = (
+        train_loader.collate_fn
+        or compact_grounding_collate_fn
+    )
     batch = collate_fn(items)
 
-    images, query_texts, image_indices = prepare_model_batch(
-        batch=batch,
-        device=device,
-        channels_last=channels_last,
+    images, captions, image_indices = (
+        prepare_model_batch(
+            batch=batch,
+            device=device,
+            channels_last=channels_last,
+        )
     )
-    targets = move_targets_to_device(batch, device)
+    targets = move_targets_to_device(
+        batch,
+        device,
+    )
 
-    if len(query_texts) == 0:
-        raise RuntimeError("Startup batch contains no query_texts")
-    if len(targets) != len(query_texts):
+    if not captions:
         raise RuntimeError(
-            "Startup targets/query_texts mismatch: "
-            f"{len(targets)} != {len(query_texts)}"
+            "Startup batch contains no ODVG captions"
         )
-    if not images.dtype.is_floating_point:
+    if len(targets) != len(captions):
         raise RuntimeError(
-            f"Prepared images must be floating point, got {images.dtype}"
+            "Startup targets/captions mismatch: "
+            f"{len(targets)} != {len(captions)}"
+        )
+    if images.shape[0] != len(captions):
+        raise RuntimeError(
+            "Startup images/captions mismatch: "
+            f"{images.shape[0]} != {len(captions)}"
         )
 
-    loss_forward_kwargs = resolve_loss_forward_kwargs(
-        args=args,
-        epoch=1,
-        total_epochs=total_epochs,
+    for index, target in enumerate(targets):
+        boxes = target.get("boxes")
+        spans = target.get(
+            "positive_char_spans"
+        )
+
+        if boxes is None or spans is None:
+            raise KeyError(
+                "ODVG target must contain boxes and "
+                "positive_char_spans"
+            )
+
+        if len(spans) != int(boxes.shape[0]):
+            raise RuntimeError(
+                "ODVG box/span count mismatch at batch "
+                f"{index}: {boxes.shape[0]} != {len(spans)}"
+            )
+
+    loss_forward_kwargs = (
+        resolve_loss_forward_kwargs(
+            args=args,
+            epoch=1,
+            total_epochs=total_epochs,
+        )
     )
 
     was_training = model.training
     model.eval()
-    amp_enabled = get_amp_enabled(device, use_amp)
+    amp_enabled = get_amp_enabled(
+        device,
+        use_amp,
+    )
 
     try:
         with torch.no_grad():
             with autocast(
                 device_type=device.type,
                 enabled=amp_enabled,
-                dtype=amp_dtype if amp_enabled else None,
+                dtype=(
+                    amp_dtype
+                    if amp_enabled
+                    else None
+                ),
             ):
                 outputs = forward_model_batch(
                     model=model,
                     images=images,
-                    query_texts=query_texts,
+                    query_texts=captions,
                     image_indices=image_indices,
                     return_aux=True,
                 )
 
+                required = (
+                    "bbox",
+                    "quality_logit",
+                    "token_alignment_logits",
+                    "token_offsets",
+                    "alignment_text_mask",
+                )
+                missing = [
+                    key
+                    for key in required
+                    if not torch.is_tensor(
+                        outputs.get(key)
+                    )
+                ]
+                if missing:
+                    raise KeyError(
+                        "Model ODVG outputs missing: "
+                        f"{missing}"
+                    )
+
                 pred_bbox = outputs["bbox"]
-                pred_score_logit = get_score_logit(outputs)
-                aux_pred_bbox = outputs.get("aux_bbox")
-                aux_pred_score_logit = outputs.get(
-                    "aux_score_logit"
+                quality_logit = outputs[
+                    "quality_logit"
+                ]
+                token_logits = outputs[
+                    "token_alignment_logits"
+                ]
+                token_offsets = outputs[
+                    "token_offsets"
+                ]
+                alignment_mask = outputs[
+                    "alignment_text_mask"
+                ]
+
+                aux_pred_bbox = outputs.get(
+                    "aux_bbox"
+                )
+                aux_quality = outputs.get(
+                    "aux_quality_logit"
+                )
+                aux_token_logits = outputs.get(
+                    "aux_token_alignment_logits"
                 )
 
                 if (
                     aux_pred_bbox is None
-                    or aux_pred_score_logit is None
+                    or aux_quality is None
+                    or aux_token_logits is None
                 ):
                     raise RuntimeError(
-                        "Startup hybrid check requires auxiliary "
-                        "bbox and score outputs."
+                        "Startup ODVG hybrid check requires "
+                        "aux bbox, quality and token alignment"
                     )
+
+                batch_size = len(captions)
+                query_count = pred_bbox.shape[1]
+                token_count = token_logits.shape[-1]
+
+                expected_shapes = {
+                    "bbox": (
+                        batch_size,
+                        query_count,
+                        4,
+                    ),
+                    "quality": (
+                        batch_size,
+                        query_count,
+                        1,
+                    ),
+                    "token_logits": (
+                        batch_size,
+                        query_count,
+                        token_count,
+                    ),
+                    "token_offsets": (
+                        batch_size,
+                        token_count,
+                        2,
+                    ),
+                    "alignment_mask": (
+                        batch_size,
+                        token_count,
+                    ),
+                }
+                actual_shapes = {
+                    "bbox": tuple(
+                        pred_bbox.shape
+                    ),
+                    "quality": tuple(
+                        quality_logit.shape
+                    ),
+                    "token_logits": tuple(
+                        token_logits.shape
+                    ),
+                    "token_offsets": tuple(
+                        token_offsets.shape
+                    ),
+                    "alignment_mask": tuple(
+                        alignment_mask.shape
+                    ),
+                }
+
+                for name, expected in (
+                    expected_shapes.items()
+                ):
+                    if actual_shapes[name] != expected:
+                        raise RuntimeError(
+                            f"{name} shape mismatch: "
+                            f"{actual_shapes[name]} != "
+                            f"{expected}"
+                        )
 
                 loss, loss_dict = criterion(
                     pred_bbox=pred_bbox,
-                    pred_score_logit=pred_score_logit,
+                    pred_score_logit=quality_logit,
+                    pred_quality_logit=quality_logit,
+                    pred_text_alignment_logit=(
+                        token_logits
+                    ),
+                    pred_token_alignment_logit=(
+                        token_logits
+                    ),
                     targets=targets,
-                    pos_weight=float(args.pos_weight),
-                    query_loss_weights=batch.get("query_loss_weights"),
-                    text_negative_mask=batch.get("text_negative_mask"),
+                    captions=captions,
+                    token_offsets=token_offsets,
+                    alignment_text_mask=(
+                        alignment_mask
+                    ),
+                    query_loss_weights=batch.get(
+                        "query_loss_weights"
+                    ),
+                    text_negative_mask=None,
                     aux_pred_bbox=aux_pred_bbox,
-                    aux_pred_score_logit=aux_pred_score_logit,
+                    aux_pred_score_logit=aux_quality,
+                    aux_pred_quality_logit=aux_quality,
+                    aux_pred_text_alignment_logit=(
+                        aux_token_logits
+                    ),
+                    aux_pred_token_alignment_logit=(
+                        aux_token_logits
+                    ),
+                    pos_weight=float(
+                        args.pos_weight
+                    ),
                     **loss_forward_kwargs,
                 )
 
-                negative_text_matches = int(
-                    float(loss_dict.get(
-                        "negative_text_regression_matches",
-                        0.0,
-                    ))
+        finite_tensors = {
+            "bbox": pred_bbox,
+            "quality": quality_logit,
+            "token_logits": token_logits,
+            "aux_bbox": aux_pred_bbox,
+            "aux_quality": aux_quality,
+            "aux_token_logits": (
+                aux_token_logits
+            ),
+            "loss": loss,
+        }
+
+        for name, tensor in finite_tensors.items():
+            if not bool(
+                torch.isfinite(tensor).all().item()
+            ):
+                raise FloatingPointError(
+                    f"Startup {name} contains NaN/Inf"
                 )
-                if negative_text_matches != 0:
-                    raise RuntimeError(
-                        "Negative-text descriptions received bbox/GIoU "
-                        "matches. DETR empty-target supervision is broken."
-                    )
 
-                (
-                    probe_texts,
-                    probe_changed_rows,
-                    probe_mode,
-                ) = build_text_conditioning_probe(
-                    query_texts=query_texts,
-                    text_negative_mask=batch.get("text_negative_mask"),
-                )
+        alignment_loss = loss_dict.get(
+            "loss_text_alignment"
+        )
+        if alignment_loss is None:
+            raise KeyError(
+                "GroundingLoss did not return "
+                "loss_text_alignment"
+            )
 
-                localization_text_delta = None
-                score_text_delta = None
-                if probe_texts is not None and probe_changed_rows:
-                    probe_outputs = forward_model_batch(
-                        model=model,
-                        images=images,
-                        query_texts=probe_texts,
-                        image_indices=image_indices,
-                        return_aux=False,
-                    )
-                    probe_bbox = probe_outputs["bbox"]
-                    probe_score_logit = get_score_logit(probe_outputs)
-                    changed_index = torch.as_tensor(
-                        probe_changed_rows,
-                        device=pred_bbox.device,
-                        dtype=torch.long,
-                    )
-                    localization_text_delta = (
-                        pred_bbox.index_select(0, changed_index).float()
-                        - probe_bbox.index_select(0, changed_index).float()
-                    ).abs().mean()
-                    score_text_delta = (
-                        pred_score_logit.index_select(0, changed_index).float()
-                        - probe_score_logit.index_select(0, changed_index).float()
-                    ).abs().mean()
-
-                    if not bool(torch.isfinite(localization_text_delta).item()):
-                        raise FloatingPointError(
-                            "Text-conditioning bbox probe produced NaN/Inf"
-                        )
-                    if float(localization_text_delta.item()) <= 1e-8:
-                        raise RuntimeError(
-                            "Changing only the text description did not change "
-                            "pred_bbox. The bbox path is not text-conditioned, "
-                            "so positive/negative text cannot influence "
-                            "localization."
-                        )
-
-        expected_queries = len(query_texts)
-        if pred_bbox.shape[0] != expected_queries:
-            raise RuntimeError(
-                "Model bbox batch does not match query count: "
-                f"{pred_bbox.shape[0]} != {expected_queries}"
-            )
-        if pred_score_logit.shape[0] != expected_queries:
-            raise RuntimeError(
-                "Model score batch does not match query count: "
-                f"{pred_score_logit.shape[0]} != {expected_queries}"
-            )
-        if aux_pred_bbox.shape[0] != expected_queries:
-            raise RuntimeError(
-                "Aux bbox batch does not match query count: "
-                f"{aux_pred_bbox.shape[0]} != {expected_queries}"
-            )
-        if aux_pred_score_logit.shape[0] != expected_queries:
-            raise RuntimeError(
-                "Aux score batch does not match query count: "
-                f"{aux_pred_score_logit.shape[0]} != {expected_queries}"
-            )
-        if not bool(torch.isfinite(pred_bbox).all().item()):
-            raise FloatingPointError("Startup bbox output contains NaN/Inf")
-        if not bool(torch.isfinite(pred_score_logit).all().item()):
-            raise FloatingPointError("Startup score output contains NaN/Inf")
-        if not bool(torch.isfinite(aux_pred_bbox).all().item()):
-            raise FloatingPointError(
-                "Startup auxiliary bbox output contains NaN/Inf"
-            )
-        if not bool(torch.isfinite(aux_pred_score_logit).all().item()):
-            raise FloatingPointError(
-                "Startup auxiliary score output contains NaN/Inf"
-            )
-        if not bool(torch.isfinite(loss).item()):
-            raise FloatingPointError("Startup loss is NaN/Inf")
-
-        image_min, image_max = torch.aminmax(images)
+        image_min, image_max = torch.aminmax(
+            images
+        )
         print(
             "[Startup Check] PASS: "
-            f"images={tuple(images.shape)} {images.dtype} "
-            f"range=[{image_min.item():.6f}, {image_max.item():.6f}], "
-            f"queries={expected_queries}, "
+            f"images={tuple(images.shape)} "
+            f"{images.dtype} "
+            f"range=[{image_min.item():.6f}, "
+            f"{image_max.item():.6f}], "
+            f"captions={len(captions)}, "
             f"bbox={tuple(pred_bbox.shape)}, "
-            f"score={tuple(pred_score_logit.shape)}, "
-            f"aux_bbox={tuple(aux_pred_bbox.shape)}, "
-            f"aux_score={tuple(aux_pred_score_logit.shape)}, "
+            f"quality={tuple(quality_logit.shape)}, "
+            f"tokens={tuple(token_logits.shape)}, "
+            f"negative_phrases="
+            f"{int(batch.get('odvg_negative_phrase_count', 0))}, "
             f"loss={loss.item():.6f}, "
-            f"class={loss_dict.get('classification_type', 'unknown')}, "
-            f"matcher_alpha={float(loss_dict.get('matcher_score_alpha', 0.0)):.4f}, "
-            f"text_probe={probe_mode}, "
-            f"bbox_text_delta="
-            f"{'skip' if localization_text_delta is None else f'{float(localization_text_delta.item()):.8e}'}"
+            f"alignment="
+            f"{float(alignment_loss):.6f}"
         )
     finally:
         model.train(was_training)
-        del batch, images, query_texts, targets
+        del batch, images, captions, targets
+
         if image_indices is not None:
             del image_indices
+
         if device.type == "cuda":
             torch.cuda.empty_cache()
+
 
 
 
@@ -1080,24 +1182,45 @@ def train_one_epoch(
 ) -> Dict[str, float]:
     model.train()
 
-    batch_sampler = getattr(train_loader, "batch_sampler", None)
-    if batch_sampler is not None and hasattr(batch_sampler, "set_epoch"):
+    batch_sampler = getattr(
+        train_loader,
+        "batch_sampler",
+        None,
+    )
+    if (
+        batch_sampler is not None
+        and hasattr(batch_sampler, "set_epoch")
+    ):
         batch_sampler.set_epoch(epoch)
 
-    total_loss_sum = torch.zeros((), device=device)
-    total_main_loss_sum = torch.zeros((), device=device)
-    total_aux_loss_sum = torch.zeros((), device=device)
-    total_aux_contrib_sum = torch.zeros((), device=device)
-    total_bbox_sum = torch.zeros((), device=device)
-    total_giou_sum = torch.zeros((), device=device)
-    total_score_sum = torch.zeros((), device=device)
-    total_rank_contrib_sum = torch.zeros((), device=device)
-    total_rank_raw_sum = torch.zeros((), device=device)
-    total_text_negative_sum = torch.zeros((), device=device)
-    total_text_negative_contrib_sum = torch.zeros((), device=device)
-    total_text_negative_queries = 0
+    metric_names = (
+        "loss",
+        "loss_main_total",
+        "loss_aux_total",
+        "loss_aux_contrib",
+        "loss_bbox",
+        "loss_giou",
+        "loss_score",
+        "loss_rank",
+        "loss_rank_raw",
+        "loss_text_alignment",
+        "loss_text_alignment_contrib",
+        "loss_text_alignment_rank",
+        "loss_text_alignment_rank_contrib",
+    )
+    totals = {
+        name: torch.zeros(
+            (),
+            device=device,
+        )
+        for name in metric_names
+    }
+    total_negative_phrases = 0
 
-    amp_enabled = get_amp_enabled(device, use_amp)
+    amp_enabled = get_amp_enabled(
+        device,
+        use_amp,
+    )
 
     pbar = make_progress_bar(
         enumerate(train_loader),
@@ -1108,88 +1231,127 @@ def train_one_epoch(
     )
 
     for step, batch in pbar:
-        global_step = (epoch - 1) * len(train_loader) + step + 1
-
-        first_batch = epoch == 1 and step == 0
-
-        if first_batch:
-            raw_images = (
-                batch["unique_images"]
-                if "unique_images" in batch
-                else batch["images"]
-            )
-            schema = "image-level" if "unique_images" in batch else "query-level"
-            tqdm.write(
-                f"[Info] Batch schema: {schema} "
-                f"raw_shape={tuple(raw_images.shape)}, "
-                f"raw_dtype={raw_images.dtype}, "
-                f"queries={len(batch['query_texts'])}"
-            )
-
-        images, query_texts, image_indices = prepare_model_batch(
-            batch=batch,
-            device=device,
-            channels_last=channels_last,
+        global_step = (
+            (epoch - 1) * len(train_loader)
+            + step
+            + 1
         )
-        targets = move_targets_to_device(batch, device)
+        first_batch = (
+            epoch == 1
+            and step == 0
+        )
 
-        if len(targets) != len(query_texts):
+        images, captions, image_indices = (
+            prepare_model_batch(
+                batch=batch,
+                device=device,
+                channels_last=channels_last,
+            )
+        )
+        targets = move_targets_to_device(
+            batch,
+            device,
+        )
+
+        if len(targets) != len(captions):
             raise ValueError(
-                "targets/query_texts size mismatch: "
-                f"{len(targets)} != {len(query_texts)}"
+                "targets/captions size mismatch: "
+                f"{len(targets)} != {len(captions)}"
             )
 
         if first_batch:
-            image_min, image_max = torch.aminmax(images.detach())
+            raw_images = batch["unique_images"]
+            image_min, image_max = torch.aminmax(
+                images.detach()
+            )
             tqdm.write(
-                "[Info] Prepared images: "
-                f"shape={tuple(images.shape)}, dtype={images.dtype}, "
-                f"device={images.device}, "
-                f"range=[{float(image_min.item()):.6f}, "
-                f"{float(image_max.item()):.6f}], "
-                f"image_indices="
-                f"{None if image_indices is None else tuple(image_indices.shape)}"
+                "[Info] ODVG batch: "
+                f"raw={tuple(raw_images.shape)} "
+                f"{raw_images.dtype}, "
+                f"prepared={tuple(images.shape)} "
+                f"{images.dtype}, "
+                f"captions={len(captions)}, "
+                f"regions={batch.get('num_regions', 0)}, "
+                f"targets={batch.get('num_unique_targets', 0)}, "
+                f"negative_phrases="
+                f"{batch.get('odvg_negative_phrase_count', 0)}, "
+                f"range=[{float(image_min):.6f}, "
+                f"{float(image_max):.6f}]"
             )
 
-        optimizer.zero_grad(set_to_none=True)
-
-        # Schedule the LR before the optimizer update so the very first update
-        # uses the first warmup LR instead of the full base learning rate.
+        optimizer.zero_grad(
+            set_to_none=True
+        )
         scheduler.step()
 
         with autocast(
             device_type=device.type,
             enabled=amp_enabled,
-            dtype=amp_dtype if amp_enabled else None,
+            dtype=(
+                amp_dtype
+                if amp_enabled
+                else None
+            ),
         ):
             outputs = forward_model_batch(
                 model=model,
                 images=images,
-                query_texts=query_texts,
+                query_texts=captions,
                 image_indices=image_indices,
                 return_aux=True,
             )
 
             pred_bbox = outputs["bbox"]
-            pred_score_logit = get_score_logit(outputs)
-            aux_pred_bbox = outputs.get("aux_bbox")
-            aux_pred_score_logit = outputs.get(
-                "aux_score_logit"
+            quality_logit = outputs[
+                "quality_logit"
+            ]
+            token_logits = outputs[
+                "token_alignment_logits"
+            ]
+            token_offsets = outputs[
+                "token_offsets"
+            ]
+            alignment_mask = outputs[
+                "alignment_text_mask"
+            ]
+
+            aux_pred_bbox = outputs.get(
+                "aux_bbox"
+            )
+            aux_quality = outputs.get(
+                "aux_quality_logit"
+            )
+            aux_token_logits = outputs.get(
+                "aux_token_alignment_logits"
             )
 
             if (
                 aux_pred_bbox is None
-                or aux_pred_score_logit is None
+                or aux_quality is None
+                or aux_token_logits is None
             ):
                 raise RuntimeError(
-                    "Hybrid training requires aux_bbox and "
-                    "aux_score_logit from VisionTextModel."
+                    "ODVG hybrid training requires "
+                    "aux_bbox, aux_quality_logit and "
+                    "aux_token_alignment_logits"
                 )
 
             loss, loss_dict = criterion(
                 pred_bbox=pred_bbox,
-                pred_score_logit=pred_score_logit,
+                pred_score_logit=quality_logit,
+                pred_quality_logit=quality_logit,
+                pred_text_alignment_logit=(
+                    token_logits
+                ),
+                pred_token_alignment_logit=(
+                    token_logits
+                ),
                 targets=targets,
+                captions=captions,
+                token_offsets=token_offsets,
+                alignment_text_mask=(
+                    alignment_mask
+                ),
                 lambda_bbox=lambda_bbox,
                 lambda_giou=lambda_giou,
                 lambda_score=lambda_score,
@@ -1198,27 +1360,49 @@ def train_one_epoch(
                 pos_weight=pos_weight,
                 current_epoch=epoch,
                 total_epochs=num_epochs,
-                quality_warmup_epoch=quality_warmup_epoch,
-                rank_start_epoch=rank_start_epoch,
-                rank_warmup_epoch=rank_warmup_epoch,
+                quality_warmup_epoch=(
+                    quality_warmup_epoch
+                ),
+                rank_start_epoch=(
+                    rank_start_epoch
+                ),
+                rank_warmup_epoch=(
+                    rank_warmup_epoch
+                ),
                 rank_alpha_min=rank_alpha_min,
-                query_loss_weights=batch.get("query_loss_weights"),
-                text_negative_mask=batch.get("text_negative_mask"),
+                query_loss_weights=batch.get(
+                    "query_loss_weights"
+                ),
+
+                # Whole-caption negative sampling is disabled.
+                text_negative_mask=None,
+
                 aux_pred_bbox=aux_pred_bbox,
-                aux_pred_score_logit=aux_pred_score_logit,
+                aux_pred_score_logit=aux_quality,
+                aux_pred_quality_logit=aux_quality,
+                aux_pred_text_alignment_logit=(
+                    aux_token_logits
+                ),
+                aux_pred_token_alignment_logit=(
+                    aux_token_logits
+                ),
             )
 
         if scaler.is_enabled():
             scaler.scale(loss).backward()
 
             if grad_clip_norm is not None:
-                scaler.unscale_(optimizer)
+                scaler.unscale_(
+                    optimizer
+                )
                 torch.nn.utils.clip_grad_norm_(
                     ema_source_model.parameters(),
                     grad_clip_norm,
                 )
 
-            scaler.step(optimizer)
+            scaler.step(
+                optimizer
+            )
             scaler.update()
         else:
             loss.backward()
@@ -1232,399 +1416,198 @@ def train_one_epoch(
             optimizer.step()
 
         if ema is not None:
-            ema.update(ema_source_model)
+            ema.update(
+                ema_source_model
+            )
 
         zero = pred_bbox.new_zeros(())
+        detached = {
+            "loss": loss.detach(),
+        }
 
-        loss_det = loss.detach()
-        main_loss_det = loss_dict.get(
-            "loss_main_total",
-            loss_det,
-        ).detach()
-        aux_loss_det = loss_dict.get(
-            "loss_aux_total",
-            zero,
-        ).detach()
-        aux_contrib_det = loss_dict.get(
-            "loss_aux_contrib",
-            zero,
-        ).detach()
-        bbox_det = loss_dict["loss_bbox"].detach()
-        giou_det = loss_dict["loss_giou"].detach()
-        score_det = loss_dict["loss_score"].detach()
-        rank_raw_det = loss_dict.get("loss_rank_raw", zero).detach()
-        rank_det = loss_dict.get("loss_rank", zero).detach()
-        rank_contrib_det = loss_dict.get(
-            "loss_rank_contrib",
-            loss_dict.get("loss_rank", zero),
-        ).detach()
-        text_negative_det = loss_dict.get(
-            "loss_text_negative",
-            zero,
-        ).detach()
-        text_negative_contrib_det = loss_dict.get(
-            "loss_text_negative_contrib",
-            zero,
-        ).detach()
-        negative_query_top1_det = loss_dict.get(
-            "negative_query_top1_score",
-            zero,
-        ).detach()
-        positive_query_top1_det = loss_dict.get(
-            "positive_query_top1_score",
-            zero,
-        ).detach()
-        query_score_margin_det = loss_dict.get(
-            "positive_negative_score_margin",
-            zero,
-        ).detach()
-        text_negative_queries = int(
+        for name in metric_names:
+            if name == "loss":
+                continue
+            value = loss_dict.get(
+                name,
+                zero,
+            )
+            if not torch.is_tensor(value):
+                value = zero.new_tensor(
+                    float(value)
+                )
+            detached[name] = value.detach()
+
+        for name, value in detached.items():
+            totals[name].add_(value)
+
+        negative_phrase_count = int(
             batch.get(
-                "text_negative_mask",
-                torch.zeros(0, dtype=torch.bool),
-            ).sum().item()
+                "odvg_negative_phrase_count",
+                0,
+            )
         )
-
-        total_loss_sum.add_(loss_det)
-        total_main_loss_sum.add_(main_loss_det)
-        total_aux_loss_sum.add_(aux_loss_det)
-        total_aux_contrib_sum.add_(aux_contrib_det)
-        total_bbox_sum.add_(bbox_det)
-        total_giou_sum.add_(giou_det)
-        total_score_sum.add_(score_det)
-        total_rank_contrib_sum.add_(rank_contrib_det)
-        total_rank_raw_sum.add_(rank_raw_det)
-        total_text_negative_sum.add_(text_negative_det)
-        total_text_negative_contrib_sum.add_(
-            text_negative_contrib_det
+        total_negative_phrases += (
+            negative_phrase_count
         )
-        total_text_negative_queries += text_negative_queries
 
         should_log = (
-            (step + 1) % max(1, int(log_interval)) == 0
-            or (step + 1) == len(train_loader)
+            (step + 1)
+            % max(1, int(log_interval))
+            == 0
+            or (step + 1)
+            == len(train_loader)
         )
 
         if should_log:
             current_lr = scheduler.get_lr()[0]
-            loss_item = float(loss_det.item())
-            main_loss_item = float(main_loss_det.item())
-            aux_loss_item = float(aux_loss_det.item())
-            aux_contrib_item = float(aux_contrib_det.item())
-            bbox_item = float(bbox_det.item())
-            giou_item = float(giou_det.item())
-            score_item = float(score_det.item())
-            rank_raw_item = float(rank_raw_det.item())
-            rank_item = float(rank_det.item())
-            rank_contrib_item = float(rank_contrib_det.item())
-            text_negative_item = float(text_negative_det.item())
-            text_negative_contrib_item = float(
-                text_negative_contrib_det.item()
+            avg_loss = float(
+                (
+                    totals["loss"]
+                    / (step + 1)
+                ).item()
             )
-            negative_query_top1_item = float(
-                negative_query_top1_det.item()
-            )
-            positive_query_top1_item = float(
-                positive_query_top1_det.item()
-            )
-            query_score_margin_item = float(
-                query_score_margin_det.item()
-            )
-            avg_loss = float((total_loss_sum / (step + 1)).item())
-
-            rank_alpha_item = float(loss_dict.get("rank_alpha", 0.0))
-            lambda_rank_eff_item = float(
-                loss_dict.get("lambda_rank_eff", 0.0)
-            )
-            quality_alpha_item = float(loss_dict.get("quality_alpha", 1.0))
-            score_ignore_thr_item = float(
-                loss_dict.get(
-                    "score_negative_iou_ignore_thr",
-                    criterion.score_negative_iou_ignore_thr,
-                )
-            )
-            matcher_score_alpha_item = float(
-                loss_dict.get("matcher_score_alpha", rank_alpha_item)
-            )
-            matcher_score_cost_item = float(
-                loss_dict.get("matcher_cost_score_effective", 0.0)
-            )
-            negative_text_match_item = int(
-                float(loss_dict.get(
-                    "negative_text_regression_matches",
-                    0.0,
-                ))
-            )
-            if negative_text_match_item != 0:
-                raise RuntimeError(
-                    "Negative-text sample received a regression match."
-                )
-
-            score_target_pos_mean = loss_dict.get(
-                "score_target_pos_mean",
-                zero,
-            )
-
-            if torch.is_tensor(score_target_pos_mean):
-                score_target_pos_mean = float(
-                    score_target_pos_mean.detach().item()
-                )
-            else:
-                score_target_pos_mean = float(score_target_pos_mean)
 
             pbar.set_postfix({
                 "lr": f"{current_lr:.2e}",
-                "loss": f"{loss_item:.4f}",
+                "loss": (
+                    f"{float(detached['loss']):.4f}"
+                ),
                 "avg": f"{avg_loss:.4f}",
-                "bbox": f"{bbox_item:.4f}",
-                "giou": f"{giou_item:.4f}",
-                "score": f"{score_item:.4f}",
-                "rank": f"{rank_contrib_item:.4f}",
+                "bbox": (
+                    f"{float(detached['loss_bbox']):.4f}"
+                ),
+                "giou": (
+                    f"{float(detached['loss_giou']):.4f}"
+                ),
+                "quality": (
+                    f"{float(detached['loss_score']):.4f}"
+                ),
+                "align": (
+                    f"{float(detached['loss_text_alignment']):.4f}"
+                ),
             })
 
             if step_metrics_path is not None:
-                append_jsonl(step_metrics_path, {
+                row = {
                     "type": "step",
                     "time": time.time(),
                     "epoch": epoch,
                     "step": step + 1,
                     "global_step": global_step,
                     "lr": current_lr,
-                    "train_loss": loss_item,
-                    "train_loss_avg": avg_loss,
-                    "loss_main_total": main_loss_item,
-                    "loss_aux_total": aux_loss_item,
-                    "loss_aux_contrib": aux_contrib_item,
-                    "loss_bbox": bbox_item,
-                    "loss_giou": giou_item,
-                    "loss_score": score_item,
-                    "loss_rank_raw": rank_raw_item,
-                    "loss_rank": rank_item,
-                    "loss_rank_contrib": rank_contrib_item,
-                    "loss_text_negative": text_negative_item,
-                    "loss_text_negative_contrib": (
-                        text_negative_contrib_item
+                    "negative_phrases": (
+                        negative_phrase_count
                     ),
-                    "negative_query_top1_score": (
-                        negative_query_top1_item
-                    ),
-                    "positive_query_top1_score": (
-                        positive_query_top1_item
-                    ),
-                    "positive_negative_score_margin": (
-                        query_score_margin_item
-                    ),
-                    "text_negative_queries": text_negative_queries,
                     "lambda_bbox": lambda_bbox,
                     "lambda_giou": lambda_giou,
                     "lambda_score": lambda_score,
-                    "lambda_rank_max": float(lambda_rank),
-                    "lambda_rank_eff": lambda_rank_eff_item,
-                    "pos_weight": pos_weight,
-                    "quality_alpha": quality_alpha_item,
-                    "rank_alpha": rank_alpha_item,
-                    "rank_alpha_min": float(rank_alpha_min),
-                    "score_negative_iou_ignore_thr": (
-                        score_ignore_thr_item
-                    ),
-                    "duplicate_suppression_enabled": bool(
-                        loss_dict.get(
-                            "duplicate_suppression_enabled",
-                            False,
-                        )
-                    ),
-                    "loss_duplicate": float(
-                        loss_dict.get("loss_duplicate", zero)
-                        .detach()
-                        .item()
-                    ),
-                    "loss_duplicate_contrib": float(
-                        loss_dict.get(
-                            "loss_duplicate_contrib",
-                            zero,
-                        )
-                        .detach()
-                        .item()
-                    ),
-                    "duplicate_pair_count": float(
-                        loss_dict.get(
-                            "duplicate_pair_count",
-                            zero,
-                        )
-                        .detach()
-                        .item()
-                    ),
-                    "duplicate_violation_fraction": float(
-                        loss_dict.get(
-                            "duplicate_violation_fraction",
-                            zero,
-                        )
-                        .detach()
-                        .item()
-                    ),
-                    "duplicate_score_gap_mean": float(
-                        loss_dict.get(
-                            "duplicate_score_gap_mean",
-                            zero,
-                        )
-                        .detach()
-                        .item()
-                    ),
-                    "duplicate_classification_weight": float(
-                        criterion.duplicate_classification_weight
-                    ),
-                    "loss_hard_negative": float(
-                        loss_dict.get(
-                            "loss_hard_negative",
-                            zero,
-                        )
-                        .detach()
-                        .item()
-                    ),
-                    "loss_hard_negative_contrib": float(
-                        loss_dict.get(
-                            "loss_hard_negative_contrib",
-                            zero,
-                        )
-                        .detach()
-                        .item()
-                    ),
-                    "hard_neg_count": float(
-                        loss_dict.get("hard_neg_count", zero)
-                        .detach()
-                        .item()
-                    ),
-                    "hard_negative_score_mean": float(
-                        loss_dict.get(
-                            "hard_negative_score_mean",
-                            zero,
-                        )
-                        .detach()
-                        .item()
-                    ),
-                    "ignored_negative_count": float(
-                        loss_dict.get(
-                            "ignored_negative_count",
-                            0.0,
-                        )
-                    ),
-                    "selected_negative_fraction": float(
-                        loss_dict.get(
-                            "selected_negative_fraction",
-                            1.0,
-                        )
-                    ),
-                    "matcher_score_alpha": matcher_score_alpha_item,
-                    "matcher_cost_score_effective": (
-                        matcher_score_cost_item
-                    ),
-                    "negative_text_regression_matches": (
-                        negative_text_match_item
-                    ),
-                    "classification_type": loss_dict.get(
-                        "classification_type",
-                        "unknown",
-                    ),
-                    "dense_score_assignment_enabled": bool(
-                        loss_dict.get(
-                            "dense_score_assignment_enabled",
-                            False,
-                        )
-                    ),
-                    "hard_negative_mining_enabled": bool(
-                        loss_dict.get(
-                            "hard_negative_mining_enabled",
-                            False,
-                        )
-                    ),
-                    "score_target_pos_mean": score_target_pos_mean,
-                })
+                    "lambda_rank": lambda_rank,
+                }
+
+                for name, value in (
+                    detached.items()
+                ):
+                    row[name] = float(
+                        value.item()
+                    )
+
+                for name in (
+                    "matcher_score_alpha",
+                    "matcher_alignment_alpha",
+                    "matcher_cost_score_effective",
+                    "matcher_cost_alignment_effective",
+                    "text_alignment_positive_score_mean",
+                    "text_alignment_negative_score_mean",
+                    "text_alignment_positive_negative_margin",
+                ):
+                    value = loss_dict.get(
+                        name
+                    )
+                    if value is None:
+                        continue
+                    row[name] = (
+                        float(value.detach().item())
+                        if torch.is_tensor(value)
+                        else float(value)
+                    )
+
+                append_jsonl(
+                    step_metrics_path,
+                    row,
+                )
+
     pbar.refresh()
     pbar.close()
 
-    num_batches = max(1, len(train_loader))
+    num_batches = max(
+        1,
+        len(train_loader),
+    )
 
-    return {
-        "train_loss": float((total_loss_sum / num_batches).item()),
-        "train_loss_main": float(
-            (total_main_loss_sum / num_batches).item()
+    result = {
+        "train_loss": float(
+            (
+                totals["loss"]
+                / num_batches
+            ).item()
         ),
-        "train_loss_aux": float(
-            (total_aux_loss_sum / num_batches).item()
+        "train_odvg_negative_phrases": int(
+            total_negative_phrases
         ),
-        "train_loss_aux_contrib": float(
-            (total_aux_contrib_sum / num_batches).item()
-        ),
-        "train_loss_bbox": float((total_bbox_sum / num_batches).item()),
-        "train_loss_giou": float((total_giou_sum / num_batches).item()),
-        "train_loss_score": float((total_score_sum / num_batches).item()),
-        "train_loss_rank_raw": float((total_rank_raw_sum / num_batches).item()),
-        "train_loss_rank": float((total_rank_contrib_sum / num_batches).item()),
-        "train_loss_text_negative": float(
-            (total_text_negative_sum / num_batches).item()
-        ),
-        "train_loss_text_negative_contrib": float(
-            (total_text_negative_contrib_sum / num_batches).item()
-        ),
-        "train_text_negative_queries": int(total_text_negative_queries),
-        "score_negative_iou_ignore_thr": float(
-            criterion.score_negative_iou_ignore_thr
-        ),
-        "duplicate_suppression_enabled": bool(
-            criterion.duplicate_suppression_enabled
-        ),
-        "duplicate_loss_weight": float(
-            criterion.duplicate_loss_weight
-        ),
-        "duplicate_margin": float(criterion.duplicate_margin),
-        "duplicate_background_weight": float(
-            criterion.duplicate_background_weight
-        ),
-        "duplicate_classification_weight": float(
-            criterion.duplicate_classification_weight
-        ),
-        "duplicate_max_pairs": int(
-            criterion.duplicate_max_pairs
-        ),
-        "duplicate_start_epoch": int(
-            criterion.duplicate_start_epoch
-        ),
-        "hard_negative_mining_enabled": bool(
-            criterion.hard_negative_mining_enabled
-        ),
-        "hard_negative_loss_weight": float(
-            criterion.hard_negative_loss_weight
-        ),
-        "hard_negative_topk": int(
-            criterion.hard_negative_topk
-        ),
-        "hard_negative_max_iou": float(
-            criterion.hard_negative_max_iou
-        ),
-        "hard_negative_start_epoch": int(
-            criterion.hard_negative_start_epoch
-        ),
-        "matcher_score_alpha": float(
-            criterion.resolve_epoch_alpha(
-                current_epoch=epoch,
-                quality_warmup_epoch=quality_warmup_epoch,
-                rank_start_epoch=rank_start_epoch,
-                rank_warmup_epoch=rank_warmup_epoch,
-                rank_alpha_min=rank_alpha_min,
-            )[1]
-        ),
-        "matcher_cost_score_effective": float(
-            criterion.main_matcher.cost_score
-            * criterion.resolve_epoch_alpha(
-                current_epoch=epoch,
-                quality_warmup_epoch=quality_warmup_epoch,
-                rank_start_epoch=rank_start_epoch,
-                rank_warmup_epoch=rank_warmup_epoch,
-                rank_alpha_min=rank_alpha_min,
-            )[1]
-        ),
-        "train_negative_text_regression_matches": 0,
     }
+
+    metric_output_names = {
+        "loss_main_total": (
+            "train_loss_main"
+        ),
+        "loss_aux_total": (
+            "train_loss_aux"
+        ),
+        "loss_aux_contrib": (
+            "train_loss_aux_contrib"
+        ),
+        "loss_bbox": (
+            "train_loss_bbox"
+        ),
+        "loss_giou": (
+            "train_loss_giou"
+        ),
+        "loss_score": (
+            "train_loss_score"
+        ),
+        "loss_rank": (
+            "train_loss_rank"
+        ),
+        "loss_rank_raw": (
+            "train_loss_rank_raw"
+        ),
+        "loss_text_alignment": (
+            "train_loss_text_alignment"
+        ),
+        "loss_text_alignment_contrib": (
+            "train_loss_text_alignment_contrib"
+        ),
+        "loss_text_alignment_rank": (
+            "train_loss_text_alignment_rank"
+        ),
+        "loss_text_alignment_rank_contrib": (
+            "train_loss_text_alignment_rank_contrib"
+        ),
+    }
+
+    for source_name, output_name in (
+        metric_output_names.items()
+    ):
+        result[output_name] = float(
+            (
+                totals[source_name]
+                / num_batches
+            ).item()
+        )
+
+    return result
+
 
 
 
@@ -2098,15 +2081,71 @@ def save_checkpoint(
 
 
 
-def collect_query_texts_from_datasets(*datasets: Any) -> List[str]:
+def collect_query_texts_from_datasets(
+    *datasets: Any,
+) -> List[str]:
+    """
+    Collect complete ODVG captions for the frozen-BERT cache.
+
+    The historical function name is retained so external imports do not break.
+    """
     texts = set()
 
     for dataset in datasets:
         if dataset is None:
             continue
 
-        samples = getattr(dataset, "samples", None)
+        records = getattr(
+            dataset,
+            "records",
+            None,
+        )
+        if records is not None:
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
 
+                caption = str(
+                    record.get("caption", "")
+                ).strip()
+                if caption:
+                    texts.add(caption)
+
+                # Include the deterministic training-time caption containing
+                # appended negative phrases.
+                if hasattr(
+                    dataset,
+                    "sample_negative_phrases",
+                ):
+                    try:
+                        index = dataset.records.index(
+                            record
+                        )
+                        negatives = (
+                            dataset.sample_negative_phrases(
+                                record,
+                                index,
+                            )
+                        )
+                        if negatives:
+                            separator = getattr(
+                                dataset,
+                                "negative_phrase_separator",
+                                "；負向描述：",
+                            )
+                            texts.add(
+                                caption
+                                + str(separator)
+                                + "、".join(negatives)
+                            )
+                    except Exception:
+                        pass
+
+        samples = getattr(
+            dataset,
+            "samples",
+            None,
+        )
         if samples is None:
             continue
 
@@ -2114,17 +2153,20 @@ def collect_query_texts_from_datasets(*datasets: Any) -> List[str]:
             if not isinstance(sample, dict):
                 continue
 
-            text = sample.get("query_text")
+            caption = sample.get(
+                "caption",
+                sample.get("query_text"),
+            )
 
-            if text is None:
+            if caption is None:
                 continue
 
-            text = str(text).strip()
-
-            if text:
-                texts.add(text)
+            caption = str(caption).strip()
+            if caption:
+                texts.add(caption)
 
     return sorted(texts)
+
 
 
 def ensure_precomputed_bert_raw_cache(
@@ -2132,7 +2174,7 @@ def ensure_precomputed_bert_raw_cache(
     datasets: Sequence[Any],
     device: torch.device,
     hidden_dim: int = 512,
-    max_length: int = 32,
+    max_length: int = 64,
     batch_size: int = 128,
     enabled: bool = True,
 ) -> Optional[str]:
@@ -2177,9 +2219,25 @@ def ensure_precomputed_bert_raw_cache(
 
             if isinstance(cached_object, dict):
                 loaded_cache = cached_object.get("cache", {})
-                if isinstance(loaded_cache, dict):
+                cached_max_length = int(
+                    cached_object.get("max_length", -1)
+                )
+
+                if (
+                    isinstance(loaded_cache, dict)
+                    and cached_max_length == int(max_length)
+                ):
                     cache = loaded_cache
                     cache_metadata = cached_object
+                else:
+                    print(
+                        "[BERT Precompute] Existing cache "
+                        "max_length mismatch; rebuild: "
+                        f"cached={cached_max_length}, "
+                        f"requested={int(max_length)}"
+                    )
+                    cache = {}
+                    cache_metadata = {}
         except Exception as error:
             print(
                 "[BERT Precompute] Existing cache is invalid; rebuild it: "
@@ -2346,7 +2404,23 @@ def build_dataloaders_with_supported_options(args: SimpleNamespace, **paths: str
         "query_budget_batching": args.query_budget,
         "negative_query_path": args.negative_query_path,
         "negative_sample_ratio": args.negative_sample_ratio,
-        "use_negative_queries_in_val": args.use_negative_queries_in_val,
+        "use_negative_queries_in_val": (
+            args.use_negative_queries_in_val
+        ),
+        "negative_phrase_max_per_image": int(
+            getattr(
+                args,
+                "negative_phrase_max_per_image",
+                3,
+            )
+        ),
+        "negative_phrase_separator": str(
+            getattr(
+                args,
+                "negative_phrase_separator",
+                "；負向描述：",
+            )
+        ),
     }
 
     signature = inspect.signature(build_dataloaders)
@@ -2450,9 +2524,9 @@ def train(args: SimpleNamespace) -> None:
     dataset_dir = args.dir
 
     train_image_dir = os.path.join(dataset_dir, "images", "train")
-    train_anno_dir = os.path.join(dataset_dir, "labels", "train")
+    train_anno_dir = os.path.join(dataset_dir, "labels", "ODVG", "train")
     val_image_dir = os.path.join(dataset_dir, "images", "val")
-    val_anno_dir = os.path.join(dataset_dir, "labels", "val")
+    val_anno_dir = os.path.join(dataset_dir, "labels", "ODVG", "val")
 
     train_loader, val_loader = build_dataloaders_with_supported_options(
         args,
@@ -2772,10 +2846,10 @@ def train(args: SimpleNamespace) -> None:
     print(f"[Info] Train batches: {len(train_loader)}")
     print(f"[Info] Val batches: {len(val_loader)}")
     print(
-        f"[Info] Text negatives: path={args.negative_query_path}, "
+        f"[Info] ODVG negative phrases: pool={args.negative_query_path}, "
         f"ratio={args.negative_sample_ratio:.4f}, "
         f"val={args.use_negative_queries_in_val}, "
-        f"max_loss_weight={args.max_query_loss_weight:.2f}"
+        f"max_per_image={getattr(args, 'negative_phrase_max_per_image', 3)}"
     )
     print(
         f"[Info] EMA: enabled={args.use_ema}, decay={args.ema_decay}, "
@@ -3074,8 +3148,22 @@ def train(args: SimpleNamespace) -> None:
             "matcher_score_start_epoch": int(args.rank_start_epoch),
             "matcher_score_warmup_epoch": int(args.rank_warmup_epoch),
             "matcher_score_alpha_min": float(args.rank_alpha_min),
-            "negative_sample_ratio": float(args.negative_sample_ratio),
-            "max_query_loss_weight": float(args.max_query_loss_weight),
+            "negative_sample_ratio": float(
+                args.negative_sample_ratio
+            ),
+            "negative_phrase_max_per_image": int(
+                getattr(
+                    args,
+                    "negative_phrase_max_per_image",
+                    3,
+                )
+            ),
+            "negative_sampling_mode": (
+                "odvg_appended_phrase"
+            ),
+            "max_query_loss_weight": float(
+                args.max_query_loss_weight
+            ),
             "lambda_text_negative": float(args.lambda_text_negative),
             "text_negative_topk": int(args.text_negative_topk),
             "text_negative_hard_mix": float(
@@ -3115,6 +3203,10 @@ def train(args: SimpleNamespace) -> None:
             "val_loss_bbox": None,
             "val_loss_giou": None,
             "val_loss_score": None,
+            "val_loss_text_alignment": None,
+            "val_loss_text_alignment_contrib": None,
+            "val_loss_text_alignment_rank": None,
+            "val_loss_text_alignment_rank_contrib": None,
             "val_loss_rank_raw": None,
             "val_loss_rank": None,
             "val_loss_text_negative": None,
@@ -3491,6 +3583,20 @@ class LightDet:
         )
         args.prefer_ema = bool(prefer_ema)
 
+        data_cfg = train_cfg.get("data", {})
+        args.negative_phrase_max_per_image = int(
+            data_cfg.get(
+                "negative_phrase_max_per_image",
+                3,
+            )
+        )
+        args.negative_phrase_separator = str(
+            data_cfg.get(
+                "negative_phrase_separator",
+                "；負向描述：",
+            )
+        )
+
         print_config_summary(
             model_cfg=model_cfg,
             train_cfg=train_cfg,
@@ -3543,7 +3649,7 @@ def main() -> None:
         model=str("/home/soic/Desktop/LightDet/units/model/cards/config/model.yaml"),
     )
     model.train(
-        cfg=str("/home/soic/Desktop/LightDet/units/model/cards/config/stronger_ranking.yaml"),
+        cfg=str("/home/soic/Desktop/LightDet/units/model/cards/config/train.yaml"),
     )
 
 

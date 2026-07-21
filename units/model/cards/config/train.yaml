@@ -13,9 +13,13 @@ data:
   persistent_workers: true
   query_budget: true
 
+  # ODVG phrase-level negatives. Phrases are appended to the complete caption
+  # without a bbox, so they supervise token alignment only.
   negative_query_path: units/model/cards/cache/negative_query_pool.json
   negative_sample_ratio: 0.15
-  use_negative_queries_in_val: true
+  negative_phrase_max_per_image: 3
+  negative_phrase_separator: "；負向描述："
+  use_negative_queries_in_val: false
 
 train:
   epochs: 300
@@ -44,12 +48,7 @@ train:
   grad_clip_norm: 1.0
 
 optim:
-  # 格式：
-  # ["mode", max_lr, min_lr, start_epoch, end_epoch]
-  #
-  # start_epoch、end_epoch:
-  #   0.0 ~ 1.0 代表總訓練 epoch 比例
-  #   大於 1.0 代表絕對 epoch
+  # [mode, max_lr, min_lr, start_epoch, end_epoch]
   components:
     vision: ["cosine", 0.0001, 0.000005, 0.00, 1.00]
     text: ["cosine", 0.00001, 0.0000005, 0.00, 1.00]
@@ -64,13 +63,18 @@ loss:
   matcher:
     cost_bbox: 5.0
     cost_giou: 2.0
-    # The matcher consumes localization-quality only, never the fused score.
+
+    # Localization quality remains in matching to preserve the current learned
+    # ranking behavior.
     cost_score: 2.0
     score_cost_type: focal
     focal_alpha: 0.25
     focal_gamma: 2.0
 
-  # Main localization-quality contribution schedule.
+    # ODVG query-to-phrase token alignment cost.
+    cost_alignment: 2.0
+    alignment_negative_weight: 0.25
+
   weight:
     dynamic: true
     bbox: 5.0
@@ -79,10 +83,8 @@ loss:
 
     bbox_start: 5.0
     bbox_end: 3.5
-
     giou_start: 2.0
     giou_end: 2.0
-
     score_start: 1.0
     score_end: 4.0
 
@@ -91,7 +93,6 @@ loss:
     schedule: cosine
 
   classification:
-    # Matched quality target = IoU; unmatched quality target = 0.
     type: iou
     ia_bce_alpha: 0.25
     focal_alpha: 0.25
@@ -114,17 +115,26 @@ loss:
     quality_warmup_epoch: 10
     aux_score_enabled: true
 
-  # Independent semantic supervision. Positive-text rows supervise high-IoU
-  # regions; negative-text rows supervise alignment only and do not enter the
-  # localization matcher or bbox/quality losses.
   text_alignment:
     enabled: true
     loss_weight: 1.0
-    positive_iou_threshold: 0.50
-    negative_iou_threshold: 0.20
+
+    # Matched query: non-phrase valid tokens.
     negative_weight: 0.25
+
+    # Unmatched query: every valid caption token.
+    unmatched_weight: 0.10
+
+    # Retained for future ODVG negative-caption rows.
     negative_text_weight: 1.0
+
     focal_gamma: 2.0
+
+    # Matched query must rank above the hardest unmatched query for the same GT
+    # phrase token map.
+    ranking_weight: 0.25
+    ranking_margin: 0.15
+
     start_epoch: 1
     warmup_epoch: 5
 
@@ -136,6 +146,7 @@ loss:
   score_sampling:
     positive_ratio: 1.0
     max_positive_per_gt: 5
+    min_extra_positive_iou: 0.0
     hard_negative_ratio: 5
     aux_positive_label: 0.7
     expand_cost_bbox: 5.0
@@ -143,16 +154,14 @@ loss:
 
   hybrid:
     aux_loss_weight: 0.50
-    aux_cost_score: 2.0
+    matcher_cost_score: 2.0
+    matcher_cost_alignment: 2.0
     warmup_epoch: 3
     decay_start_ratio: 0.75
     min_factor: 0.25
-    matcher_cost_score: 2.0
     matcher_score_start_epoch: 5
     matcher_score_warmup_epoch: 10
 
-  # Retained for backward-compatible logging. Semantic negative-text
-  # supervision is now provided by text_alignment.
   text_negative:
     as_empty_target: true
     classification_weight: 1.0
@@ -183,9 +192,11 @@ loss:
     start_epoch: 10
     warmup_epoch: 5
 
+  # Legacy quality-ranking configuration remains disabled. Phrase ranking is
+  # now part of text_alignment and uses GT token maps.
   ranking:
     enabled: false
-    lambda_rank: 0.5
+    lambda_rank: 0.0
     rank_margin: 0.1
     rank_min_quality_gap: 0.1
     rank_max_pairs: 512
@@ -193,6 +204,12 @@ loss:
     rank_warmup_epoch: 12
     rank_alpha_min: 0.0
     rank_negative_iou_max: 0.20
+
+  query_refinement:
+    identity_weight: 0.0
+    start_epoch: 1
+    warmup_epoch: 5
+    detach_localization: true
 
   pos_weight:
     value: 1.0
@@ -214,10 +231,10 @@ eval:
   best_metric: map50_95
 
 log:
-  save_dir: units/model/runs/train/lightdet_HDETR_score_decoupled
+  save_dir: units/model/runs/train/lightdet_ODVG_token_alignment
 
-  # The architecture adds a new trainable head. Use weights-only warm start
-  # for an old checkpoint because its optimizer state has no alignment params.
+  # The token-alignment projection heads are new parameters. Use weights-only
+  # loading for an old checkpoint; do not resume its optimizer state.
   weights_path: /home/soic/Desktop/LightDet/units/model/runs/train/lightdet_HDETR_object_query/latest.pt
   resume_path: null
   prefer_ema: true

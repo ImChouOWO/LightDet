@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -12,16 +13,21 @@ from tqdm import tqdm
 from units.model.tool.runtime import (
     box_iou_xyxy,
     forward_model_batch,
-    get_score_logit,
+    get_raw_targets,
     get_target_boxes_cpu,
     make_progress_bar,
     move_targets_to_device,
     prepare_model_batch,
+    score_queries_for_char_spans,
 )
 
 
-def get_amp_enabled(device: torch.device, use_amp: bool = True) -> bool:
+def get_amp_enabled(
+    device: torch.device,
+    use_amp: bool = True,
+) -> bool:
     return bool(use_amp and device.type == "cuda")
+
 
 def select_predictions_batch(
     boxes: torch.Tensor,
@@ -33,21 +39,24 @@ def select_predictions_batch(
     use_nms: bool = True,
 ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
     """
-    在 GPU 上批次完成 top-k、threshold 與 batched NMS；每個 batch 僅集中搬一次 CPU。
+    Select predictions for each phrase row.
 
-    boxes:  [B, N, 4], normalized xyxy
-    scores: [B, N], sigmoid scores
+    boxes:  [P,Q,4]
+    scores: [P,Q]
     """
-
     if boxes.ndim != 3 or boxes.shape[-1] != 4:
-        raise ValueError(f"boxes must be [B, N, 4], got {tuple(boxes.shape)}")
-
+        raise ValueError(
+            f"boxes must be [P,Q,4], got {tuple(boxes.shape)}"
+        )
     if scores.ndim != 2:
-        raise ValueError(f"scores must be [B, N], got {tuple(scores.shape)}")
+        raise ValueError(
+            f"scores must be [P,Q], got {tuple(scores.shape)}"
+        )
+    if boxes.shape[:2] != scores.shape:
+        raise ValueError("boxes/scores shape mismatch")
 
     batch_size, num_queries = scores.shape
-
-    if num_queries == 0 or top_k <= 0:
+    if num_queries == 0 or int(top_k) <= 0:
         return [
             (
                 torch.empty((0, 4), dtype=torch.float32),
@@ -57,7 +66,6 @@ def select_predictions_batch(
         ]
 
     k = min(int(top_k), int(num_queries))
-
     top_scores, top_indices = torch.topk(
         scores,
         k=k,
@@ -65,7 +73,6 @@ def select_predictions_batch(
         largest=True,
         sorted=True,
     )
-
     top_boxes = torch.gather(
         boxes,
         dim=1,
@@ -73,7 +80,6 @@ def select_predictions_batch(
     )
 
     valid_mask = top_scores >= float(score_thr)
-
     if use_topk_fallback:
         no_valid = ~valid_mask.any(dim=1)
         valid_mask[no_valid] = True
@@ -104,37 +110,34 @@ def select_predictions_batch(
             flat_batch_ids,
             float(nms_iou_thr),
         )
-
         flat_boxes = flat_boxes[keep]
         flat_scores = flat_scores[keep]
         flat_batch_ids = flat_batch_ids[keep]
 
-    # 非同步 copy 在 pinned destination 上才真正有利；這裡一次性 copy 已避免逐框同步。
-    boxes_cpu = flat_boxes.detach().to(dtype=torch.float32, device="cpu")
-    scores_cpu = flat_scores.detach().to(dtype=torch.float32, device="cpu")
-    batch_ids_cpu = flat_batch_ids.detach().to(device="cpu")
+    boxes_cpu = flat_boxes.detach().to(
+        device="cpu",
+        dtype=torch.float32,
+    )
+    scores_cpu = flat_scores.detach().to(
+        device="cpu",
+        dtype=torch.float32,
+    )
+    batch_ids_cpu = flat_batch_ids.detach().cpu()
 
     results: List[Tuple[torch.Tensor, torch.Tensor]] = []
-
     for batch_index in range(batch_size):
         mask = batch_ids_cpu == batch_index
-        boxes_i = boxes_cpu[mask]
-        scores_i = scores_cpu[mask]
-
-        # topk 與 batched_nms 的輸出已依 score 由高到低排列；
-        # 依 batch mask 取出後仍保留該 sample 的相對順序。
-        results.append((boxes_i, scores_i))
-
+        results.append(
+            (
+                boxes_cpu[mask],
+                scores_cpu[mask],
+            )
+        )
     return results
 
+
 class BinaryDetectionAPAccumulator:
-    """
-    保留原本 query-conditioned binary detection 的 matching 定義，但：
-      1. 每個 sample 僅計算一次 IoU matrix。
-      2. 所有 IoU thresholds 同時計算。
-      3. 所有 prediction 只做一次全域 score 排序。
-      4. 不建立逐框 Python dict。
-    """
+    """Global AP accumulator for phrase-conditioned binary detection."""
 
     def __init__(
         self,
@@ -145,12 +148,10 @@ class BinaryDetectionAPAccumulator:
                 round(value, 2)
                 for value in np.arange(0.50, 0.96, 0.05)
             ]
-
         self.iou_thresholds = torch.as_tensor(
-            iou_thresholds,
+            list(iou_thresholds),
             dtype=torch.float32,
         )
-
         if self.iou_thresholds.numel() == 0:
             raise ValueError("iou_thresholds must not be empty")
 
@@ -174,95 +175,64 @@ class BinaryDetectionAPAccumulator:
         num_thresholds = int(self.iou_thresholds.numel())
 
         if pred_scores.numel() != num_pred:
-            raise ValueError(
-                "pred_boxes/pred_scores size mismatch: "
-                f"{num_pred} != {pred_scores.numel()}"
-            )
+            raise ValueError("pred_boxes/pred_scores size mismatch")
 
         self.num_gt += num_gt
         self.num_pred += num_pred
-
         if num_pred == 0:
             return
 
-        # AP matching 必須依 confidence 由高到低逐一處理 prediction。
-        # 即使上游 select_predictions_batch 已排序，這裡仍再次排序，
-        # 避免未來由其他呼叫路徑傳入未排序 prediction 時造成評估偏差。
-        score_order = torch.argsort(
+        order = torch.argsort(
             pred_scores,
             descending=True,
             stable=True,
         )
-        pred_boxes = pred_boxes[score_order]
-        pred_scores = pred_scores[score_order]
+        pred_boxes = pred_boxes[order]
+        pred_scores = pred_scores[order]
 
-        metric_device = pred_boxes.device
-
-        if gt_boxes.device != metric_device:
-            gt_boxes = gt_boxes.to(metric_device)
-
-        # 每一列對應一個 prediction，每一欄對應一個 IoU threshold。
         tp_matrix = torch.zeros(
             (num_pred, num_thresholds),
             dtype=torch.bool,
-            device=metric_device,
+            device=pred_boxes.device,
         )
 
         if num_gt > 0:
+            if gt_boxes.device != pred_boxes.device:
+                gt_boxes = gt_boxes.to(pred_boxes.device)
+
             iou_matrix = box_iou_xyxy(
                 pred_boxes,
                 gt_boxes,
             )
-
-            iou_thresholds = self.iou_thresholds.to(
-                device=metric_device,
+            thresholds = self.iou_thresholds.to(
+                device=pred_boxes.device,
                 dtype=iou_matrix.dtype,
             )
-
-            # 每個 IoU threshold 都必須維護獨立的 GT 配對狀態。
-            # shape: [num_thresholds, num_gt]
             matched_gt = torch.zeros(
                 (num_thresholds, num_gt),
                 dtype=torch.bool,
-                device=metric_device,
+                device=pred_boxes.device,
             )
-
             threshold_indices = torch.arange(
                 num_thresholds,
-                device=metric_device,
+                device=pred_boxes.device,
             )
 
-            # prediction 已依 confidence 由高到低排列。
             for prediction_index in range(num_pred):
-                # 同一個 prediction 在每個 IoU threshold 下，都只可從
-                # 尚未配對的 GT 中選擇 IoU 最高者。
-                candidate_ious = (
+                candidate = (
                     iou_matrix[prediction_index]
                     .unsqueeze(0)
                     .expand(num_thresholds, -1)
                     .masked_fill(matched_gt, -1.0)
                 )
-
-                best_iou, best_gt_index = candidate_ious.max(dim=1)
-                is_true_positive = best_iou >= iou_thresholds
-
-                tp_matrix[prediction_index] = is_true_positive
-
-                # 僅更新本次成功配對的 threshold/GT 組合。
-                valid_threshold_indices = threshold_indices[
-                    is_true_positive
-                ]
-                valid_gt_indices = best_gt_index[
-                    is_true_positive
-                ]
-
+                best_iou, best_gt = candidate.max(dim=1)
+                is_tp = best_iou >= thresholds
+                tp_matrix[prediction_index] = is_tp
                 matched_gt[
-                    valid_threshold_indices,
-                    valid_gt_indices,
+                    threshold_indices[is_tp],
+                    best_gt[is_tp],
                 ] = True
 
-        # 累積資料固定搬回 CPU，避免跨 batch 保留 GPU tensor，
-        # 並確保 compute() 的全域排序與累積運算裝置一致。
         self.score_chunks.append(
             pred_scores.detach().cpu().contiguous()
         )
@@ -296,27 +266,27 @@ class BinaryDetectionAPAccumulator:
             }
 
         all_scores = torch.cat(self.score_chunks, dim=0)
-        all_tp = torch.cat(self.tp_chunks, dim=0).to(torch.float32)
+        all_tp = torch.cat(
+            self.tp_chunks,
+            dim=0,
+        ).to(torch.float32)
 
-        global_order = torch.argsort(
+        order = torch.argsort(
             all_scores,
             descending=True,
             stable=True,
         )
-
-        all_tp = all_tp[global_order]
+        all_tp = all_tp[order]
         all_fp = 1.0 - all_tp
 
         cumulative_tp = torch.cumsum(all_tp, dim=0)
         cumulative_fp = torch.cumsum(all_fp, dim=0)
-
         recall = cumulative_tp / max(1, self.num_gt)
         precision = cumulative_tp / torch.clamp(
             cumulative_tp + cumulative_fp,
             min=1e-7,
         )
 
-        # Precision envelope，等價於原本由後往前逐點 max。
         precision_envelope = torch.flip(
             torch.cummax(
                 torch.flip(precision, dims=[0]),
@@ -324,7 +294,6 @@ class BinaryDetectionAPAccumulator:
             ).values,
             dims=[0],
         )
-
         previous_recall = torch.cat(
             [
                 torch.zeros(
@@ -335,27 +304,29 @@ class BinaryDetectionAPAccumulator:
             ],
             dim=0,
         )
-
-        recall_delta = recall - previous_recall
         ap_per_threshold = torch.sum(
-            recall_delta * precision_envelope,
+            (recall - previous_recall)
+            * precision_envelope,
             dim=0,
         )
 
+        threshold_50_index = int(
+            torch.argmin(
+                torch.abs(self.iou_thresholds - 0.50)
+            ).item()
+        )
         final_tp = cumulative_tp[-1]
         final_fp = cumulative_fp[-1]
-
-        # 找最接近 0.50 的 threshold，避免自訂 threshold 順序造成錯誤。
-        threshold_50_index = int(
-            torch.argmin(torch.abs(self.iou_thresholds - 0.50)).item()
-        )
-
         tp50 = int(final_tp[threshold_50_index].item())
         fp50 = int(final_fp[threshold_50_index].item())
 
         return {
-            "map50": float(ap_per_threshold[threshold_50_index].item()),
-            "map50_95": float(ap_per_threshold.mean().item()),
+            "map50": float(
+                ap_per_threshold[threshold_50_index].item()
+            ),
+            "map50_95": float(
+                ap_per_threshold.mean().item()
+            ),
             "precision": tp50 / max(1, tp50 + fp50),
             "recall": tp50 / max(1, self.num_gt),
             "tp": tp50,
@@ -364,86 +335,97 @@ class BinaryDetectionAPAccumulator:
             "num_pred": int(self.num_pred),
         }
 
-class RankedRecallAtKAccumulator:
-    """Score-ranked Recall@K with one-to-one matching at IoU 0.50."""
 
-    def __init__(self, ks=(1, 5, 10), iou_threshold=0.50):
-        self.ks = tuple(sorted({max(1, int(value)) for value in ks}))
+class RankedRecallAtKAccumulator:
+    """Phrase-conditioned Recall@K at one IoU threshold."""
+
+    def __init__(
+        self,
+        ks: Sequence[int] = (1, 5, 10),
+        iou_threshold: float = 0.50,
+    ) -> None:
+        self.ks = tuple(
+            sorted({max(1, int(value)) for value in ks})
+        )
         self.iou_threshold = float(iou_threshold)
         self.num_gt = 0
         self.hits = {value: 0 for value in self.ks}
 
-    def update(self, pred_boxes, pred_scores, gt_boxes):
+    def update(
+        self,
+        pred_boxes: torch.Tensor,
+        pred_scores: torch.Tensor,
+        gt_boxes: torch.Tensor,
+    ) -> None:
         pred_boxes = pred_boxes.detach().float().reshape(-1, 4).cpu()
         pred_scores = pred_scores.detach().float().reshape(-1).cpu()
         gt_boxes = gt_boxes.detach().float().reshape(-1, 4).cpu()
+
         num_gt = int(gt_boxes.shape[0])
         self.num_gt += num_gt
         if num_gt == 0 or pred_boxes.shape[0] == 0:
             return
 
-        order = torch.argsort(pred_scores, descending=True, stable=True)
-        iou_matrix = box_iou_xyxy(pred_boxes[order], gt_boxes)
+        order = torch.argsort(
+            pred_scores,
+            descending=True,
+            stable=True,
+        )
+        iou_matrix = box_iou_xyxy(
+            pred_boxes[order],
+            gt_boxes,
+        )
+
         for top_k in self.ks:
-            matched_gt = torch.zeros((num_gt,), dtype=torch.bool)
+            matched_gt = torch.zeros(
+                (num_gt,),
+                dtype=torch.bool,
+            )
             hit_count = 0
-            for prediction_index in range(min(top_k, iou_matrix.shape[0])):
-                candidate = iou_matrix[prediction_index].masked_fill(
-                    matched_gt, -1.0
-                )
+            for prediction_index in range(
+                min(top_k, iou_matrix.shape[0])
+            ):
+                candidate = iou_matrix[
+                    prediction_index
+                ].masked_fill(matched_gt, -1.0)
                 best_iou, best_gt = candidate.max(dim=0)
                 if float(best_iou.item()) >= self.iou_threshold:
                     matched_gt[best_gt] = True
                     hit_count += 1
             self.hits[top_k] += hit_count
 
-    def compute(self):
+    def compute(self, prefix: str) -> Dict[str, float]:
         denominator = max(1, self.num_gt)
-        result = {"ranking_recall_iou": self.iou_threshold}
-        for top_k in self.ks:
-            result[f"recall50_at_{top_k}"] = self.hits[top_k] / denominator
-        return result
+        return {
+            f"{prefix}_recall_iou": self.iou_threshold,
+            **{
+                f"{prefix}_recall50_at_{top_k}": (
+                    self.hits[top_k] / denominator
+                )
+                for top_k in self.ks
+            },
+        }
 
 
 class RawOracleRecallAccumulator:
-    """
-    使用全部 raw prediction 計算候選框覆蓋能力。
-
-    對每一個 GT，從該 query 的所有原始預測框中取最大 IoU：
-        best_iou(gt) = max IoU(raw_prediction, gt)
-
-    Raw Oracle Recall@t：
-        best_iou >= t 的 GT 數 / 全部 GT 數
-
-    此指標不套用 confidence threshold、Top-K 或 NMS，並允許同一個
-    prediction 成為多個 GT 的最佳候選。因此它是偏樂觀的候選框覆蓋
-    上限，只用於診斷定位能力，不能取代正式 mAP、Precision 或 Recall。
-    """
+    """Raw-box coverage upper bound for each phrase GT set."""
 
     def __init__(
         self,
-        iou_thresholds: Optional[Sequence[float]] = None,
+        iou_thresholds: Sequence[float] = (
+            0.25,
+            0.50,
+            0.75,
+        ),
     ) -> None:
-        if iou_thresholds is None:
-            iou_thresholds = (0.25, 0.50, 0.75)
-
         self.iou_thresholds = torch.as_tensor(
             list(iou_thresholds),
             dtype=torch.float32,
         )
-
         if self.iou_thresholds.numel() == 0:
             raise ValueError(
                 "raw_oracle_iou_thresholds must not be empty"
             )
-
-        if bool(
-            ((self.iou_thresholds < 0.0) | (self.iou_thresholds > 1.0)).any()
-        ):
-            raise ValueError(
-                "raw_oracle_iou_thresholds must be within [0, 1]"
-            )
-
         self.best_iou_chunks: List[torch.Tensor] = []
         self.num_gt = 0
         self.num_samples = 0
@@ -453,15 +435,16 @@ class RawOracleRecallAccumulator:
 
     @staticmethod
     def threshold_key(threshold: float) -> str:
-        return f"raw_oracle_recall{int(round(float(threshold) * 100)):02d}"
+        return (
+            "raw_oracle_recall"
+            f"{int(round(float(threshold) * 100)):02d}"
+        )
 
     def update(
         self,
         pred_boxes: torch.Tensor,
         gt_boxes: torch.Tensor,
     ) -> None:
-        # Raw Oracle 只需要 bbox，不使用 score。固定搬到 CPU，避免跨 batch
-        # 保留 GPU tensor，並讓獨立 validate.py 與 train.py 的結果一致。
         pred_boxes = (
             pred_boxes.detach()
             .to(device="cpu", dtype=torch.float32)
@@ -477,13 +460,10 @@ class RawOracleRecallAccumulator:
 
         num_pred = int(pred_boxes.shape[0])
         num_gt = int(gt_boxes.shape[0])
-
         self.num_samples += 1
         self.num_raw_pred += num_pred
         self.num_gt += num_gt
 
-        # 負文字 query 沒有 GT，不參與 Raw Oracle Recall，但仍保留於
-        # 正式 AP/Precision 的 FP 計算。
         if num_gt == 0:
             return
 
@@ -496,16 +476,11 @@ class RawOracleRecallAccumulator:
                 dtype=torch.float32,
             )
         else:
-            iou_matrix = box_iou_xyxy(
+            best_iou = box_iou_xyxy(
                 pred_boxes,
                 gt_boxes,
-            )
-            # 每一欄是一個 GT，取所有 raw prediction 中的最大 IoU。
-            best_iou = iou_matrix.max(dim=0).values
-
-        self.best_iou_chunks.append(
-            best_iou.detach().cpu().contiguous()
-        )
+            ).max(dim=0).values
+        self.best_iou_chunks.append(best_iou)
 
     def compute(self) -> Dict[str, float]:
         result: Dict[str, float] = {
@@ -531,26 +506,19 @@ class RawOracleRecallAccumulator:
                 "raw_best_iou_p25": 0.0,
                 "raw_best_iou_p75": 0.0,
             })
-
             for threshold in self.iou_thresholds.tolist():
                 result[self.threshold_key(threshold)] = 0.0
-
             return result
 
         best_iou = torch.cat(
             self.best_iou_chunks,
             dim=0,
         )
-
-        if int(best_iou.numel()) != int(self.num_gt):
-            raise RuntimeError(
-                "Raw Oracle GT count mismatch: "
-                f"best_iou={best_iou.numel()}, num_gt={self.num_gt}"
-            )
-
         result.update({
             "raw_best_iou_mean": float(best_iou.mean().item()),
-            "raw_best_iou_median": float(best_iou.median().item()),
+            "raw_best_iou_median": float(
+                best_iou.median().item()
+            ),
             "raw_best_iou_p25": float(
                 torch.quantile(best_iou, 0.25).item()
             ),
@@ -558,7 +526,6 @@ class RawOracleRecallAccumulator:
                 torch.quantile(best_iou, 0.75).item()
             ),
         })
-
         for threshold in self.iou_thresholds.tolist():
             result[self.threshold_key(threshold)] = float(
                 (best_iou >= float(threshold))
@@ -566,9 +533,281 @@ class RawOracleRecallAccumulator:
                 .mean()
                 .item()
             )
-
         return result
 
+
+@dataclass
+class PhraseEvaluationRow:
+    image_index: int
+    phrase: str
+    char_spans: Sequence[Sequence[int]]
+    pred_boxes: torch.Tensor
+    quality_scores: torch.Tensor
+    alignment_scores: torch.Tensor
+    final_scores: torch.Tensor
+    gt_boxes: torch.Tensor
+
+
+def _normalize_target_indices(
+    value: Any,
+    *,
+    target_count: int,
+) -> List[int]:
+    if torch.is_tensor(value):
+        values = value.detach().cpu().reshape(-1).tolist()
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    elif value is None:
+        values = []
+    else:
+        values = [value]
+
+    result: List[int] = []
+    seen = set()
+    for item in values:
+        index = int(item)
+        if index < 0 or index >= int(target_count):
+            raise IndexError(
+                "region_to_target_indices contains out-of-range "
+                f"target index {index}/{target_count}"
+            )
+        if index not in seen:
+            seen.add(index)
+            result.append(index)
+    return result
+
+
+def _flatten_target_spans(
+    target: Mapping[str, Any],
+) -> List[List[int]]:
+    result: List[List[int]] = []
+    for target_spans in target.get(
+        "positive_char_spans",
+        [],
+    ):
+        for span in target_spans:
+            if len(span) == 2:
+                result.append(
+                    [int(span[0]), int(span[1])]
+                )
+    return result
+
+
+def build_phrase_evaluation_rows(
+    *,
+    batch: Mapping[str, Any],
+    outputs: Mapping[str, Any],
+    pred_bbox: torch.Tensor,
+    token_reduction: str = "mean",
+    score_fusion: str = "geometric_mean",
+) -> List[PhraseEvaluationRow]:
+    """
+    Expand each ODVG image into phrase-conditioned evaluation rows.
+
+    Each region phrase receives its own query scores and its own GT box set.
+    """
+    quality_logit = outputs.get(
+        "quality_logit",
+        outputs.get("main_quality_logit"),
+    )
+    token_logits = outputs.get(
+        "token_alignment_logits",
+        outputs.get("main_token_alignment_logits"),
+    )
+    token_offsets = outputs.get("token_offsets")
+    alignment_text_mask = outputs.get(
+        "alignment_text_mask"
+    )
+
+    if not torch.is_tensor(quality_logit):
+        raise RuntimeError(
+            "Model output does not contain quality_logit"
+        )
+    if not torch.is_tensor(token_logits):
+        raise RuntimeError(
+            "Model output does not contain token_alignment_logits"
+        )
+    if not torch.is_tensor(token_offsets):
+        raise RuntimeError(
+            "Model output does not contain token_offsets"
+        )
+    if not torch.is_tensor(alignment_text_mask):
+        raise RuntimeError(
+            "Model output does not contain alignment_text_mask"
+        )
+
+    batch_size = int(pred_bbox.shape[0])
+    if quality_logit.shape[:2] != pred_bbox.shape[:2]:
+        raise ValueError("quality/bbox shape mismatch")
+    if token_logits.shape[:2] != pred_bbox.shape[:2]:
+        raise ValueError("token alignment/bbox shape mismatch")
+    if token_offsets.shape[:2] != (
+        batch_size,
+        token_logits.shape[-1],
+    ):
+        raise ValueError("token offset shape mismatch")
+    if alignment_text_mask.shape != (
+        batch_size,
+        token_logits.shape[-1],
+    ):
+        raise ValueError("alignment text mask shape mismatch")
+
+    raw_targets = get_raw_targets(dict(batch))
+    if len(raw_targets) != batch_size:
+        raise ValueError("target/model batch mismatch")
+
+    regions_batch = batch.get("regions")
+    mapping_batch = batch.get(
+        "region_to_target_indices"
+    )
+    rows: List[PhraseEvaluationRow] = []
+
+    for image_index in range(batch_size):
+        target = raw_targets[image_index]
+        target_boxes = torch.as_tensor(
+            target["boxes"],
+            dtype=torch.float32,
+        ).reshape(-1, 4)
+
+        image_regions = (
+            regions_batch[image_index]
+            if isinstance(regions_batch, Sequence)
+            and image_index < len(regions_batch)
+            else None
+        )
+        image_mapping = (
+            mapping_batch[image_index]
+            if isinstance(mapping_batch, Sequence)
+            and image_index < len(mapping_batch)
+            else None
+        )
+
+        region_rows_created = 0
+        if image_regions is not None:
+            for region_index, region in enumerate(
+                image_regions
+            ):
+                if not isinstance(region, Mapping):
+                    continue
+                spans = region.get(
+                    "tokens_positive",
+                    [],
+                )
+                if not spans:
+                    continue
+
+                if image_mapping is not None:
+                    mapping_value = (
+                        image_mapping[region_index]
+                        if region_index < len(image_mapping)
+                        else None
+                    )
+                    target_indices = _normalize_target_indices(
+                        mapping_value,
+                        target_count=target_boxes.shape[0],
+                    )
+                else:
+                    target_indices = []
+
+                if not target_indices:
+                    # Structural fallback for older ODVG collates.
+                    target_indices = list(
+                        range(target_boxes.shape[0])
+                    )
+
+                gt_boxes = target_boxes[
+                    target_indices
+                ]
+                scores = score_queries_for_char_spans(
+                    quality_logit=quality_logit[
+                        image_index
+                    ],
+                    token_alignment_logits=token_logits[
+                        image_index
+                    ],
+                    token_offsets=token_offsets[
+                        image_index
+                    ],
+                    char_spans=spans,
+                    valid_token_mask=alignment_text_mask[
+                        image_index
+                    ],
+                    token_reduction=token_reduction,
+                    score_fusion=score_fusion,
+                    strict=True,
+                )
+
+                rows.append(
+                    PhraseEvaluationRow(
+                        image_index=image_index,
+                        phrase=str(
+                            region.get("phrase", "")
+                        ),
+                        char_spans=spans,
+                        pred_boxes=pred_bbox[image_index],
+                        quality_scores=scores[
+                            "quality_score"
+                        ],
+                        alignment_scores=scores[
+                            "phrase_alignment_score"
+                        ],
+                        final_scores=scores[
+                            "final_score"
+                        ],
+                        gt_boxes=gt_boxes,
+                    )
+                )
+                region_rows_created += 1
+
+        if region_rows_created > 0:
+            continue
+
+        # Fallback: one union-phrase row per image.
+        spans = _flatten_target_spans(target)
+        if spans:
+            scores = score_queries_for_char_spans(
+                quality_logit=quality_logit[
+                    image_index
+                ],
+                token_alignment_logits=token_logits[
+                    image_index
+                ],
+                token_offsets=token_offsets[
+                    image_index
+                ],
+                char_spans=spans,
+                valid_token_mask=alignment_text_mask[
+                    image_index
+                ],
+                token_reduction=token_reduction,
+                score_fusion=score_fusion,
+                strict=True,
+            )
+            rows.append(
+                PhraseEvaluationRow(
+                    image_index=image_index,
+                    phrase=str(
+                        target.get("caption", "")
+                    ),
+                    char_spans=spans,
+                    pred_boxes=pred_bbox[image_index],
+                    quality_scores=scores[
+                        "quality_score"
+                    ],
+                    alignment_scores=scores[
+                        "phrase_alignment_score"
+                    ],
+                    final_scores=scores[
+                        "final_score"
+                    ],
+                    gt_boxes=target_boxes,
+                )
+            )
+
+    return rows
+
+
+@torch.inference_mode()
 def validate_one_epoch(
     model: torch.nn.Module,
     criterion: torch.nn.Module,
@@ -597,89 +836,81 @@ def validate_one_epoch(
     use_nms: bool = True,
     iou_thresholds: Optional[Sequence[float]] = None,
     compute_raw_oracle: bool = True,
-    raw_oracle_iou_thresholds: Optional[Sequence[float]] = (
-        0.25,
-        0.50,
-        0.75,
-    ),
+    raw_oracle_iou_thresholds: Optional[
+        Sequence[float]
+    ] = (0.25, 0.50, 0.75),
     max_val_batches: Optional[int] = None,
     log_interval: int = 50,
     progress_leave: bool = True,
     progress_mininterval: float = 0.5,
+    phrase_token_reduction: str = "mean",
+    phrase_score_fusion: str = "geometric_mean",
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
     if not compute_loss and not compute_metrics:
         return {}, {}
 
     model.eval()
-    amp_enabled = get_amp_enabled(device, use_amp)
+    amp_enabled = get_amp_enabled(
+        device,
+        use_amp,
+    )
 
-    total_loss_sum = torch.zeros((), device=device)
-    total_bbox_sum = torch.zeros((), device=device)
-    total_giou_sum = torch.zeros((), device=device)
-    total_score_sum = torch.zeros((), device=device)
-    total_rank_contrib_sum = torch.zeros((), device=device)
-    total_rank_raw_sum = torch.zeros((), device=device)
-    total_text_negative_sum = torch.zeros((), device=device)
-    total_text_negative_contrib_sum = torch.zeros((), device=device)
-    total_text_negative_queries = 0
+    loss_sums: Dict[str, torch.Tensor] = {}
+    processed_batches = 0
 
     metric = (
-        BinaryDetectionAPAccumulator(iou_thresholds=iou_thresholds)
+        BinaryDetectionAPAccumulator(
+            iou_thresholds=iou_thresholds
+        )
         if compute_metrics
         else None
     )
-
     raw_oracle_metric = (
         RawOracleRecallAccumulator(
-            iou_thresholds=raw_oracle_iou_thresholds,
+            iou_thresholds=(
+                raw_oracle_iou_thresholds
+                if raw_oracle_iou_thresholds is not None
+                else (0.25, 0.50, 0.75)
+            )
         )
         if compute_metrics and compute_raw_oracle
         else None
     )
-
     quality_recall_metric = (
-        RankedRecallAtKAccumulator(
-            ks=(1, 5, 10),
-            iou_threshold=0.50,
-        )
+        RankedRecallAtKAccumulator()
         if compute_metrics
         else None
     )
-
-    text_recall_metric = (
-        RankedRecallAtKAccumulator(
-            ks=(1, 5, 10),
-            iou_threshold=0.50,
-        )
+    alignment_recall_metric = (
+        RankedRecallAtKAccumulator()
         if compute_metrics
         else None
     )
-
     final_recall_metric = (
-        RankedRecallAtKAccumulator(
-            ks=(1, 5, 10),
-            iou_threshold=0.50,
-        )
+        RankedRecallAtKAccumulator()
         if compute_metrics
         else None
     )
 
-    sample_count = 0
+    phrase_count = 0
+    image_count = 0
+    total_text_negative_queries = 0
     skipped_empty_gt = 0
     total_selected = 0
-    processed_batches = 0
 
     pbar_total = (
         len(val_loader)
         if max_val_batches is None
-        else min(len(val_loader), int(max_val_batches))
+        else min(
+            len(val_loader),
+            int(max_val_batches),
+        )
     )
-
-    labels = []
+    labels: List[str] = []
     if compute_loss:
         labels.append("Loss")
     if compute_metrics:
-        labels.append("Eval")
+        labels.append("ODVG Eval")
 
     pbar = make_progress_bar(
         enumerate(val_loader),
@@ -692,91 +923,88 @@ def validate_one_epoch(
     validation_start = time.perf_counter()
 
     for step, batch in pbar:
-        if max_val_batches is not None and step >= int(max_val_batches):
+        if (
+            max_val_batches is not None
+            and step >= int(max_val_batches)
+        ):
             break
 
         processed_batches += 1
-
-        images, query_texts, image_indices = prepare_model_batch(
-            batch=batch,
-            device=device,
-            channels_last=channels_last,
+        images, captions, image_indices = (
+            prepare_model_batch(
+                batch=batch,
+                device=device,
+                channels_last=channels_last,
+            )
         )
-
         targets_device = (
             move_targets_to_device(batch, device)
             if compute_loss
             else None
         )
-
-        gt_boxes_cpu = (
-            get_target_boxes_cpu(batch)
-            if compute_metrics
-            else None
-        )
+        if compute_loss:
+            negative_mask_value = batch.get("text_negative_mask")
+            if negative_mask_value is not None:
+                total_text_negative_queries += int(
+                    torch.as_tensor(
+                        negative_mask_value,
+                        dtype=torch.bool,
+                    ).sum().item()
+                )
 
         with autocast(
             device_type=device.type,
             enabled=amp_enabled,
-            dtype=amp_dtype if amp_enabled else None,
+            dtype=(
+                amp_dtype
+                if amp_enabled
+                else None
+            ),
         ):
             outputs = forward_model_batch(
                 model=model,
                 images=images,
-                query_texts=query_texts,
+                query_texts=captions,
                 image_indices=image_indices,
                 return_aux=False,
             )
-
             pred_bbox = outputs["bbox"]
-
-            # 正式 AP 與推論排序仍使用融合後的 final score。
-            final_score_logit = outputs.get(
-                "final_score_logit",
-                get_score_logit(outputs),
-            )
-
-            quality_score_logit = outputs.get(
+            quality_logit = outputs.get(
                 "quality_logit",
+                outputs.get("main_quality_logit"),
+            )
+            token_logits = outputs.get(
+                "token_alignment_logits",
+                outputs.get(
+                    "main_token_alignment_logits"
+                ),
             )
 
-            text_score_logit = outputs.get(
-                "text_alignment_logit",
-            )
-
-            # 相容透過 tensor metadata 傳遞分支輸出的版本。
-            if quality_score_logit is None:
-                quality_score_logit = getattr(
-                    final_score_logit,
-                    "_quality_logit",
-                    None,
-                )
-
-            if text_score_logit is None:
-                text_score_logit = getattr(
-                    final_score_logit,
-                    "_text_alignment_logit",
-                    None,
-                )
-
-            if quality_score_logit is None:
+            if not torch.is_tensor(quality_logit):
                 raise RuntimeError(
                     "Model output does not contain quality_logit"
                 )
-
-            if text_score_logit is None:
+            if not torch.is_tensor(token_logits):
                 raise RuntimeError(
-                    "Model output does not contain text_alignment_logit"
+                    "Model output does not contain "
+                    "token_alignment_logits"
                 )
-
-            pred_score_logit = final_score_logit
 
             if compute_loss:
                 loss, loss_dict = criterion(
                     pred_bbox=pred_bbox,
-                    pred_score_logit=pred_score_logit,
-                    pred_quality_logit=quality_score_logit,
-                    pred_text_alignment_logit=text_score_logit,
+                    pred_score_logit=quality_logit,
+                    pred_quality_logit=quality_logit,
+                    pred_text_alignment_logit=token_logits,
+                    pred_token_alignment_logit=token_logits,
+                    positive_token_maps=None,
+                    alignment_text_mask=outputs[
+                        "alignment_text_mask"
+                    ],
+                    token_offsets=outputs[
+                        "token_offsets"
+                    ],
+                    captions=captions,
                     targets=targets_device,
                     lambda_bbox=lambda_bbox,
                     lambda_giou=lambda_giou,
@@ -785,357 +1013,384 @@ def validate_one_epoch(
                     pos_weight=pos_weight,
                     current_epoch=epoch,
                     total_epochs=total_epochs,
-                    quality_warmup_epoch=quality_warmup_epoch,
+                    quality_warmup_epoch=(
+                        quality_warmup_epoch
+                    ),
                     rank_start_epoch=rank_start_epoch,
                     rank_warmup_epoch=rank_warmup_epoch,
                     rank_alpha_min=rank_alpha_min,
-                    query_loss_weights=batch.get("query_loss_weights"),
-                    text_negative_mask=batch.get("text_negative_mask"),
+                    query_loss_weights=batch.get(
+                        "query_loss_weights"
+                    ),
+                    text_negative_mask=batch.get(
+                        "text_negative_mask"
+                    ),
                 )
 
         if compute_loss:
-            zero = pred_bbox.new_zeros(())
-
-            total_loss_sum.add_(loss.detach())
-            total_bbox_sum.add_(loss_dict["loss_bbox"].detach())
-            total_giou_sum.add_(loss_dict["loss_giou"].detach())
-            total_score_sum.add_(loss_dict["loss_score"].detach())
-            total_rank_contrib_sum.add_(
-                loss_dict.get(
+            values = {
+                "loss": loss,
+                "loss_bbox": loss_dict.get(
+                    "loss_bbox",
+                    pred_bbox.new_zeros(()),
+                ),
+                "loss_giou": loss_dict.get(
+                    "loss_giou",
+                    pred_bbox.new_zeros(()),
+                ),
+                "loss_score": loss_dict.get(
+                    "loss_score",
+                    pred_bbox.new_zeros(()),
+                ),
+                "loss_rank_raw": loss_dict.get(
+                    "loss_rank_raw",
+                    pred_bbox.new_zeros(()),
+                ),
+                "loss_rank": loss_dict.get(
                     "loss_rank_contrib",
-                    loss_dict.get("loss_rank", zero),
+                    loss_dict.get(
+                        "loss_rank",
+                        pred_bbox.new_zeros(()),
+                    ),
+                ),
+                "loss_text_alignment": loss_dict.get(
+                    "loss_text_alignment",
+                    pred_bbox.new_zeros(()),
+                ),
+                "loss_text_alignment_contrib": (
+                    loss_dict.get(
+                        "loss_text_alignment_contrib",
+                        pred_bbox.new_zeros(()),
+                    )
+                ),
+                "loss_text_negative": loss_dict.get(
+                    "loss_text_negative",
+                    pred_bbox.new_zeros(()),
+                ),
+                "loss_text_negative_contrib": (
+                    loss_dict.get(
+                        "loss_text_negative_contrib",
+                        pred_bbox.new_zeros(()),
+                    )
+                ),
+            }
+            for key, value in values.items():
+                value = torch.as_tensor(
+                    value,
+                    device=device,
                 ).detach()
-            )
-            total_rank_raw_sum.add_(
-                loss_dict.get("loss_rank_raw", zero).detach()
-            )
-            total_text_negative_sum.add_(
-                loss_dict.get("loss_text_negative", zero).detach()
-            )
-            total_text_negative_contrib_sum.add_(
-                loss_dict.get(
-                    "loss_text_negative_contrib",
-                    zero,
-                ).detach()
-            )
-            total_text_negative_queries += int(
-                batch.get(
-                    "text_negative_mask",
-                    torch.zeros(0, dtype=torch.bool),
-                ).sum().item()
-            )
+                if key not in loss_sums:
+                    loss_sums[key] = torch.zeros(
+                        (),
+                        device=device,
+                    )
+                loss_sums[key].add_(value)
 
-        if compute_metrics and metric is not None and gt_boxes_cpu is not None:
-            # Raw Oracle 與正式 filtered metric 共用同一次 model forward。
-            # 先使用全部原始 bbox 更新 Oracle，再做 threshold/Top-K/NMS。
-            if raw_oracle_metric is not None:
-                raw_pred_bbox_cpu = (
-                    pred_bbox.detach()
-                    .to(device="cpu", dtype=torch.float32)
-                    .contiguous()
+            last_loss_dict = loss_dict
+        else:
+            last_loss_dict = {}
+
+        if compute_metrics and metric is not None:
+            rows = build_phrase_evaluation_rows(
+                batch=batch,
+                outputs=outputs,
+                pred_bbox=pred_bbox.detach(),
+                token_reduction=(
+                    phrase_token_reduction
+                ),
+                score_fusion=(
+                    phrase_score_fusion
+                ),
+            )
+            image_count += int(pred_bbox.shape[0])
+            phrase_count += len(rows)
+
+            if rows:
+                phrase_boxes = torch.stack(
+                    [
+                        row.pred_boxes
+                        for row in rows
+                    ],
+                    dim=0,
+                )
+                final_scores = torch.stack(
+                    [
+                        row.final_scores
+                        for row in rows
+                    ],
+                    dim=0,
+                )
+                selected_rows = select_predictions_batch(
+                    boxes=phrase_boxes,
+                    scores=final_scores,
+                    score_thr=score_thr,
+                    top_k=top_k,
+                    nms_iou_thr=nms_iou_thr,
+                    use_topk_fallback=(
+                        use_topk_fallback
+                    ),
+                    use_nms=use_nms,
                 )
 
-                if int(raw_pred_bbox_cpu.shape[0]) != len(gt_boxes_cpu):
-                    raise RuntimeError(
-                        "Raw prediction/GT batch size mismatch: "
-                        f"{raw_pred_bbox_cpu.shape[0]} != "
-                        f"{len(gt_boxes_cpu)}"
+                for row, (
+                    selected_boxes,
+                    selected_scores,
+                ) in zip(rows, selected_rows):
+                    gt_boxes = (
+                        row.gt_boxes.detach()
+                        .to(
+                            device="cpu",
+                            dtype=torch.float32,
+                        )
+                        .reshape(-1, 4)
+                    )
+                    if gt_boxes.numel() == 0:
+                        skipped_empty_gt += 1
+
+                    total_selected += int(
+                        selected_boxes.shape[0]
                     )
 
-                for raw_boxes, gt_boxes in zip(
-                    raw_pred_bbox_cpu,
-                    gt_boxes_cpu,
-                ):
-                    raw_oracle_metric.update(
-                        pred_boxes=raw_boxes,
+                    metric.update(
+                        pred_boxes=selected_boxes,
+                        pred_scores=selected_scores,
                         gt_boxes=gt_boxes,
                     )
 
-            quality_scores = quality_score_logit.float().sigmoid()
-            text_scores = text_score_logit.float().sigmoid()
-            final_scores = final_score_logit.float().sigmoid()
-
-            if quality_scores.ndim == 3:
-                quality_scores = quality_scores.squeeze(-1)
-
-            if text_scores.ndim == 3:
-                text_scores = text_scores.squeeze(-1)
-
-            if final_scores.ndim == 3:
-                final_scores = final_scores.squeeze(-1)
-
-            if (
-                quality_recall_metric is not None
-                and text_recall_metric is not None
-                and final_recall_metric is not None
-            ):
-                for (
-                    raw_boxes,
-                    quality_scores_row,
-                    text_scores_row,
-                    final_scores_row,
-                    gt_boxes,
-                ) in zip(
-                    pred_bbox.detach(),
-                    quality_scores.detach(),
-                    text_scores.detach(),
-                    final_scores.detach(),
-                    gt_boxes_cpu,
-                ):
                     quality_recall_metric.update(
-                        pred_boxes=raw_boxes,
-                        pred_scores=quality_scores_row,
+                        pred_boxes=row.pred_boxes,
+                        pred_scores=(
+                            row.quality_scores
+                        ),
                         gt_boxes=gt_boxes,
                     )
-
-                    text_recall_metric.update(
-                        pred_boxes=raw_boxes,
-                        pred_scores=text_scores_row,
+                    alignment_recall_metric.update(
+                        pred_boxes=row.pred_boxes,
+                        pred_scores=(
+                            row.alignment_scores
+                        ),
                         gt_boxes=gt_boxes,
                     )
-
                     final_recall_metric.update(
-                        pred_boxes=raw_boxes,
-                        pred_scores=final_scores_row,
+                        pred_boxes=row.pred_boxes,
+                        pred_scores=row.final_scores,
                         gt_boxes=gt_boxes,
                     )
 
-            # 正式 mAP、Precision、Recall 和 Top-K 選框仍使用 final score。
-            pred_scores = final_scores
-
-            selected_batch = select_predictions_batch(
-                boxes=pred_bbox.detach(),
-                scores=pred_scores.detach(),
-                score_thr=score_thr,
-                top_k=top_k,
-                nms_iou_thr=nms_iou_thr,
-                use_topk_fallback=use_topk_fallback,
-                use_nms=use_nms,
-            )
-
-            for (selected_boxes, selected_scores), gt_boxes in zip(
-                selected_batch,
-                gt_boxes_cpu,
-            ):
-                if gt_boxes.numel() == 0:
-                    skipped_empty_gt += 1
-
-                total_selected += int(selected_boxes.shape[0])
-                sample_count += 1
-
-                metric.update(
-                    pred_boxes=selected_boxes,
-                    pred_scores=selected_scores,
-                    gt_boxes=gt_boxes,
-                )
+                    if raw_oracle_metric is not None:
+                        raw_oracle_metric.update(
+                            pred_boxes=row.pred_boxes,
+                            gt_boxes=gt_boxes,
+                        )
 
         should_log = (
-            (step + 1) % max(1, int(log_interval)) == 0
+            (step + 1)
+            % max(1, int(log_interval))
+            == 0
             or (step + 1) == pbar_total
         )
-
         if should_log:
             postfix: Dict[str, Any] = {}
-
-            if compute_loss:
+            if compute_loss and processed_batches > 0:
                 postfix["loss"] = (
-                    f"{float((total_loss_sum / processed_batches).item()):.4f}"
+                    f"{float((loss_sums['loss'] / processed_batches).item()):.4f}"
                 )
-
-            if compute_metrics and metric is not None:
+            if compute_metrics:
                 postfix.update({
-                    "samples": sample_count,
-                    "pred": metric.num_pred,
-                    "sel/img": f"{total_selected / max(1, sample_count):.2f}",
-                    "skip_empty": skipped_empty_gt,
+                    "phrases": phrase_count,
+                    "selected": total_selected,
                 })
-
             pbar.set_postfix(postfix)
-            
+
     pbar.refresh()
     pbar.close()
-    validation_loop_time = time.perf_counter() - validation_start
+    validation_loop_time = (
+        time.perf_counter()
+        - validation_start
+    )
 
     val_loss_metrics: Dict[str, float] = {}
-    eval_metrics: Dict[str, float] = {}
-
     if compute_loss:
         denominator = max(1, processed_batches)
+
+        def average(key: str) -> float:
+            value = loss_sums.get(
+                key,
+                torch.zeros((), device=device),
+            )
+            return float(
+                (value / denominator).item()
+            )
+
         val_loss_metrics = {
-            "val_loss": float((total_loss_sum / denominator).item()),
-            "val_loss_bbox": float((total_bbox_sum / denominator).item()),
-            "val_loss_giou": float((total_giou_sum / denominator).item()),
-            "val_loss_score": float((total_score_sum / denominator).item()),
-            "val_loss_rank_raw": float((total_rank_raw_sum / denominator).item()),
-            "val_loss_rank": float(
-                (total_rank_contrib_sum / denominator).item()
+            "val_loss": average("loss"),
+            "val_loss_bbox": average("loss_bbox"),
+            "val_loss_giou": average("loss_giou"),
+            "val_loss_score": average("loss_score"),
+            "val_loss_rank_raw": average(
+                "loss_rank_raw"
             ),
-            "val_loss_text_negative": float(
-                (total_text_negative_sum / denominator).item()
+            "val_loss_rank": average("loss_rank"),
+            "val_loss_text_alignment": average(
+                "loss_text_alignment"
             ),
-            "val_loss_text_negative_contrib": float(
-                (total_text_negative_contrib_sum / denominator).item()
+            "val_loss_text_alignment_contrib": (
+                average(
+                    "loss_text_alignment_contrib"
+                )
             ),
-            "val_text_negative_queries": int(total_text_negative_queries),
+            "val_loss_text_negative": average(
+                "loss_text_negative"
+            ),
+            "val_loss_text_negative_contrib": (
+                average(
+                    "loss_text_negative_contrib"
+                )
+            ),
+            "val_text_negative_queries": int(
+                total_text_negative_queries
+            ),
             "val_score_negative_iou_ignore_thr": float(
-                criterion.score_negative_iou_ignore_thr
+                last_loss_dict.get(
+                    "score_negative_iou_ignore_thr",
+                    getattr(
+                        criterion,
+                        "score_negative_iou_ignore_thr",
+                        0.0,
+                    ),
+                )
             ),
             "val_duplicate_suppression_enabled": bool(
-                criterion.duplicate_suppression_enabled
+                last_loss_dict.get(
+                    "duplicate_suppression_enabled",
+                    getattr(
+                        criterion,
+                        "duplicate_suppression_enabled",
+                        False,
+                    ),
+                )
             ),
             "val_hard_negative_mining_enabled": bool(
-                criterion.hard_negative_mining_enabled
+                last_loss_dict.get(
+                    "hard_negative_mining_enabled",
+                    getattr(
+                        criterion,
+                        "hard_negative_mining_enabled",
+                        False,
+                    ),
+                )
             ),
             "val_matcher_score_alpha": float(
-                criterion.resolve_epoch_alpha(
-                    current_epoch=epoch,
-                    quality_warmup_epoch=quality_warmup_epoch,
-                    rank_start_epoch=rank_start_epoch,
-                    rank_warmup_epoch=rank_warmup_epoch,
-                    rank_alpha_min=rank_alpha_min,
-                )[1]
+                last_loss_dict.get(
+                    "matcher_score_alpha",
+                    0.0,
+                )
+            ),
+            "val_matcher_alignment_alpha": float(
+                last_loss_dict.get(
+                    "matcher_alignment_alpha",
+                    0.0,
+                )
             ),
             "val_matcher_cost_score_effective": float(
-                criterion.main_matcher.cost_score
-                * criterion.resolve_epoch_alpha(
-                    current_epoch=epoch,
-                    quality_warmup_epoch=quality_warmup_epoch,
-                    rank_start_epoch=rank_start_epoch,
-                    rank_warmup_epoch=rank_warmup_epoch,
-                    rank_alpha_min=rank_alpha_min,
-                )[1]
+                last_loss_dict.get(
+                    "matcher_cost_score_effective",
+                    0.0,
+                )
+            ),
+            "val_matcher_cost_alignment_effective": float(
+                last_loss_dict.get(
+                    "matcher_cost_alignment_effective",
+                    0.0,
+                )
             ),
         }
 
+    eval_metrics: Dict[str, float] = {}
     if compute_metrics and metric is not None:
-        tqdm.write(
-            f"[Eval Metric] Start: samples={sample_count}, "
-            f"pred={metric.num_pred}, gt={metric.num_gt}"
-        )
-
-        metric_start = time.perf_counter()
-        eval_metrics = metric.compute()
-        metric_time = time.perf_counter() - metric_start
-        recall_ks = (1, 5, 10)
-
-        if quality_recall_metric is not None:
-            quality_recall_metrics = quality_recall_metric.compute()
-
-            for top_k_value in recall_ks:
-                eval_metrics[
-                    f"quality_recall50_at_{top_k_value}"
-                ] = quality_recall_metrics[
-                    f"recall50_at_{top_k_value}"
-                ]
-
-        if text_recall_metric is not None:
-            text_recall_metrics = text_recall_metric.compute()
-
-            for top_k_value in recall_ks:
-                eval_metrics[
-                    f"text_recall50_at_{top_k_value}"
-                ] = text_recall_metrics[
-                    f"recall50_at_{top_k_value}"
-                ]
-
-        if final_recall_metric is not None:
-            final_recall_metrics = final_recall_metric.compute()
-
-            for top_k_value in recall_ks:
-                value = final_recall_metrics[
-                    f"recall50_at_{top_k_value}"
-                ]
-
-                eval_metrics[
-                    f"final_recall50_at_{top_k_value}"
-                ] = value
-
-                # 保留原本欄位名稱，避免舊的 train.py 或分析工具失效。
-                eval_metrics[
-                    f"recall50_at_{top_k_value}"
-                ] = value
-
-        raw_oracle_time = 0.0
-        if raw_oracle_metric is not None:
-            raw_oracle_start = time.perf_counter()
-            raw_oracle_metrics = raw_oracle_metric.compute()
-            raw_oracle_time = (
-                time.perf_counter() - raw_oracle_start
+        eval_metrics.update(metric.compute())
+        eval_metrics.update(
+            quality_recall_metric.compute(
+                "quality"
             )
-            eval_metrics.update(raw_oracle_metrics)
+        )
+        eval_metrics.update(
+            alignment_recall_metric.compute(
+                "text"
+            )
+        )
+        final_recall = (
+            final_recall_metric.compute("final")
+        )
+        eval_metrics.update(final_recall)
 
-            raw_oracle_recall50 = float(
-                raw_oracle_metrics.get(
+        for top_k in final_recall_metric.ks:
+            eval_metrics[f"recall50_at_{top_k}"] = (
+                final_recall[
+                    f"final_recall50_at_{top_k}"
+                ]
+            )
+
+        if raw_oracle_metric is not None:
+            raw_metrics = raw_oracle_metric.compute()
+            eval_metrics.update(raw_metrics)
+            raw_recall50 = float(
+                raw_metrics.get(
                     "raw_oracle_recall50",
                     0.0,
                 )
             )
-            filtered_recall50 = float(
-                eval_metrics.get("recall", 0.0)
+            final_recall50 = float(
+                eval_metrics.get(
+                    "recall",
+                    0.0,
+                )
             )
-
             eval_metrics["raw_oracle_gap50"] = (
-                raw_oracle_recall50 - filtered_recall50
+                raw_recall50 - final_recall50
             )
-            eval_metrics["raw_oracle_retention50"] = (
-                filtered_recall50
-                / max(raw_oracle_recall50, 1e-12)
+            eval_metrics[
+                "raw_oracle_retention50"
+            ] = (
+                final_recall50
+                / max(raw_recall50, 1e-12)
             )
 
         eval_metrics.update({
-            "valid_samples": sample_count,
-            "skipped_empty_gt": skipped_empty_gt,
-            "avg_selected_per_sample": (
-                total_selected / max(1, sample_count)
+            "valid_samples": int(phrase_count),
+            "valid_images": int(image_count),
+            "odvg_phrase_rows": int(phrase_count),
+            "skipped_empty_gt": int(
+                skipped_empty_gt
             ),
-            "eval_loop_time": validation_loop_time,
-            "eval_metric_time": metric_time,
-            "raw_oracle_metric_time": raw_oracle_time,
+            "avg_selected_per_sample": (
+                total_selected
+                / max(1, phrase_count)
+            ),
+            "eval_loop_time": float(
+                validation_loop_time
+            ),
+            "phrase_token_reduction": str(
+                phrase_token_reduction
+            ),
+            "phrase_score_fusion": str(
+                phrase_score_fusion
+            ),
+            "evaluation_mode": (
+                "odvg_phrase_grounding"
+            ),
         })
-
-        tqdm.write(
-            f"Eval Epoch [{epoch}] "
-            f"mAP50={eval_metrics['map50']:.4f} "
-            f"mAP50-95={eval_metrics['map50_95']:.4f} "
-            f"P={eval_metrics['precision']:.4f} "
-            f"R={eval_metrics['recall']:.4f} "
-            f"TP={eval_metrics['tp']} "
-            f"FP={eval_metrics['fp']} "
-            f"GT={eval_metrics['num_gt']} "
-            f"Pred={eval_metrics['num_pred']}"
-        )
-
-        tqdm.write(
-            f"Recall50 [{epoch}] "
-            f"Quality="
-            f"{eval_metrics.get('quality_recall50_at_1', 0.0):.4f}/"
-            f"{eval_metrics.get('quality_recall50_at_5', 0.0):.4f}/"
-            f"{eval_metrics.get('quality_recall50_at_10', 0.0):.4f} "
-            f"Text="
-            f"{eval_metrics.get('text_recall50_at_1', 0.0):.4f}/"
-            f"{eval_metrics.get('text_recall50_at_5', 0.0):.4f}/"
-            f"{eval_metrics.get('text_recall50_at_10', 0.0):.4f} "
-            f"Final="
-            f"{eval_metrics.get('final_recall50_at_1', 0.0):.4f}/"
-            f"{eval_metrics.get('final_recall50_at_5', 0.0):.4f}/"
-            f"{eval_metrics.get('final_recall50_at_10', 0.0):.4f}"
-        )
-
-        if raw_oracle_metric is not None:
-            tqdm.write(
-                f"Raw Oracle [{epoch}] "
-                f"R25={eval_metrics.get('raw_oracle_recall25', 0.0):.4f} "
-                f"R50={eval_metrics.get('raw_oracle_recall50', 0.0):.4f} "
-                f"R75={eval_metrics.get('raw_oracle_recall75', 0.0):.4f} "
-                f"BestIoUMean="
-                f"{eval_metrics.get('raw_best_iou_mean', 0.0):.4f} "
-                f"BestIoUMedian="
-                f"{eval_metrics.get('raw_best_iou_median', 0.0):.4f} "
-                f"Gap50="
-                f"{eval_metrics.get('raw_oracle_gap50', 0.0):.4f} "
-                f"Retention50="
-                f"{eval_metrics.get('raw_oracle_retention50', 0.0):.4f}"
-            )
 
     return val_loss_metrics, eval_metrics
 
+
+__all__ = [
+    "BinaryDetectionAPAccumulator",
+    "PhraseEvaluationRow",
+    "RankedRecallAtKAccumulator",
+    "RawOracleRecallAccumulator",
+    "build_phrase_evaluation_rows",
+    "get_amp_enabled",
+    "select_predictions_batch",
+    "validate_one_epoch",
+]

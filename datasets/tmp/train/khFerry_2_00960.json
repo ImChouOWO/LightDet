@@ -1,0 +1,124 @@
+[
+  {
+    "name": "khFerry_2_00960_000.jpg",
+    "bbox_xyxy": [
+      313,
+      568,
+      529,
+      686
+    ],
+    "class_id": 0,
+    "source_name": "khFerry_2_00960",
+    "source_size": {
+      "width": 1920,
+      "height": 1080
+    },
+    "llm_output": "船體主要顏色：黑色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構",
+    "attributes": {
+      "main_colors": [
+        "黑色"
+      ],
+      "is_multicolor": false
+    },
+    "query_text": "黑色的船",
+    "query_texts_aug": [
+      "黑色的船",
+      "一艘黑色的船",
+      "黑色船隻",
+      "船體是黑色的船"
+    ],
+    "raw_text": "船體主要顏色：黑色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構"
+  },
+  {
+    "name": "khFerry_2_00960_001.jpg",
+    "bbox_xyxy": [
+      617,
+      570,
+      807,
+      689
+    ],
+    "class_id": 0,
+    "source_name": "khFerry_2_00960",
+    "source_size": {
+      "width": 1920,
+      "height": 1080
+    },
+    "llm_output": "船體主要顏色：綠色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構",
+    "attributes": {
+      "main_colors": [
+        "綠色"
+      ],
+      "is_multicolor": false
+    },
+    "query_text": "綠色的船",
+    "query_texts_aug": [
+      "綠色的船",
+      "一艘綠色的船",
+      "綠色船隻",
+      "船體是綠色的船"
+    ],
+    "raw_text": "船體主要顏色：綠色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構"
+  },
+  {
+    "name": "khFerry_2_00960_002.jpg",
+    "bbox_xyxy": [
+      864,
+      561,
+      1013,
+      692
+    ],
+    "class_id": 0,
+    "source_name": "khFerry_2_00960",
+    "source_size": {
+      "width": 1920,
+      "height": 1080
+    },
+    "llm_output": "船體主要顏色：灰、白、紅\n\n船體是否為多色，說明船體的顏色組成：是，船體由灰、白、紅三色組成。\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構",
+    "attributes": {
+      "main_colors": [
+        "灰",
+        "白",
+        "紅"
+      ],
+      "is_multicolor": true
+    },
+    "query_text": "灰白紅相間的船",
+    "query_texts_aug": [
+      "灰白紅相間的船",
+      "灰、白、紅相間的船",
+      "一艘灰白紅相間的船",
+      "灰白紅多色的船"
+    ],
+    "raw_text": "船體主要顏色：灰、白、紅\n\n船體是否為多色，說明船體的顏色組成：是，船體由灰、白、紅三色組成。\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構"
+  },
+  {
+    "name": "khFerry_2_00960_003.jpg",
+    "bbox_xyxy": [
+      1070,
+      610,
+      1157,
+      687
+    ],
+    "class_id": 0,
+    "source_name": "khFerry_2_00960",
+    "source_size": {
+      "width": 1920,
+      "height": 1080
+    },
+    "llm_output": "船體主要顏色：灰色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構",
+    "attributes": {
+      "main_colors": [
+        "灰色"
+      ],
+      "is_multicolor": false
+    },
+    "query_text": "灰色的船",
+    "query_texts_aug": [
+      "灰色的船",
+      "一艘灰色的船",
+      "灰色船隻",
+      "船體是灰色的船"
+    ],
+    "raw_text": "船體主要顏色：灰色\n\n船體是否為多色，說明船體的顏色組成：否，未觀察到對應結構\n\n船體的外觀特徵與結構設計為何：否，未觀察到對應結構"
+  }
+]
