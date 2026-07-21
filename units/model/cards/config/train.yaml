@@ -235,7 +235,7 @@ log:
 
   # The token-alignment projection heads are new parameters. Use weights-only
   # loading for an old checkpoint; do not resume its optimizer state.
-  weights_path: /home/soic/Desktop/LightDet/units/model/runs/train/lightdet_HDETR_object_query/latest.pt
+  weights_path: null
   resume_path: null
   prefer_ema: true
 
