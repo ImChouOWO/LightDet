@@ -1,0 +1,84 @@
+{
+  "source": "/home/soic/Desktop/datasetPreTest15000/dataset/sys/rain/2021_11_14_16_43_48_01330.jpg",
+  "weights": "/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_ODVG_token_alignment/best_map50_95.pt",
+  "weight_source": "model",
+  "checkpoint_epoch": 216,
+  "stored_best_metric_name": "map50_95",
+  "stored_best_metric": 0.1633475422859192,
+  "device": "cuda:0",
+  "image_size": 1024,
+  "original_size": {
+    "width": 1280,
+    "height": 960
+  },
+  "caption": "紅色的船",
+  "phrases": [
+    "紅色的船"
+  ],
+  "confidence_threshold": 0.5,
+  "quality_threshold": 0.5,
+  "alignment_threshold": 0.5,
+  "model_cache_hit": false,
+  "top_k": 20,
+  "token_reduction": "mean",
+  "score_fusion": "geometric_mean",
+  "use_nms": true,
+  "nms_iou_threshold": 0.5,
+  "auxiliary_computed": false,
+  "results": [
+    {
+      "phrase": "紅色的船",
+      "caption": "紅色的船",
+      "char_spans": [
+        [
+          0,
+          4
+        ]
+      ],
+      "positive_token_indices": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "boxes_norm": [
+        [
+          0.3657420873641968,
+          0.3185802400112152,
+          0.9276041388511658,
+          0.5644710063934326
+        ]
+      ],
+      "boxes_pixel": [
+        [
+          468.1498718261719,
+          305.8370361328125,
+          1187.333251953125,
+          541.8921508789062
+        ]
+      ],
+      "scores": [
+        0.6946062445640564
+      ],
+      "quality_scores": [
+        0.9372414350509644
+      ],
+      "alignment_scores": [
+        0.5147850513458252
+      ],
+      "indices": [
+        8
+      ],
+      "num_raw_predictions": 100,
+      "num_above_final": 3,
+      "num_above_quality": 3,
+      "num_above_alignment": 1,
+      "num_after_semantic_gate": 1,
+      "num_above_confidence": 1,
+      "num_after_nms": 1,
+      "num_selected": 1
+    }
+  ],
+  "rendered_path": "/home/soic/Desktop/LightDet/units/runs/predict/lightdet_odvg/prediction.jpg",
+  "elapsed_seconds": 45.477273468859494
+}

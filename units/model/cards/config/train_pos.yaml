@@ -13,18 +13,23 @@ data:
   persistent_workers: true
   query_budget: true
 
-  # ODVG phrase-level negatives. Phrases are appended to the complete caption
-  # without a bbox, so they supervise token alignment only.
+  # ODVG phrase-level negatives.
+  # 負片語會附加到完整 caption 中，但不具備 bbox，
+  # 因此主要用於 token alignment 的負樣本監督。
   negative_query_path: units/model/cards/cache/negative_query_pool.json
   negative_sample_ratio: 0.1
   negative_phrase_max_per_image: 3
   negative_phrase_separator: "；負向描述："
   use_negative_queries_in_val: false
 
+
 train:
-  epochs: 300
+  # 定位能力強化微調。
+  # 建議從目前最佳 map50_95 checkpoint 載入模型權重，
+  # 不接續舊 optimizer 與 scheduler 狀態。
+  epochs: 120
   batch_size: 48
-  warmup_epochs: 3
+  warmup_epochs: 2
   num_workers: 16
   device: cuda:1
   seed: 49
@@ -47,50 +52,71 @@ train:
 
   grad_clip_norm: 1.0
 
+
 optim:
   # [mode, max_lr, min_lr, start_epoch, end_epoch]
+  #
+  # Vision 與 text encoder 使用較低學習率，
+  # transformer 與 detection head 保留較高更新幅度，
+  # 讓現有語意能力維持穩定，同時強化 bbox refinement。
   components:
-    vision: ["cosine", 0.0001, 0.000005, 0.00, 1.00]
-    text: ["cosine", 0.00001, 0.0000005, 0.00, 1.00]
-    transformer: ["cosine", 0.0001, 0.000005, 0.00, 1.00]
-    head: ["cosine", 0.0001, 0.000005, 0.00, 1.00]
+    vision:
+      ["cosine", 0.00003, 0.000001, 0.00, 1.00]
+
+    text:
+      ["cosine", 0.000003, 0.0000001, 0.00, 1.00]
+
+    transformer:
+      ["cosine", 0.00005, 0.000002, 0.00, 1.00]
+
+    head:
+      ["cosine", 0.00008, 0.000003, 0.00, 1.00]
 
   weight_decay: 0.0001
-  max_warmup_steps: 3000
+  max_warmup_steps: 1500
   fused: true
+
 
 loss:
   matcher:
-    cost_bbox: 5.0
-    cost_giou: 2.0
+    # 提高位置與 IoU 在 Hungarian matching 中的主導程度。
+    cost_bbox: 6.0
+    cost_giou: 4.0
 
-    # Localization quality remains in matching to preserve the current learned
-    # ranking behavior.
-    cost_score: 2.0
+    # 保留 quality score，但降低其 matching 權重，
+    # 避免排序能力過度干擾定位 query 的選擇。
+    cost_score: 1.5
     score_cost_type: focal
     focal_alpha: 0.25
     focal_gamma: 2.0
 
-    # ODVG query-to-phrase token alignment cost.
-    cost_alignment: 2.0
+    # 保留 token alignment matching，
+    # 但略低於 bbox 與 GIoU。
+    cost_alignment: 1.5
     alignment_negative_weight: 0.25
 
+
   weight:
+    # 前 20 epochs 逐步切換為定位導向。
     dynamic: true
-    bbox: 5.0
-    giou: 2.0
-    score: 1.0
+
+    bbox: 6.0
+    giou: 4.0
+    score: 2.0
 
     bbox_start: 5.0
-    bbox_end: 3.5
-    giou_start: 2.0
-    giou_end: 2.0
-    score_start: 1.0
-    score_end: 4.0
+    bbox_end: 6.0
+
+    giou_start: 2.5
+    giou_end: 4.0
+
+    score_start: 2.0
+    score_end: 2.0
 
     start_epoch: 1
-    end_epoch: 30
+    end_epoch: 20
     schedule: cosine
+
 
   classification:
     type: iou
@@ -107,6 +133,7 @@ loss:
     negative_iou_ignore_end_epoch: 25
     negative_iou_ignore_schedule: cosine
 
+
   quality:
     iou_pos_thr: 0.0
     quality_min: 0.10
@@ -115,33 +142,38 @@ loss:
     quality_warmup_epoch: 10
     aux_score_enabled: true
 
+
   text_alignment:
     enabled: true
-    loss_weight: 1.0
 
-    # Matched query: non-phrase valid tokens.
+    # 保留已建立的 phrase-token alignment 能力，
+    # 但降低其相對梯度，將訓練重心轉回定位。
+    loss_weight: 0.75
+
+    # Matched query：非 phrase 的有效 token。
     negative_weight: 0.25
 
-    # Unmatched query: every valid caption token.
+    # Unmatched query：caption 中所有有效 token。
     unmatched_weight: 0.10
 
-    # Retained for future ODVG negative-caption rows.
+    # 保留給未來完整 negative-caption row。
     negative_text_weight: 1.0
 
     focal_gamma: 2.0
 
-    # Matched query must rank above the hardest unmatched query for the same GT
-    # phrase token map.
-    ranking_weight: 0.25
+    # 保留 phrase ranking，但降低權重。
+    ranking_weight: 0.15
     ranking_margin: 0.15
 
     start_epoch: 1
-    warmup_epoch: 5
+    warmup_epoch: 3
+
 
   matcher_schedule:
     start_epoch: 5
     warmup_epoch: 12
     alpha_min: 0.0
+
 
   score_sampling:
     positive_ratio: 1.0
@@ -149,18 +181,26 @@ loss:
     min_extra_positive_iou: 0.0
     hard_negative_ratio: 5
     aux_positive_label: 0.7
-    expand_cost_bbox: 5.0
-    expand_cost_giou: 2.0
+
+    # 與主要 matcher 的定位權重同步。
+    expand_cost_bbox: 6.0
+    expand_cost_giou: 4.0
+
 
   hybrid:
     aux_loss_weight: 0.50
-    matcher_cost_score: 2.0
-    matcher_cost_alignment: 2.0
+
+    # 降低 score 與 alignment 在 hybrid matcher 中的相對權重。
+    matcher_cost_score: 1.5
+    matcher_cost_alignment: 1.5
+
     warmup_epoch: 3
     decay_start_ratio: 0.75
     min_factor: 0.25
+
     matcher_score_start_epoch: 5
     matcher_score_warmup_epoch: 10
+
 
   text_negative:
     as_empty_target: true
@@ -174,6 +214,7 @@ loss:
     start_epoch: 1
     warmup_epoch: 5
 
+
   duplicate_suppression:
     enabled: true
     loss_weight: 0.10
@@ -184,6 +225,7 @@ loss:
     start_epoch: 5
     warmup_epoch: 5
 
+
   hard_negative:
     enabled: true
     loss_weight: 0.05
@@ -192,8 +234,9 @@ loss:
     start_epoch: 10
     warmup_epoch: 5
 
-  # Legacy quality-ranking configuration remains disabled. Phrase ranking is
-  # now part of text_alignment and uses GT token maps.
+
+  # Legacy quality-ranking 保持停用。
+  # Phrase ranking 已由 text_alignment 處理。
   ranking:
     enabled: false
     lambda_rank: 0.0
@@ -205,14 +248,17 @@ loss:
     rank_alpha_min: 0.0
     rank_negative_iou_max: 0.20
 
+
   query_refinement:
     identity_weight: 0.0
     start_epoch: 1
     warmup_epoch: 5
     detach_localization: true
 
+
   pos_weight:
     value: 1.0
+
 
 eval:
   val_loss_interval: 5
@@ -226,21 +272,26 @@ eval:
   use_topk_fallback: false
 
   iou_thresholds: null
+
+  # 定位強化階段需持續觀察 oracle 指標。
   compute_raw_oracle: true
-  raw_oracle_iou_thresholds: [0.25, 0.50, 0.75]
+  raw_oracle_iou_thresholds:
+    - 0.25
+    - 0.50
+    - 0.75
+
   best_metric: map50_95
 
-log:
-  save_dir: units/model/runs/train/lightdet_ODVG_token_alignment
 
-  # The token-alignment projection heads are new parameters. Use weights-only
-  # loading for an old checkpoint; do not resume its optimizer state.
-  weights_path: null
+log:
+  save_dir: units/model/runs/train/lightdet_ODVG_localization_finetune
+  weights_path: /home/soic/Desktop/LightDet/units/model/runs/train/lightdet_ODVG_token_alignment/best_map50_95.pt
   resume_path: null
+
   prefer_ema: true
 
   save_latest_interval: 1
-  save_epoch_interval: 50
+  save_epoch_interval: 20
   emit_step_metrics: false
   log_interval: 50
   progress_leave: true

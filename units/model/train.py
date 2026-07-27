@@ -2524,9 +2524,9 @@ def train(args: SimpleNamespace) -> None:
     dataset_dir = args.dir
 
     train_image_dir = os.path.join(dataset_dir, "images", "train")
-    train_anno_dir = os.path.join(dataset_dir, "labels", "ODVG", "train")
+    train_anno_dir = os.path.join(dataset_dir, "labels",  "train")
     val_image_dir = os.path.join(dataset_dir, "images", "val")
-    val_anno_dir = os.path.join(dataset_dir, "labels", "ODVG", "val")
+    val_anno_dir = os.path.join(dataset_dir, "labels", "val")
 
     train_loader, val_loader = build_dataloaders_with_supported_options(
         args,
@@ -3649,7 +3649,7 @@ def main() -> None:
         model=str("/home/soic/Desktop/LightDet/units/model/cards/config/model.yaml"),
     )
     model.train(
-        cfg=str("/home/soic/Desktop/LightDet/units/model/cards/config/train.yaml"),
+        cfg=str("/home/soic/Desktop/LightDet/units/model/cards/config/train_pos.yaml"),
     )
 
 

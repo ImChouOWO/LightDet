@@ -20,9 +20,11 @@ LightDet ODVG-style phrase grounding inference.
         ],
         imgsz=1024,
         device=0,
-        conf=0.05,
+        conf=0.30,
+        quality_thr=0.50,
+        alignment_thr=0.45,
         top_k=20,
-        use_nms=False,
+        use_nms=True,
         project="runs/predict",
         name="odvg_exp",
     )
@@ -44,6 +46,7 @@ import json
 import os
 import sys
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -51,7 +54,6 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
-from torchvision import transforms
 from torchvision.ops import nms
 
 
@@ -64,10 +66,6 @@ for path in (PROJECT_ROOT, CURRENT_DIR):
         sys.path.insert(0, path_text)
 
 
-from units.model.train import (  # noqa: E402
-    deepcopy_cfg,
-    normalize_device,
-)
 from units.validate import LightDet as ValidateLightDet  # noqa: E402
 from units.tool.card import VisionTextModel  # noqa: E402
 from units.model.tool.runtime import (  # noqa: E402
@@ -75,9 +73,43 @@ from units.model.tool.runtime import (  # noqa: E402
 )
 
 
-# ---------------------------------------------------------------------------
+def deepcopy_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    return deepcopy(cfg)
+
+
+def normalize_device(device: Optional[Any]) -> str:
+    if device is None:
+        if torch.cuda.is_available():
+            return "cuda:0"
+        if torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+
+    if isinstance(device, torch.device):
+        return str(device)
+    if isinstance(device, int):
+        return f"cuda:{device}"
+
+    value = str(device).strip().lower()
+    if not value:
+        return "cuda:0" if torch.cuda.is_available() else (
+            "mps" if torch.backends.mps.is_available() else "cpu"
+        )
+    if value.isdigit():
+        return f"cuda:{value}"
+    if value in {"cuda", "gpu"}:
+        return "cuda:0"
+    if value.startswith("cuda:") or value in {"cpu", "mps"}:
+        return value
+
+    raise ValueError(
+        f"Unsupported device value: {device!r}"
+    )
+
+
+
 # Checkpoint helpers
-# ---------------------------------------------------------------------------
+
 
 
 def normalize_state_dict_keys(
@@ -200,9 +232,9 @@ def load_checkpoint_for_inference(
     }
 
 
-# ---------------------------------------------------------------------------
+
 # Model / device
-# ---------------------------------------------------------------------------
+
 
 
 def build_inference_model(
@@ -301,9 +333,9 @@ def resolve_inference_device(
     return resolved
 
 
-# ---------------------------------------------------------------------------
+
 # Text / input helpers
-# ---------------------------------------------------------------------------
+
 
 
 def normalize_caption(
@@ -400,41 +432,30 @@ def preprocess_image(
     image_size: int,
 ) -> Tuple[torch.Tensor, np.ndarray, int, int]:
     source = Path(source).expanduser().resolve()
-
     if not source.is_file():
-        raise FileNotFoundError(
-            f"Input image not found: {source}"
-        )
+        raise FileNotFoundError(f"Input image not found: {source}")
 
     try:
-        pil_image = Image.open(source).convert("RGB")
+        original_pil = Image.open(source).convert("RGB")
     except Exception as error:
-        raise RuntimeError(
-            f"Unable to read image: {source}"
-        ) from error
+        raise RuntimeError(f"Unable to read image: {source}") from error
 
-    original_width, original_height = pil_image.size
-
-    transform = transforms.Compose([
-        transforms.Resize(
-            (
-                int(image_size),
-                int(image_size),
-            ),
-            interpolation=(
-                transforms.InterpolationMode.BILINEAR
-            ),
-        ),
-        transforms.ToTensor(),
-    ])
-
-    image_tensor = transform(
-        pil_image
-    ).unsqueeze(0)
-
+    original_width, original_height = original_pil.size
     original_bgr = cv2.cvtColor(
-        np.asarray(pil_image),
+        np.asarray(original_pil),
         cv2.COLOR_RGB2BGR,
+    )
+
+    resized_pil = original_pil.resize(
+        (int(image_size), int(image_size)),
+        Image.Resampling.BILINEAR,
+    )
+    image_array = np.asarray(resized_pil, dtype=np.float32) / 255.0
+    image_tensor = (
+        torch.from_numpy(image_array)
+        .permute(2, 0, 1)
+        .contiguous()
+        .unsqueeze(0)
     )
 
     return (
@@ -445,9 +466,9 @@ def preprocess_image(
     )
 
 
-# ---------------------------------------------------------------------------
+
 # Box / score helpers
-# ---------------------------------------------------------------------------
+
 
 
 def sanitize_xyxy_boxes(
@@ -522,6 +543,8 @@ def select_phrase_predictions(
     quality_scores: torch.Tensor,
     alignment_scores: torch.Tensor,
     confidence_threshold: float,
+    quality_threshold: float,
+    alignment_threshold: float,
     top_k: int,
     width: int,
     height: int,
@@ -575,9 +598,13 @@ def select_phrase_predictions(
             f"alignment={alignment_scores.numel()}"
         )
 
+    final_mask = final_scores >= float(confidence_threshold)
+    quality_mask = quality_scores >= float(quality_threshold)
+    alignment_mask = alignment_scores >= float(alignment_threshold)
+    valid_mask = final_mask & quality_mask & alignment_mask
+
     valid_indices = torch.nonzero(
-        final_scores
-        >= float(confidence_threshold),
+        valid_mask,
         as_tuple=False,
     ).flatten()
 
@@ -746,9 +773,11 @@ def select_phrase_predictions(
             .cpu()
         ),
         "num_raw_predictions": count,
-        "num_above_confidence": int(
-            valid_indices.numel()
-        ),
+        "num_above_final": int(final_mask.sum().item()),
+        "num_above_quality": int(quality_mask.sum().item()),
+        "num_above_alignment": int(alignment_mask.sum().item()),
+        "num_after_semantic_gate": int(valid_indices.numel()),
+        "num_above_confidence": int(valid_indices.numel()),
         "num_after_nms": int(
             num_after_nms
         ),
@@ -758,9 +787,9 @@ def select_phrase_predictions(
     }
 
 
-# ---------------------------------------------------------------------------
+
 # Rendering
-# ---------------------------------------------------------------------------
+
 
 
 def get_chinese_font(
@@ -1078,9 +1107,9 @@ def draw_predictions(
     )
 
 
-# ---------------------------------------------------------------------------
+
 # ODVG inference core
-# ---------------------------------------------------------------------------
+
 
 
 def _resolve_main_output(
@@ -1109,6 +1138,8 @@ def predict_image(
     phrases: Sequence[str],
     device: torch.device,
     confidence_threshold: float,
+    quality_threshold: float,
+    alignment_threshold: float,
     top_k: int,
     use_nms: bool = False,
     nms_iou_threshold: float = 0.5,
@@ -1274,16 +1305,14 @@ def predict_image(
             alignment_scores=phrase_scores[
                 "phrase_alignment_score"
             ],
-            confidence_threshold=(
-                confidence_threshold
-            ),
+            confidence_threshold=confidence_threshold,
+            quality_threshold=quality_threshold,
+            alignment_threshold=alignment_threshold,
             top_k=top_k,
             width=width,
             height=height,
             use_nms=use_nms,
-            nms_iou_threshold=(
-                nms_iou_threshold
-            ),
+            nms_iou_threshold=nms_iou_threshold,
         )
 
         boxes_norm_np = selected[
@@ -1332,8 +1361,12 @@ def predict_image(
             "indices": (
                 selected["indices"].tolist()
             ),
-            "num_raw_predictions": selected[
-                "num_raw_predictions"
+            "num_raw_predictions": selected["num_raw_predictions"],
+            "num_above_final": selected["num_above_final"],
+            "num_above_quality": selected["num_above_quality"],
+            "num_above_alignment": selected["num_above_alignment"],
+            "num_after_semantic_gate": selected[
+                "num_after_semantic_gate"
             ],
             "num_above_confidence": selected[
                 "num_above_confidence"
@@ -1364,9 +1397,9 @@ def predict_image(
     return results, rendered_images
 
 
-# ---------------------------------------------------------------------------
+
 # YOLO-style object interface
-# ---------------------------------------------------------------------------
+
 
 
 class LightDet(ValidateLightDet):
@@ -1397,6 +1430,72 @@ class LightDet(ValidateLightDet):
         )
     """
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._inference_model: Optional[torch.nn.Module] = None
+        self._inference_checkpoint_info: Optional[Dict[str, Any]] = None
+        self._loaded_weights_path: Optional[str] = None
+        self._loaded_device: Optional[str] = None
+        self._loaded_prefer_ema: Optional[bool] = None
+
+    def clear_inference_cache(self) -> None:
+        self._inference_model = None
+        self._inference_checkpoint_info = None
+        self._loaded_weights_path = None
+        self._loaded_device = None
+        self._loaded_prefer_ema = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _get_inference_model(
+        self,
+        weights: str | Path,
+        device: torch.device,
+        prefer_ema: bool,
+    ) -> Tuple[torch.nn.Module, Dict[str, Any], bool]:
+        checkpoint_path = Path(weights).expanduser().resolve()
+
+        cache_hit = (
+            self._inference_model is not None
+            and self._inference_checkpoint_info is not None
+            and self._loaded_weights_path == str(checkpoint_path)
+            and self._loaded_device == str(device)
+            and self._loaded_prefer_ema == bool(prefer_ema)
+        )
+
+        if cache_hit:
+            return (
+                self._inference_model,
+                self._inference_checkpoint_info,
+                True,
+            )
+
+        model_cfg = deepcopy_cfg(self.model_cfg)
+        model_cfg["model"]["auxiliary_in_eval"] = False
+
+        load_start = time.perf_counter()
+        print("\n[LightDet] Loading inference model")
+        print(f"  weights : {checkpoint_path}")
+        print(f"  device  : {device}")
+
+        inference_model = build_inference_model(model_cfg)
+        checkpoint_info = load_checkpoint_for_inference(
+            model=inference_model,
+            checkpoint_path=checkpoint_path,
+            prefer_ema=bool(prefer_ema),
+        )
+        inference_model = inference_model.to(device)
+        inference_model.eval()
+
+        self._inference_model = inference_model
+        self._inference_checkpoint_info = checkpoint_info
+        self._loaded_weights_path = str(checkpoint_path)
+        self._loaded_device = str(device)
+        self._loaded_prefer_ema = bool(prefer_ema)
+
+        print(f"  load time: {time.perf_counter() - load_start:.3f}s")
+        return inference_model, checkpoint_info, False
+
     def predict(
         self,
         weights: str,
@@ -1406,6 +1505,8 @@ class LightDet(ValidateLightDet):
         imgsz: int = 1024,
         device: Optional[Any] = None,
         conf: float = 0.05,
+        quality_thr: float = 0.50,
+        alignment_thr: float = 0.45,
         top_k: int = 20,
         use_nms: bool = False,
         nms_iou_threshold: float = 0.5,
@@ -1430,6 +1531,16 @@ class LightDet(ValidateLightDet):
         if not 0.0 <= float(conf) <= 1.0:
             raise ValueError(
                 f"conf must be within [0, 1], got {conf}"
+            )
+
+        if not 0.0 <= float(quality_thr) <= 1.0:
+            raise ValueError(
+                f"quality_thr must be within [0, 1], got {quality_thr}"
+            )
+
+        if not 0.0 <= float(alignment_thr) <= 1.0:
+            raise ValueError(
+                f"alignment_thr must be within [0, 1], got {alignment_thr}"
             )
 
         if int(top_k) <= 0:
@@ -1486,27 +1597,15 @@ class LightDet(ValidateLightDet):
             device
         )
 
-        model_cfg = deepcopy_cfg(
-            self.model_cfg
-        )
-        model_cfg["model"][
-            "auxiliary_in_eval"
-        ] = False
-
-        inference_model = build_inference_model(
-            model_cfg
-        )
-
-        checkpoint_info = load_checkpoint_for_inference(
-            model=inference_model,
-            checkpoint_path=checkpoint_path,
+        (
+            inference_model,
+            checkpoint_info,
+            cache_hit,
+        ) = self._get_inference_model(
+            weights=checkpoint_path,
+            device=resolved_device,
             prefer_ema=bool(prefer_ema),
         )
-
-        inference_model = inference_model.to(
-            resolved_device
-        )
-        inference_model.eval()
 
         (
             image_tensor,
@@ -1529,6 +1628,9 @@ class LightDet(ValidateLightDet):
         print(f"  caption         : {normalized_caption}")
         print(f"  phrases         : {len(normalized_phrases)}")
         print(f"  confidence      : {float(conf):.6f}")
+        print(f"  quality thr     : {float(quality_thr):.6f}")
+        print(f"  alignment thr   : {float(alignment_thr):.6f}")
+        print(f"  model cache     : {'hit' if cache_hit else 'miss'}")
         print(f"  top-k           : {int(top_k)}")
         print(f"  token reduction : {token_reduction}")
         print(f"  score fusion    : {score_fusion}")
@@ -1547,6 +1649,8 @@ class LightDet(ValidateLightDet):
             phrases=normalized_phrases,
             device=resolved_device,
             confidence_threshold=float(conf),
+            quality_threshold=float(quality_thr),
+            alignment_threshold=float(alignment_thr),
             top_k=int(top_k),
             use_nms=bool(use_nms),
             nms_iou_threshold=float(
@@ -1619,6 +1723,9 @@ class LightDet(ValidateLightDet):
             "caption": normalized_caption,
             "phrases": normalized_phrases,
             "confidence_threshold": float(conf),
+            "quality_threshold": float(quality_thr),
+            "alignment_threshold": float(alignment_thr),
+            "model_cache_hit": bool(cache_hit),
             "top_k": int(top_k),
             "token_reduction": str(
                 token_reduction
@@ -1680,7 +1787,10 @@ class LightDet(ValidateLightDet):
                 f"  phrase={result['phrase']!r}, "
                 f"spans={result['char_spans']}, "
                 f"raw={result['num_raw_predictions']}, "
-                f"above_conf={result['num_above_confidence']}, "
+                f"final_ok={result['num_above_final']}, "
+                f"quality_ok={result['num_above_quality']}, "
+                f"alignment_ok={result['num_above_alignment']}, "
+                f"gated={result['num_after_semantic_gate']}, "
                 f"after_nms={result['num_after_nms']}, "
                 f"selected={result['num_selected']}"
             )
@@ -1746,38 +1856,32 @@ def main() -> None:
 
     model.predict(
         weights=(
-            "/home/soic/Desktop/LightDet/"
-            "units/model/runs/train/"
-            "lightdet_odvg/best_map50_95.pt"
+            "/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_ODVG_token_alignment/best_map50_95.pt"
         ),
         source=(
-            "/home/soic/Desktop/LightDet/"
-            "datasets/images/val/example.jpg"
+            "/home/soic/Desktop/datasetPreTest15000/dataset/sys/rain/2021_11_14_16_43_48_01330.jpg"
         ),
 
-        # 完整 caption 只輸入模型一次。
+        
         caption=(
-            "畫面中包含一艘紅色的船、"
-            "一艘白色的船與一艘藍白相間的船"
+            "紅色的船"
         ),
 
-        # 每個 phrase 必須是 caption 中的完整子字串。
-        phrases=[
-            "紅色的船",
-            "白色的船",
-            "藍白相間的船",
+        
+        phrases = [
+            "紅色的船"
         ],
-
         imgsz=1024,
         device=0,
-        conf=0.05,
+        conf=0.5,
+        quality_thr=0.5,
+        alignment_thr=0.5,
         top_k=20,
 
-        # DETR-style 預設不使用 NMS。
-        use_nms=False,
+        use_nms=True,
         nms_iou_threshold=0.5,
 
-        # Phrase token 與 quality 的聚合方式。
+       
         token_reduction="mean",
         score_fusion="geometric_mean",
         include_all_occurrences=True,
@@ -1785,7 +1889,7 @@ def main() -> None:
         project="runs/predict",
         name="lightdet_odvg",
 
-        prefer_ema=True,
+        prefer_ema=False,
         save=True,
         save_json=True,
     )

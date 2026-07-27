@@ -1475,9 +1475,9 @@ def build_dataloaders(
 if __name__ == "__main__":
     train_loader, val_loader = build_dataloaders(
         train_image_dir="path/to/datasets/images/train",
-        train_anno_dir="path/to/datasets/labels/ODVG/train",
+        train_anno_dir="path/to/datasets/labels/train",
         val_image_dir="path/to/datasets/images/val",
-        val_anno_dir="path/to/datasets/labels/ODVG/val",
+        val_anno_dir="path/to/datasets/labels/val",
         batch_size=48,
         image_size=(512, 512),
         num_workers=0,
