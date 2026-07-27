@@ -1,6 +1,6 @@
 from __future__ import annotations
 import math
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 import yaml
 
 import os
@@ -23,11 +23,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import ResNet50_Weights, resnet50
 from torchvision.models.feature_extraction import create_feature_extractor
+from torchvision.ops import FeaturePyramidNetwork
 from transformers import BertModel, BertTokenizerFast
 from transformers.utils import logging as transformers_logging
 from huggingface_hub import logging as hub_logging
 from huggingface_hub.utils import disable_progress_bars
-
+from collections import OrderedDict
 transformers_logging.set_verbosity_error()
 hub_logging.set_verbosity_error()
 disable_progress_bars()
@@ -1001,90 +1002,264 @@ class MobileNetV4ConvBlock(nn.Module):
 
 
 class ImgProjector(nn.Module):
+    """
+    將 FPN 多尺度特徵轉換成 Transformer image tokens。
+
+    預設輸入：
+        c3: [B, 256, 128, 128]
+        c4: [B, 256,  64,  64]
+        c5: [B, 256,  32,  32]
+
+    預設輸出：
+        c3 -> 16x16 = 256 tokens
+        c4 ->  8x8 =  64 tokens
+        c5 ->  4x4 =  16 tokens
+
+        output: [B, 336, 512]
+    """
+
     def __init__(
         self,
-        in_channels=1024,
-        out_channels=512,
-        layer_num=3,
-        expand_ratio=2.0,
-        target_size=(40, 40),
+        in_channels: int = 256,
+        out_channels: int = 512,
+        layer_num: int = 2,
+        expand_ratio: float = 2.0,
+        level_names: Sequence[str] = (
+            "c3",
+            "c4",
+            "c5",
+        ),
+        token_grids: Sequence[Sequence[int]] = (
+            (16, 16),
+            (8, 8),
+            (4, 4),
+        ),
     ):
         super().__init__()
 
-        self.target_size = (
-            target_size
+        self._validate_init_args(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            layer_num=layer_num,
+            expand_ratio=expand_ratio,
+            level_names=level_names,
+            token_grids=token_grids,
         )
 
-        self.larger_view = (
-            self._make_layers(
-                in_channels,
-                out_channels,
-                layer_num,
-                expand_ratio,
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.layer_num = int(layer_num)
+        self.expand_ratio = float(expand_ratio)
+
+        self.level_names = tuple(
+            str(name)
+            for name in level_names
+        )
+
+        self.token_grids = tuple(
+            (
+                int(grid[0]),
+                int(grid[1]),
+            )
+            for grid in token_grids
+        )
+
+        # 每個 FPN Level 使用獨立的投影模組，
+        # 避免不同尺度共享完全相同的 projection。
+        self.level_projectors = nn.ModuleDict({
+            level_name: self._make_level_projector(
+                in_channels=self.in_channels,
+                out_channels=self.out_channels,
+                layer_num=self.layer_num,
+                expand_ratio=self.expand_ratio,
+            )
+            for level_name in self.level_names
+        })
+
+        # 用於區分 c3、c4、c5 的尺度來源。
+        #
+        # shape:
+        # [num_levels, 1, 1, out_channels]
+        self.level_embeddings = nn.Parameter(
+            torch.zeros(
+                len(self.level_names),
+                1,
+                1,
+                self.out_channels,
             )
         )
 
-        self.middle_view = (
-            self._make_layers(
-                in_channels,
-                out_channels,
-                layer_num,
-                expand_ratio,
-            )
+        nn.init.normal_(
+            self.level_embeddings,
+            mean=0.0,
+            std=0.02,
         )
 
-        self.smaller_view = (
-            self._make_layers(
-                in_channels,
-                out_channels,
-                layer_num,
-                expand_ratio,
+        # 各層 token 數量。
+        #
+        # 預設：
+        # 16*16 + 8*8 + 4*4
+        # = 256 + 64 + 16
+        # = 336
+        self.tokens_per_level = {
+            level_name: grid_height * grid_width
+            for level_name, (
+                grid_height,
+                grid_width,
+            ) in zip(
+                self.level_names,
+                self.token_grids,
             )
-        )
+        }
 
-        self.resize_view = nn.Sequential(
-            nn.Conv2d(
-                out_channels,
-                out_channels,
-                kernel_size=1,
-                stride=1,
-                padding=0,
-                bias=False,
-            ),
-            make_group_norm(
-                out_channels
-            ),
-            nn.SiLU(
-                inplace=True
-            ),
+        self.num_tokens = sum(
+            self.tokens_per_level.values()
         )
 
     @staticmethod
-    def _make_layers(
-        in_channels,
-        out_channels,
-        layer_num,
-        expand_ratio,
-    ):
-        layers = []
-
-        for index in range(
-            layer_num
+    def _validate_init_args(
+        in_channels: int,
+        out_channels: int,
+        layer_num: int,
+        expand_ratio: float,
+        level_names: Sequence[str],
+        token_grids: Sequence[Sequence[int]],
+    ) -> None:
+        if (
+            isinstance(in_channels, bool)
+            or not isinstance(in_channels, int)
+            or in_channels <= 0
         ):
+            raise ValueError(
+                "in_channels 必須是大於 0 的整數，"
+                f"目前為 {in_channels!r}"
+            )
+
+        if (
+            isinstance(out_channels, bool)
+            or not isinstance(out_channels, int)
+            or out_channels <= 0
+        ):
+            raise ValueError(
+                "out_channels 必須是大於 0 的整數，"
+                f"目前為 {out_channels!r}"
+            )
+
+        if (
+            isinstance(layer_num, bool)
+            or not isinstance(layer_num, int)
+            or layer_num < 0
+        ):
+            raise ValueError(
+                "layer_num 必須是大於等於 0 的整數，"
+                f"目前為 {layer_num!r}"
+            )
+
+        if expand_ratio <= 0:
+            raise ValueError(
+                "expand_ratio 必須大於 0，"
+                f"目前為 {expand_ratio}"
+            )
+
+        if len(level_names) == 0:
+            raise ValueError(
+                "level_names 不得為空"
+            )
+
+        if len(level_names) != len(token_grids):
+            raise ValueError(
+                "level_names 與 token_grids "
+                "必須具有相同長度："
+                f"{len(level_names)} != "
+                f"{len(token_grids)}"
+            )
+
+        if len(set(level_names)) != len(level_names):
+            raise ValueError(
+                "level_names 不得包含重複名稱"
+            )
+
+        for level_name in level_names:
+            if (
+                not isinstance(level_name, str)
+                or not level_name.strip()
+            ):
+                raise ValueError(
+                    "每個 level name 都必須是非空字串，"
+                    f"目前為 {level_name!r}"
+                )
+
+        for index, grid in enumerate(token_grids):
+            if (
+                not isinstance(
+                    grid,
+                    (tuple, list),
+                )
+                or len(grid) != 2
+            ):
+                raise ValueError(
+                    "每個 token grid 都必須是 "
+                    "[height, width]，"
+                    f"第 {index} 個為 {grid!r}"
+                )
+
+            height = grid[0]
+            width = grid[1]
+
+            if (
+                isinstance(height, bool)
+                or not isinstance(height, int)
+                or height <= 0
+            ):
+                raise ValueError(
+                    "token grid height 必須是大於 0 "
+                    f"的整數，目前為 {height!r}"
+                )
+
+            if (
+                isinstance(width, bool)
+                or not isinstance(width, int)
+                or width <= 0
+            ):
+                raise ValueError(
+                    "token grid width 必須是大於 0 "
+                    f"的整數，目前為 {width!r}"
+                )
+
+    @staticmethod
+    def _make_level_projector(
+        in_channels: int,
+        out_channels: int,
+        layer_num: int,
+        expand_ratio: float,
+    ) -> nn.Sequential:
+        """
+        建立單一 FPN Level 的投影模組。
+
+        流程：
+            1x1 ConvGNAct
+            -> MobileNetV4 refinement blocks
+        """
+
+        layers = [
+            # 先將 FPN channel 投影至 Transformer hidden dim。
+            ConvGNAct(
+                in_channels,
+                out_channels,
+                kernel_size=1,
+                stride=1,
+            )
+        ]
+
+        # 在較小的 token grid 上進行特徵 refinement，
+        # 不再改變空間解析度。
+        for _ in range(layer_num):
             layers.append(
                 MobileNetV4ConvBlock(
-                    in_channels=(
-                        in_channels
-                        if index == 0
-                        else out_channels
-                    ),
-                    out_channels=(
-                        out_channels
-                    ),
+                    in_channels=out_channels,
+                    out_channels=out_channels,
                     stride=1,
-                    expand_ratio=(
-                        expand_ratio
-                    ),
+                    expand_ratio=expand_ratio,
                     start_dw=True,
                     middle_dw=True,
                     kernel_size=3,
@@ -1095,156 +1270,464 @@ class ImgProjector(nn.Module):
             *layers
         )
 
+    def _validate_feature(
+        self,
+        level_name: str,
+        feature: torch.Tensor,
+    ) -> None:
+        if not torch.is_tensor(feature):
+            raise TypeError(
+                f"{level_name} 必須是 torch.Tensor，"
+                f"目前為 {type(feature).__name__}"
+            )
+
+        if feature.ndim != 4:
+            raise ValueError(
+                f"{level_name} 必須是四維 Tensor "
+                "[B, C, H, W]，"
+                f"目前 shape={tuple(feature.shape)}"
+            )
+
+        if int(feature.shape[1]) != self.in_channels:
+            raise ValueError(
+                f"{level_name} channel 不符合設定："
+                f"預期 {self.in_channels}，"
+                f"實際為 {feature.shape[1]}"
+            )
+
+        if int(feature.shape[2]) <= 0:
+            raise ValueError(
+                f"{level_name} 的 height 必須大於 0"
+            )
+
+        if int(feature.shape[3]) <= 0:
+            raise ValueError(
+                f"{level_name} 的 width 必須大於 0"
+            )
+
     def forward(
         self,
-        x,
-    ):
-        large_x = x
-
-        middle_x = F.interpolate(
-            x,
-            scale_factor=0.5,
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        small_x = F.interpolate(
-            x,
-            scale_factor=0.25,
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        large_feat = self.larger_view(
-            large_x
-        )
-        middle_feat = (
-            self.middle_view(
-                middle_x
+        features: Mapping[str, torch.Tensor],
+    ) -> torch.Tensor:
+        if not isinstance(
+            features,
+            (dict, OrderedDict),
+        ):
+            raise TypeError(
+                "ImgProjector 輸入必須是 dict "
+                "或 OrderedDict，"
+                f"目前為 {type(features).__name__}"
             )
-        )
-        small_feat = self.smaller_view(
-            small_x
+
+        output_tokens = []
+        batch_size = None
+
+        for level_index, (
+            level_name,
+            target_grid,
+        ) in enumerate(zip(
+            self.level_names,
+            self.token_grids,
+        )):
+            if level_name not in features:
+                raise KeyError(
+                    f"缺少 FPN Level：{level_name}。"
+                    f"目前 keys={tuple(features.keys())}"
+                )
+
+            feature = features[level_name]
+
+            self._validate_feature(
+                level_name=level_name,
+                feature=feature,
+            )
+
+            if batch_size is None:
+                batch_size = int(
+                    feature.shape[0]
+                )
+            elif int(feature.shape[0]) != batch_size:
+                raise ValueError(
+                    "所有 FPN Level 的 batch size "
+                    "必須一致："
+                    f"{level_name}={feature.shape[0]}，"
+                    f"預期={batch_size}"
+                )
+
+            # 先將每個 FPN Level 壓縮至指定 token grid。
+            #
+            # c3: 128x128 -> 16x16
+            # c4:  64x64  ->  8x8
+            # c5:  32x32  ->  4x4
+            feature = F.adaptive_avg_pool2d(
+                feature,
+                output_size=target_grid,
+            )
+
+            # 每個尺度使用獨立 projector。
+            feature = self.level_projectors[
+                level_name
+            ](feature)
+
+            # [B, C, H, W]
+            # -> [B, C, H*W]
+            # -> [B, H*W, C]
+            tokens = (
+                feature
+                .flatten(2)
+                .transpose(1, 2)
+                .contiguous()
+            )
+
+            expected_tokens = (
+                target_grid[0]
+                * target_grid[1]
+            )
+
+            if int(tokens.shape[1]) != expected_tokens:
+                raise RuntimeError(
+                    f"{level_name} token 數量錯誤："
+                    f"{tokens.shape[1]} != "
+                    f"{expected_tokens}"
+                )
+
+            if int(tokens.shape[2]) != self.out_channels:
+                raise RuntimeError(
+                    f"{level_name} token dimension 錯誤："
+                    f"{tokens.shape[2]} != "
+                    f"{self.out_channels}"
+                )
+
+            # 加入尺度識別資訊。
+            #
+            # level_embedding:
+            # [1, 1, C]
+            #
+            # tokens:
+            # [B, N, C]
+            level_embedding = (
+                self.level_embeddings[
+                    level_index
+                ]
+                .to(
+                    device=tokens.device,
+                    dtype=tokens.dtype,
+                )
+            )
+
+            tokens = (
+                tokens
+                + level_embedding
+            )
+
+            output_tokens.append(
+                tokens
+            )
+
+        image_tokens = torch.cat(
+            output_tokens,
+            dim=1,
         )
 
-        target_size = self.target_size
+        if int(image_tokens.shape[1]) != self.num_tokens:
+            raise RuntimeError(
+                "ImgProjector 最終 token 數量錯誤："
+                f"{image_tokens.shape[1]} != "
+                f"{self.num_tokens}"
+            )
 
-        large_feat = F.interpolate(
-            large_feat,
-            size=target_size,
-            mode="bilinear",
-            align_corners=False,
-        )
+        if int(image_tokens.shape[2]) != self.out_channels:
+            raise RuntimeError(
+                "ImgProjector 最終 hidden dimension 錯誤："
+                f"{image_tokens.shape[2]} != "
+                f"{self.out_channels}"
+            )
 
-        middle_feat = F.interpolate(
-            middle_feat,
-            size=target_size,
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        small_feat = F.interpolate(
-            small_feat,
-            size=target_size,
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        large_feat = self.resize_view(
-            large_feat
-        )
-        middle_feat = self.resize_view(
-            middle_feat
-        )
-        small_feat = self.resize_view(
-            small_feat
-        )
-
-        return (
-            large_feat
-            + middle_feat
-            + small_feat
-        )
+        return image_tokens
 
 
 class BackBone(nn.Module):
     def __init__(
         self,
-        in_channels,
-        out_channels=1024,
-        target_size=(40, 40),
-        layer_num=3,
+        in_channels_list=(192, 384, 768),
+        out_channels: int = 256,
     ):
         super().__init__()
 
-        self.backbone = ImgProjector(
-            in_channels=in_channels,
+        self.fpn = FeaturePyramidNetwork(
+            in_channels_list=list(in_channels_list),
             out_channels=out_channels,
-            layer_num=layer_num,
-            expand_ratio=2.0,
-            target_size=target_size,
+            norm_layer=None,
         )
+
+        self.out_channels = out_channels
 
     def forward(
         self,
-        x,
-    ):
-        x = self.backbone(x)
-        return x.flatten(
-            2
-        ).transpose(
-            1,
-            2,
-        )
+        features: OrderedDict[str, torch.Tensor],
+    ) -> OrderedDict[str, torch.Tensor]:
+        return self.fpn(features)
 
 
 class BottleNet(nn.Module):
     def __init__(
         self,
-        in_channels=3,
-        out_channels=1024,
+        in_channels: int = 3,
+        base_channels: Sequence[int] = (
+            64,
+            128,
+            256,
+            512,
+            1024,
+        ),
+        base_depths: Sequence[int] = (
+            2,
+            3,
+            2,
+        ),
+        width_multiple: float = 0.75,
+        depth_multiple: float = 0.67,
+        max_channels: int = 1024,
+        channel_divisor: int = 8,
     ):
         super().__init__()
 
+        if len(base_channels) != 5:
+            raise ValueError(
+                "base_channels 必須包含 5 個數值："
+                "Stem1、Stem2、C3、C4、C5"
+            )
+
+        if len(base_depths) != 3:
+            raise ValueError(
+                "base_depths 必須包含 3 個數值："
+                "Stage3、Stage4、Stage5"
+            )
+
+        if width_multiple <= 0:
+            raise ValueError(
+                "width_multiple must be > 0"
+            )
+
+        if depth_multiple <= 0:
+            raise ValueError(
+                "depth_multiple must be > 0"
+            )
+
+        if max_channels <= 0:
+            raise ValueError(
+                "max_channels must be > 0"
+            )
+
+        if channel_divisor <= 0:
+            raise ValueError(
+                "channel_divisor must be > 0"
+            )
+
+        # stage channel計算
+        scaled_channels = [
+            self._scale_channels(
+                base_channels=channel,
+                width_multiple=width_multiple,
+                max_channels=max_channels,
+                divisor=channel_divisor,
+            )
+            for channel in base_channels
+        ]
+
+        # Stage3、Stage4、Stage5 的實際深度
+        scaled_depths = [
+            self._scale_depth(
+                base_depth=depth,
+                depth_multiple=depth_multiple,
+            )
+            for depth in base_depths
+        ]
+
+        stem1_channels = scaled_channels[0]
+        stem2_channels = scaled_channels[1]
+        c3_channels = scaled_channels[2]
+        c4_channels = scaled_channels[3]
+        c5_channels = scaled_channels[4]
+
+        stage3_depth = scaled_depths[0]
+        stage4_depth = scaled_depths[1]
+        stage5_depth = scaled_depths[2]
+
+        self.channels = tuple(scaled_channels)
+        self.depths = tuple(scaled_depths)
+
+        # Stem 只負責輸出 stride 4 特徵
         self.stem = nn.Sequential(
             ConvGNAct(
                 in_channels,
-                64,
+                stem1_channels,
                 kernel_size=3,
                 stride=2,
             ),
             ConvGNAct(
-                64,
-                128,
+                stem1_channels,
+                stem2_channels,
                 kernel_size=3,
                 stride=2,
-            ),
-            ConvGNAct(
-                128,
-                256,
-                kernel_size=3,
-                stride=2,
-            ),
-            ConvGNAct(
-                256,
-                512,
-                kernel_size=3,
-                stride=2,
-            ),
-            ConvGNAct(
-                512,
-                out_channels,
-                kernel_size=1,
-                stride=1,
             ),
         )
 
+        # C3：stride 8
+        self.stage3 = self._make_stage(
+            in_channels=stem2_channels,
+            out_channels=c3_channels,
+            depth=stage3_depth,
+            stride=2,
+        )
+
+        # C4：stride 16
+        self.stage4 = self._make_stage(
+            in_channels=c3_channels,
+            out_channels=c4_channels,
+            depth=stage4_depth,
+            stride=2,
+        )
+
+        # C5：stride 32
+        self.stage5 = self._make_stage(
+            in_channels=c4_channels,
+            out_channels=c5_channels,
+            depth=stage5_depth,
+            stride=2,
+        )
+
+        # FPN必要參數紀錄
+        self.output_channels = (
+            c3_channels,
+            c4_channels,
+            c5_channels,
+        )
+
+    @staticmethod
+    def _scale_channels(
+        base_channels: int,
+        width_multiple: float,
+        max_channels: int,
+        divisor: int = 8,
+    ) -> int:
+        if (
+            isinstance(base_channels, bool)
+            or not isinstance(base_channels, int)
+            or base_channels <= 0
+        ):
+            raise ValueError(
+                "base_channels 必須是大於 0 的整數，"
+                f"目前為 {base_channels!r}"
+            )
+
+        scaled_channels = min(
+            base_channels * width_multiple,
+            max_channels,
+        )
+
+        #使channel對齊GroupNorm避免scale up 錯誤
+        scaled_channels = max(divisor,int( scaled_channels + divisor / 2)// divisor* divisor,)
+
+        return int(scaled_channels)
+
+    @staticmethod
+    def _scale_depth(
+        base_depth: int,
+        depth_multiple: float,
+    ) -> int:
+        if (
+            isinstance(base_depth, bool)
+            or not isinstance(base_depth, int)
+            or base_depth <= 0
+        ):
+            raise ValueError(
+                "base_depth 必須是大於 0 的整數，"
+                f"目前為 {base_depth!r}"
+            )
+
+        return max(
+            round(base_depth * depth_multiple),
+            1,
+        )
+
+    @staticmethod
+    def _make_stage(
+        in_channels: int,
+        out_channels: int,
+        depth: int,
+        stride: int = 2,
+    ) -> nn.Sequential:
+        if (
+            isinstance(in_channels, bool)
+            or not isinstance(in_channels, int)
+            or in_channels <= 0
+        ):
+            raise ValueError(
+                "in_channels 必須是大於 0 的整數"
+            )
+
+        if (
+            isinstance(out_channels, bool)
+            or not isinstance(out_channels, int)
+            or out_channels <= 0
+        ):
+            raise ValueError(
+                "out_channels 必須是大於 0 的整數"
+            )
+
+        if (
+            isinstance(depth, bool)
+            or not isinstance(depth, int)
+            or depth < 1
+        ):
+            raise ValueError(
+                "depth 必須是大於等於 1 的整數"
+            )
+
+        if stride not in (1, 2):
+            raise ValueError(
+                "stride must be 1 or 2"
+            )
+
+        layers = [
+            #執行下採樣
+            ConvGNAct(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                stride=stride,
+            )
+        ]
+
+        #後續層不套用下採樣
+        for _ in range(depth - 1):
+            layers.append(
+                ConvGNAct(
+                    out_channels,
+                    out_channels,
+                    kernel_size=3,
+                    stride=1,
+                )
+            )
+
+        return nn.Sequential(*layers)
+
     def forward(
         self,
-        x,
-    ):
-        return self.stem(x)
+        x: torch.Tensor,
+    ) -> OrderedDict[str, torch.Tensor]:
+        x = self.stem(x)
 
+        c3 = self.stage3(x)
+        c4 = self.stage4(c3)
+        c5 = self.stage5(c4)
+
+        return OrderedDict({
+            "c3": c3,
+            "c4": c4,
+            "c5": c5,
+        })
 
 class QueryHead(nn.Module):
     """BBox, localization-quality and token-level text-alignment head."""
@@ -2502,3 +2985,84 @@ class VisionTextModel(_BaseVisionTextModel):
 
         return outputs
 
+
+def test_img_projector():
+    bottle_net = BottleNet(
+        in_channels=3,
+        width_multiple=0.75,
+        depth_multiple=0.67,
+        max_channels=1024,
+    )
+
+    backbone = BackBone(
+        in_channels_list=bottle_net.output_channels,
+        out_channels=256,
+    )
+
+    img_projector = ImgProjector(
+        in_channels=256,
+        out_channels=512,
+        layer_num=2,
+        expand_ratio=2.0,
+        level_names=(
+            "c3",
+            "c4",
+            "c5",
+        ),
+        token_grids=(
+            (16, 16),
+            (8, 8),
+            (4, 4),
+        ),
+    )
+
+    bottle_net.eval()
+    backbone.eval()
+    img_projector.eval()
+
+    image = torch.randn(
+        1,
+        3,
+        1024,
+        1024,
+    )
+
+    with torch.no_grad():
+        bottle_features = bottle_net(
+            image
+        )
+
+        fpn_features = backbone(
+            bottle_features
+        )
+
+        image_tokens = img_projector(
+            fpn_features
+        )
+
+    print("FPN features:")
+
+    for name, feature in fpn_features.items():
+        print(
+            name,
+            tuple(feature.shape),
+        )
+
+    print(
+        "tokens per level:",
+        img_projector.tokens_per_level,
+    )
+
+    print(
+        "total tokens:",
+        img_projector.num_tokens,
+    )
+
+    print(
+        "image tokens:",
+        tuple(image_tokens.shape),
+    )
+
+
+if __name__ == "__main__":
+    test_img_projector()
