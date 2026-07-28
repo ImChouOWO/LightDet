@@ -14,7 +14,7 @@ Image + Text Query -> Bounding Boxes + Scores
 
 ## 簡介
 
-模型資料流：
+### 模型資料流：
 
 ```mermaid
 flowchart LR
@@ -36,8 +36,10 @@ flowchart LR
 
     S2 --> OUT[Bounding Boxes<br/>Localization Scores<br/>Token Alignment Scores]
 ```
+### 模型結構
+![模型架構](https://github.com/ImChouOWO/LightDet/blob/main/img/LightDet.png)
 
->[!NOTE] </br>
+>[!NOTE] 
 > 模型淺層時透過FPN擷取圖像資訊，深層時以`Token fusion`融合文字與圖像資訊並透過`Transformer`進行高階語意的擷取。
 
 目前模型包含以下主要設計：
