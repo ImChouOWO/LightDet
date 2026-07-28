@@ -1,9 +1,50 @@
 # LightDet
 
-LightDet 是一個 `Vision-Text to BBox model`，透過文字與圖像輸入定位畫面中的目標物件。
+LightDet 是一個以 DETR 為基礎的文字引導物件偵測模型（text-guided object detection）。模型接收影像與文字描述，輸出與文字語意對應的邊界框與信心分數。
 
-`Multimodal` `Transformer` `Token Fusion` <br>
-`Decoder Only` `DETR Like`
+```text
+Image + Text Query -> Bounding Boxes + Scores
+```
+
+目前版本採用 Decoder-only Object Query、兩階段 Query Refinement、H-DETR Main/Auxiliary 分支，以及 ODVG 風格的 token-level text alignment。
+
+`Vision-Language` `Object Detection` `DETR-like` `Decoder-only` `H-DETR` `ODVG Token Alignment`
+
+---
+
+## 模型概觀
+
+LightDet 的資料流可概括為：
+
+```text
+影像
+  -> Vision Backbone / Image Projection
+  -> Image Tokens
+
+文字描述
+  -> Chinese MacBERT / Precomputed Text Features
+  -> Text Tokens
+
+Image Tokens + Text Tokens + Fusion Tokens
+  -> Stage 1 Localization Transformer
+  -> Object Query Bounding Boxes
+  -> Stage 2 Quality / Text-alignment Refinement Transformer
+  -> Bounding Boxes + Localization Scores + Token Alignment Scores
+```
+
+目前模型包含以下主要設計：
+
+| 模組 | 說明 |
+|---|---|
+| Learnable Object Queries | 使用固定數量的可學習 Query 進行候選物件定位 |
+| Decoder-only Localization | 以 Query 從融合後的影像與文字記憶中擷取定位資訊 |
+| Staged Query Refinement | 第二階段進一步估計定位品質與文字對齊程度 |
+| H-DETR Auxiliary Branch | 訓練期間增加輔助分支，提高正樣本監督密度 |
+| Hungarian Matching | 根據 BBox、GIoU、Score 與文字對齊成本進行一對一匹配 |
+| Token-level Alignment | 學習 Object Query 與文字片段 token 的對應關係 |
+| Duplicate Suppression | 抑制多個 Query 對同一物件產生重複預測 |
+| Hard Negative Mining | 強化高分錯誤候選框與負文字片段的辨識能力 |
+| EMA | 保存模型參數的指數移動平均版本 |
 
 ---
 
@@ -19,69 +60,50 @@ LightDet/
 │   │   ├── train/
 │   │   └── val/
 │   └── .cache/
-│       └── images_512_uint8/
+│       └── images_1024_uint8/
 │
-└── units/
-    ├── model/
-    │   ├── bert/
-    │   │   └── models--hfl--chinese-macbert-base/
-    │   ├── cards/
-    │   │   ├── cache/
-    │   │   │   ├── bert_raw_cache.pt
-    │   │   │   └── negative_query_pool.json
-    │   │   ├── config/
-    │   │   │   ├── model.yaml
-    │   │   │   └── train.yaml
-    │   │   └── loss.py
-    │   ├── pipeline/
-    │   │   └── data.py
-    │   ├── resnet/
-    │   │   └── checkpoints/
-    │   ├── runs/
-    │   │   └── train/
-    │   └── train.py
-    │
-    └── tool/
-        └── card.py
+├── units/
+│   ├── model/
+│   │   ├── bert/
+│   │   ├── cards/
+│   │   │   ├── cache/
+│   │   │   │   ├── bert_raw_cache.pt
+│   │   │   │   └── negative_query_pool.json
+│   │   │   ├── config/
+│   │   │   │   ├── model.yaml
+│   │   │   │   └── train.yaml
+│   │   │   ├── loss.py
+│   │   │   └── ranking_loss.py
+│   │   ├── pipeline/
+│   │   │   └── data.py
+│   │   ├── tool/
+│   │   ├── runs/
+│   │   │   └── train/
+│   │   └── train.py
+│   │
+│   └── tool/
+│       └── card.py
+│
+├── requirements.txt
+└── README.md
 ```
 
 ---
 
-## 建置與運行
+## 安裝
 
-LightDet 的基本流程如下：
-
-```text
-下載專案
-→ 建立 Python 環境
-→ 安裝相依套件
-→ 準備資料集與標記
-→ 設定 model.yaml 與 train.yaml
-→ 執行 model.train()
-→ 取得 checkpoint 與驗證指標
-```
-
----
-
-## 1. 下載專案
+### 1. 下載專案
 
 ```bash
 git clone https://github.com/ImChouOWO/LightDet.git
 cd LightDet
 ```
 
----
+### 2. 建立虛擬環境
 
-## 2. 建立 Python 環境
+建議使用 Python 3.10 以上版本。
 
-建議環境：
-
-```text
-Python >= 3.10
-PyTorch >= 2.0
-```
-
-Linux 或 macOS：
+Linux / macOS：
 
 ```bash
 python3 -m venv venv
@@ -89,31 +111,46 @@ source venv/bin/activate
 python3 -m pip install --upgrade pip
 ```
 
-Windows：
+Windows PowerShell：
 
 ```powershell
 python -m venv venv
-venv\Scripts\activate
+venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 ```
 
----
+### 3. 安裝 PyTorch
 
-## 3. 安裝相依套件
+請依照 CUDA、CPU 或其他運算平台安裝相容的 PyTorch 與 TorchVision。
 
 ```bash
 pip install torch torchvision
-pip install numpy pyyaml tqdm transformers scipy pillow
+```
+
+### 4. 安裝其餘相依套件
+
+```bash
+pip install -r requirements.txt
+pip install numpy pyyaml scipy
+```
+
+目前 `requirements.txt` 包含：
+
+```text
+pillow
+tqdm
+transformers
+huggingface-hub
 ```
 
 ---
 
-## 4. 準備資料集
+## 資料集格式
 
-資料集目錄：
+資料集根目錄預設為：
 
 ```text
-/path/to/LightDet/datasets/
+datasets/
 ├── images/
 │   ├── train/
 │   └── val/
@@ -123,46 +160,25 @@ pip install numpy pyyaml tqdm transformers scipy pillow
 └── .cache/
 ```
 
-影像與標記檔名稱需要相互對應：
+影像與標記檔必須使用相同檔名：
 
 ```text
-images/train/000001.jpg
-labels/train/000001.json
+datasets/images/train/000001.jpg
+datasets/labels/train/000001.json
 
-images/val/000101.jpg
-labels/val/000101.json
+datasets/images/val/000101.jpg
+datasets/labels/val/000101.json
 ```
 
-支援的影像格式：
+支援的常見影像格式：
 
 ```text
-.jpg
-.jpeg
-.png
-.bmp
-.tif
-.tiff
-.webp
+.jpg  .jpeg  .png  .bmp  .tif  .tiff  .webp
 ```
 
-每一張影像可以包含多個物件。資料載入器會根據物件屬性與增強文字建立 Query-level 樣本：
+### 標記檔範例
 
-```text
-影像 + 文字 Query + Query 對應的 GT bbox
-```
-
-例如：
-
-```text
-影像：紅色船與白色船
-Query：紅色的船
-GT：紅色船的 bbox
-```
-
-<details>
-<summary><strong>標記檔格式</strong></summary>
-
-每張影像對應一個 JSON 標記檔，最外層必須是陣列：
+每張影像對應一個 JSON 陣列。每個元素代表一個物件及其可用文字描述。
 
 ```json
 [
@@ -171,9 +187,7 @@ GT：紅色船的 bbox
     "class_id": 0,
     "bbox_xyxy": [120, 80, 420, 300],
     "attributes": {
-      "main_colors": [
-        "紅色"
-      ]
+      "main_colors": ["紅色"]
     },
     "query_texts_aug": [
       "紅色的船",
@@ -186,9 +200,7 @@ GT：紅色船的 bbox
     "class_id": 0,
     "bbox_xyxy": [500, 100, 760, 340],
     "attributes": {
-      "main_colors": [
-        "白色"
-      ]
+      "main_colors": ["白色"]
     },
     "query_texts_aug": [
       "白色的船",
@@ -198,39 +210,28 @@ GT：紅色船的 bbox
 ]
 ```
 
-欄位說明：
-
 | 欄位 | 必要 | 說明 |
 |---|---:|---|
-| `source_name` | 是 | 對應的影像檔名。相同 JSON 內通常使用相同檔名 |
-| `bbox_xyxy` | 是 | 原始影像像素座標，格式為 `[x1, y1, x2, y2]` |
-| `class_id` | 否 | 類別編號，未設定時預設為 `0` |
-| `attributes.main_colors` | 建議 | 物件主要顏色，用於建立顏色文字 Query |
-| `query_texts_aug` | 建議 | 額外的文字 Query 描述 |
+| `source_name` | 是 | 對應的影像檔名 |
+| `bbox_xyxy` | 是 | 原始影像像素座標 `[x1, y1, x2, y2]` |
+| `class_id` | 否 | 類別編號，未指定時可使用預設類別 |
+| `attributes.main_colors` | 建議 | 物件主要顏色，可用於建立文字描述 |
+| `query_texts_aug` | 建議 | 同一物件的額外文字描述 |
 
-座標條件：
+邊界框必須符合：
 
 ```text
 x1 < x2
 y1 < y2
 ```
 
-資料載入器會依序執行：
+`bbox_xyxy` 應保存原始影像的像素座標，不需要預先正規化。資料載入流程會依照 `image_size` 縮放、裁切並轉換為模型使用的座標格式。
 
-```text
-原始像素 xyxy
-→ 依 image_size 縮放
-→ 裁切至影像邊界
-→ 正規化至 0～1
-```
+---
 
-因此標記檔中的 `bbox_xyxy` 應保存原始影像的像素座標，不需要預先正規化。
+## Query Budget Batch
 
-</details>
-
-### Query Budget Batch
-
-當設定：
+當 `query_budget: true` 時，`batch_size` 代表一個 batch 可容納的文字 Query 預算，而不是固定的影像數量。
 
 ```yaml
 data:
@@ -239,8 +240,6 @@ data:
 train:
   batch_size: 48
 ```
-
-`batch_size=48` 代表每個 batch 的 Query 預算，而不是固定載入 48 張影像。
 
 例如：
 
@@ -249,41 +248,26 @@ train:
 影像 B：13 個 Query
 影像 C：10 個 Query
 影像 D：14 個 Query
-
-總 Query：46
+--------------------
+總計：46 個 Query
 ```
 
-這四張影像可以組成同一個 batch。
+上述四張影像可被組合成同一個 batch。
 
 ---
 
-## 5. 準備 BERT 與文字快取
+## 文字編碼與快取
 
-LightDet 預設使用：
+LightDet 預設使用中文 MacBERT：
 
 ```text
 hfl/chinese-macbert-base
 ```
 
-本地模型目錄：
+預計使用的文字特徵快取位置：
 
 ```text
-/path/to/LightDet/units/model/bert/models--hfl--chinese-macbert-base/
-```
-
-文字特徵快取：
-
-```text
-/path/to/LightDet/units/model/cards/cache/bert_raw_cache.pt
-```
-
-當新增文字 Query 時，訓練程式會：
-
-```text
-讀取現有 cache
-→ 檢查缺少的文字
-→ 建立缺少的 BERT 特徵
-→ 更新 bert_raw_cache.pt
+units/model/cards/cache/bert_raw_cache.pt
 ```
 
 模型設定：
@@ -291,446 +275,335 @@ hfl/chinese-macbert-base
 ```yaml
 model:
   freeze_bert: true
-  precomputed_bert_path: /path/to/LightDet/units/model/cards/cache/bert_raw_cache.pt
+  precomputed_bert_path: units/model/cards/cache/bert_raw_cache.pt
 ```
+
+當 BERT 被凍結時，可預先計算並重複使用文字特徵，以降低訓練期間的重複編碼成本。
 
 ---
 
-## 6. 設定負文字 Query Pool
+## 負文字片段
 
-預設位置：
+負文字設定檔預設位於：
 
 ```text
-/path/to/LightDet/units/model/cards/cache/negative_query_pool.json
+units/model/cards/cache/negative_query_pool.json
 ```
 
-格式：
+目前資料流程採用 ODVG phrase-level negative 設計。抽樣到的負文字片段會附加到完整 caption 中，但不配置對應的邊界框，主要用於 token alignment 監督。
 
-```json
-{
-  "version": 1,
-  "target": "船",
-  "categories": {
-    "hard": {
-      "sampling_weight": 1.0,
-      "loss_weight": 2.0,
-      "queries": [
-        "紅色浮標",
-        "大型海上平台",
-        "漂浮中的塑膠桶"
-      ]
-    },
-    "severe": {
-      "sampling_weight": 1.0,
-      "loss_weight": 4.0,
-      "queries": [
-        "白色汽車",
-        "畫面中的人",
-        "天空中的飛機"
-      ]
-    }
-  }
-}
+相關訓練設定：
+
+```yaml
+data:
+  negative_query_path: units/model/cards/cache/negative_query_pool.json
+  negative_sample_ratio: 0.1
+  negative_phrase_max_per_image: 3
+  negative_phrase_separator: "；負向描述："
+  use_negative_queries_in_val: false
 ```
 
 | 參數 | 說明 |
 |---|---|
-| `sampling_weight` | 控制該分類被抽中的相對機率 |
-| `loss_weight` | 控制該負文字 Query 在 QFL 中的權重 |
-| `queries` | 可抽樣的負文字描述 |
-
-建議初始設定：
-
-```text
-hard loss_weight   = 2.0
-severe loss_weight = 4.0
-negative ratio     = 0.05
-```
-
-負文字 Query 沒有對應 GT：
-
-```python
-targets["boxes"] = []
-```
-
-因此：
-
-```text
-不計算 BBox Loss
-不計算 GIoU Loss
-所有 prediction 的 score target 為 0
-```
+| `negative_sample_ratio` | 訓練樣本加入負文字片段的比例 |
+| `negative_phrase_max_per_image` | 每張影像最多加入的負文字片段數 |
+| `negative_phrase_separator` | 正向描述與負向描述之間的分隔字串 |
+| `use_negative_queries_in_val` | 驗證階段是否加入負文字片段 |
 
 ---
 
-## 7. 設定模型結構
+## 模型設定
 
-設定檔：
+模型設定檔：
 
 ```text
-/path/to/LightDet/units/model/cards/config/model.yaml
+units/model/cards/config/model.yaml
 ```
 
-`model.yaml`範例：
+目前主要設定如下：
 
 ```yaml
 model:
   img_in_channels: 1024
+  cnn_layers: 3
   hidden_dim: 512
+  image_grid_size: 10
+  freeze_img_projection: false
+
+  num_object_queries: 100
+  query_group_init_std: 0.02
+  fusion_token_num: 16
+
   num_heads: 8
   num_layers: 2
   mlp_ratio: 3.5
-  image_grid_size: 10
-  text_max_length: 32
-  fusion_token_num: 16
   dropout: 0.1
+
+  staged_query_refinement: true
+  score_num_heads: 8
+  score_num_layers: 2
+  score_mlp_ratio: 3.0
+  score_dropout: 0.1
+  score_bbox_conditioning: true
+  score_bbox_detach: true
+  score_fusion: geometric_mean
+  score_fusion_eps: 0.000001
+
+  text_max_length: 256
   freeze_bert: true
-  precomputed_bert_path: /path/to/LightDet/units/model/cards/cache/bert_raw_cache.pt
+  precomputed_bert_path: units/model/cards/cache/bert_raw_cache.pt
+
+  use_auxiliary_head: true
+  auxiliary_in_eval: false
+  initialize_aux_from_main: true
 ```
 
-> [!NOTE]
-> model為模型結構參數會影像初始化後的模型
+### 關鍵參數
+
+| 參數 | 說明 |
+|---|---|
+| `num_object_queries` | 每張影像使用的可學習物件 Query 數量 |
+| `fusion_token_num` | 影像與文字融合時使用的 Fusion Token 數量 |
+| `num_layers` | 第一階段定位 Transformer 層數 |
+| `staged_query_refinement` | 是否啟用第二階段品質與文字對齊 refinement |
+| `score_bbox_conditioning` | 第二階段是否使用預測框資訊作為條件 |
+| `score_bbox_detach` | 傳入第二階段前是否停止 BBox 梯度回傳 |
+| `score_fusion` | 定位分數與文字對齊分數的融合方式 |
+| `text_max_length` | 最大文字 token 長度 |
+| `use_auxiliary_head` | 是否啟用 H-DETR 輔助訓練分支 |
+
+> 修改模型結構參數後，舊 checkpoint 可能無法完整載入。若新增或移除模組，應優先使用 weights-only warm start，而不是恢復舊 optimizer 狀態。
 
 ---
 
-## 8. 設定訓練參數
+## 訓練設定
 
-設定檔：
+訓練設定檔：
 
 ```text
-/path/to/LightDet/units/model/cards/config/train.yaml
+units/model/cards/config/train.yaml
 ```
 
-`train.yaml` 範例：
+目前預設核心設定：
 
 ```yaml
 data:
-  dataset_dir: /path/to/LightDet/datasets
-  image_size: 512
+  dataset_dir: datasets
+  image_size: 1024
   max_text_aug_per_image: 1
-
   cache_images: true
-  image_cache_dir: /path/to/LightDet/datasets/.cache/images_512_uint8
+  image_cache_dir: datasets/.cache/images_1024_uint8
   prebuild_image_cache: true
   cache_workers: 8
-
-  prefetch_factor: 4
+  prefetch_factor: 2
   pin_memory: true
   persistent_workers: true
   query_budget: true
 
-  negative_query_path: /path/to/LightDet/units/model/cards/cache/negative_query_pool.json
-  negative_sample_ratio: 0.05
-  use_negative_queries_in_val: false
-
 train:
   epochs: 300
   batch_size: 48
-  warmup_epochs: 5
+  warmup_epochs: 3
   num_workers: 16
-  device: cuda:0
-  seed: 47
+  device: cuda:1
+  seed: 49
   deterministic: false
-
   use_amp: true
   amp_dtype: bf16
-
+  allow_tf32: true
+  matmul_precision: high
+  compile: false
+  startup_smoke_test: true
   use_ema: true
   ema_decay: 0.999
   grad_clip_norm: 1.0
-
-  allow_tf32: true
-  matmul_precision: high
-  channels_last: false
-  compile: false
-  startup_smoke_test: true
-
-optim:
-  lr_vision: 0.0001
-  lr_text: 0.00001
-  lr_transformer: 0.0001
-  lr_head: 0.0001
-  weight_decay: 0.0001
-  min_lr_ratio: 0.05
-  max_warmup_steps: 3000
-  fused: true
-
-eval:
-  val_loss_interval: 5
-  eval_interval: 1
-  max_val_batches: null
-  score_thr: 0.001
-  top_k: 20
-  nms_iou_thr: 0.5
-  use_nms: true
-  best_metric: map50_95
-  use_topk_fallback: false
-
-log:
-  save_dir: runs/train/lightdet_exp
-  resume_path: null
-  save_latest_interval: 1
-  save_epoch_interval: 50
-  emit_step_metrics: false
-  log_interval: 50
 ```
 
-> [!NOTE]
-> `model.train()` 中明確指定的參數會覆蓋 `train.yaml` 中的對應設定。
+`device: cuda:1` 代表使用第 2 張 CUDA GPU。只有一張 GPU 時請改為：
+
+```yaml
+train:
+  device: cuda:0
+```
 
 ---
 
-## 9. 啟動訓練
+## Optimizer 與 Learning Rate
 
-在執行檔中建立模型：
+目前使用 AdamW，並可對不同模型元件設定獨立的 learning-rate schedule。
 
-```python
-from train import LightDet
+```yaml
+optim:
+  components:
+    vision: ["cosine", 0.0001, 0.000005, 0.00, 1.00]
+    text: ["cosine", 0.00001, 0.0000005, 0.00, 1.00]
+    transformer: ["cosine", 0.0001, 0.000005, 0.00, 1.00]
+    head: ["cosine", 0.0001, 0.000005, 0.00, 1.00]
 
-model = LightDet(
-    model="/path/to/LightDet/units/model/cards/config/model.yaml"
-)
-
-model.train(
-    cfg="/path/to/LightDet/units/model/cards/config/train.yaml",
-    data="/path/to/LightDet/datasets",
-
-    weights=None,
-    resume=None,
-    prefer_ema=True,
-
-    epochs=300,
-    imgsz=512,
-    batch=48,
-    device=0,
-    workers=16,
-    seed=47,
-    deterministic=False,
-
-    project="/path/to/LightDet/units/model/runs/train",
-    name="lightdet_exp",
-)
+  weight_decay: 0.0001
+  max_warmup_steps: 3000
+  fused: true
 ```
 
-執行：
+每個元件的格式為：
+
+```text
+[排程模式, 最大 LR, 最小 LR, 起始訓練比例, 結束訓練比例]
+```
+
+---
+
+## Loss 與 Matching
+
+目前版本的主要 Loss 組成：
+
+| Loss / 機制 | 用途 |
+|---|---|
+| BBox L1 Loss | 回歸預測框座標 |
+| GIoU Loss | 改善預測框與 GT 的幾何重疊 |
+| IA-BCE / IoU-aware Classification | 使分數反映預測框定位品質 |
+| Token Alignment Loss | 建立 Object Query 與文字 token 的對應 |
+| Phrase Ranking Loss | 使正確匹配 Query 的 token 分數高於未匹配 Query |
+| Auxiliary Branch Loss | 提供 H-DETR 輔助分支監督 |
+| Duplicate Suppression Loss | 抑制同一物件的重複高分預測 |
+| Hard Negative Loss | 處理高分但低 IoU 的錯誤候選框 |
+| Text Negative Loss | 抑制負文字片段與物件 Query 的錯誤對齊 |
+
+Hungarian Matcher 使用以下成本：
+
+```yaml
+loss:
+  matcher:
+    cost_bbox: 5.0
+    cost_giou: 2.0
+    cost_score: 2.0
+    score_cost_type: focal
+    cost_alignment: 2.0
+    alignment_negative_weight: 0.25
+```
+
+Loss 權重可在前期動態調整：
+
+```yaml
+loss:
+  weight:
+    dynamic: true
+    bbox_start: 5.0
+    bbox_end: 3.5
+    giou_start: 2.0
+    giou_end: 2.0
+    score_start: 1.0
+    score_end: 4.0
+    start_epoch: 1
+    end_epoch: 30
+    schedule: cosine
+```
+
+---
+
+## 啟動訓練
+
+預設設定檔已由 `train.py` 載入時，可直接執行：
 
 ```bash
-cd /path/to/LightDet/units/model
+python3 units/model/train.py
+```
+
+也可以先切換到模型目錄：
+
+```bash
+cd units/model
 python3 train.py
 ```
 
-### 訓練模式
+開始訓練前，請至少確認：
 
-三種訓練模式統一由 `weights` 與 `resume` 控制：
-
-| 模式 | `weights` | `resume` | 用途 |
-|---|---|---|---|
-| 從頭訓練 | `None` | `None` | 不載入舊 checkpoint，重新建立完整訓練狀態 |
-| Weights-only warm start | `checkpoint path` | `None` | 載入模型或 EMA 權重，但重置 optimizer、scheduler、epoch 與最佳指標 |
-| 接續訓練 | `None` | `checkpoint path` | 恢復模型先前模型訓練狀態 |
-
->[!NOTE]
->weights 與 resume 不可同時使用
-
-
-Weights-only warm start：
-
-```python
-model.train(
-    cfg="/path/to/LightDet/units/model/cards/config/train.yaml",
-    data="/path/to/LightDet/datasets",
-
-    weights="/path/to/checkpoints/best_map50_95.pt",
-    resume=None,
-    prefer_ema=True,
-
-    epochs=300,
-    imgsz=512,
-    batch=48,
-    device=0,
-    workers=16,
-
-    project="/path/to/LightDet/units/model/runs/train",
-    name="lightdet_warm_start",
-)
+```text
+1. datasets 路徑正確
+2. train / val 影像與標記檔相互對應
+3. BERT 模型或文字快取可被讀取
+4. train.yaml 的 device 對應實際 GPU
+5. image_cache_dir 與 image_size 一致
+6. 輸出目錄具有寫入權限
 ```
-
-接續訓練：
-
-```python
-model.train(
-    cfg="/path/to/LightDet/units/model/cards/config/train.yaml",
-    data="/path/to/LightDet/datasets",
-
-    weights=None,
-    resume="/path/to/LightDet/units/model/runs/train/lightdet_exp/latest.pt",
-
-    epochs=300,
-    imgsz=512,
-    batch=48,
-    device=0,
-    workers=16,
-
-    project="/path/to/LightDet/units/model/runs/train",
-    name="lightdet_exp",
-)
-```
----
-
-## 10. `model.train()` 參數
-
-### 基本與 checkpoint 參數
-
-| 參數 | 型別 | 用途 |
-|---|---|---|
-| `cfg` | `str` | `train.yaml` 路徑 |
-| `data` | `str \| None` | 資料集根目錄，覆蓋 `data.dataset_dir` |
-| `epochs` | `int \| None` | 訓練總 epoch |
-| `imgsz` | `int \| None` | 輸入影像尺寸 |
-| `batch` | `int \| None` | Batch 或 Query Budget 上限 |
-| `device` | `int \| str \| None` | 運算裝置，例如 `0`、`1`、`"cuda:0"` 或 `"cpu"` |
-| `workers` | `int \| None` | DataLoader worker 數量 |
-| `seed` | `int \| None` | 隨機種子 |
-| `deterministic` | `bool \| None` | 是否啟用 deterministic 訓練 |
-| `project` | `str` | 實驗輸出根目錄 |
-| `name` | `str` | 實驗名稱 |
-| `weights` | `str \| None` | Weights-only warm start checkpoint |
-| `resume` | `str \| bool \| None` | 完整續訓 checkpoint；`True` 代表尋找 `<project>/<name>/latest.pt` |
-| `prefer_ema` | `bool` | Warm start 時優先載入 EMA 權重 |
-
-### 資料載入參數
-
-| 參數 | 型別 | 用途 |
-|---|---|---|
-| `cache_images` | `bool \| None` | 是否使用影像快取 |
-| `image_cache_dir` | `str \| None` | 影像快取輸出目錄 |
-| `prebuild_image_cache` | `bool \| None` | 是否在訓練前預先建立快取 |
-| `prefetch_factor` | `int \| None` | 每個 worker 預先載入的 batch 數 |
-| `pin_memory` | `bool \| None` | 是否啟用 pinned memory |
-| `persistent_workers` | `bool \| None` | epoch 之間是否保留 DataLoader workers |
-| `negative_query_path` | `str \| None` | 負文字 Query Pool 路徑 |
-| `negative_sample_ratio` | `float \| None` | 負文字 Query 取樣比例，範圍為 `0～1` |
-| `use_negative_queries_in_val` | `bool \| None` | 驗證階段是否加入負文字 Query |
-
-### Optimizer 與執行參數
-
-| 參數 | 型別 | 用途 |
-|---|---|---|
-| `lr` | `float \| None` | 同時設定 vision、transformer 與 head learning rate |
-| `lr_vision` | `float \| None` | Vision backbone learning rate |
-| `lr_text` | `float \| None` | Text encoder learning rate |
-| `lr_transformer` | `float \| None` | Transformer learning rate |
-| `lr_head` | `float \| None` | BBox 與 score head learning rate |
-| `weight_decay` | `float \| None` | Optimizer weight decay |
-| `amp_dtype` | `str \| None` | AMP dtype，例如 `"bf16"` 或 `"fp16"` |
-| `compile_model` | `bool \| None` | 是否使用 `torch.compile` |
-| `channels_last` | `bool \| None` | 是否使用 channels-last memory format |
-| `startup_smoke_test` | `bool \| None` | 正式訓練前是否執行啟動測試 |
-| `use_ema` | `bool \| None` | 是否啟用 EMA |
-| `ema_decay` | `float \| None` | EMA decay，範圍為 `[0,1)` |
-
-### 驗證與後處理參數
-
-| 參數 | 型別 | 用途 |
-|---|---|---|
-| `score_thr` | `float \| None` | 驗證時的最低 confidence threshold |
-| `top_k` | `int \| None` | 每個 Query 保留的最高分 prediction 數量 |
-| `nms_iou_thr` | `float \| None` | NMS IoU threshold |
-| `use_nms` | `bool \| None` | 是否在驗證階段使用 NMS |
-| `use_topk_fallback` | `bool \| None` | 無 prediction 通過 threshold 時是否保留 top-k fallback |
-
-### QFL、Ranking 與負樣本參數
-
-| 參數 | 型別 | 用途 |
-|---|---|---|
-| `hard_negative_ratio` | `int \| None` | Score loss 中 hard negative 與 positive 的比例 |
-| `positive_ratio` | `float \| None` | 額外正樣本的候選比例 |
-| `max_positive_per_gt` | `int \| None` | 每個 GT 最多使用的正 prediction 數量 |
-| `iou_pos_thr` | `float \| None` | 判定 quality positive 的最低 IoU |
-| `quality_min` | `float \| None` | Quality target 下限 |
-| `quality_max` | `float \| None` | Quality target 上限 |
-| `qfl_beta` | `float \| None` | Quality Focal Loss 的 beta |
-| `quality_warmup_epoch` | `int \| None` | Quality target 從常數轉為 IoU 的 warmup epoch |
-| `lambda_rank` | `float \| None` | Ranking Loss 最大權重 |
-| `rank_start_epoch` | `int \| None` | Ranking Loss 開始啟用的 epoch |
-| `rank_warmup_epoch` | `int \| None` | Ranking Loss warmup 結束 epoch |
-| `rank_alpha_min` | `float \| None` | Ranking warmup 的最小 alpha |
-| `max_query_loss_weight` | `float \| None` | 負文字 Query loss weight 上限 |
-
-
 
 ---
 
-## 11. Checkpoint 檢查
+## Checkpoint 與續訓
 
-```python
-checkpoint_info = model.inspect_checkpoint(
-    "/path/to/checkpoints/latest.pt"
-)
+訓練輸出位置由下列設定控制：
 
-print(checkpoint_info)
+```yaml
+log:
+  save_dir: units/model/runs/train/lightdet_ODVG_token_alignment
+  weights_path: null
+  resume_path: null
+  prefer_ema: true
+  save_latest_interval: 1
+  save_epoch_interval: 50
 ```
 
-檢查內容包含：
+### 從頭訓練
+
+```yaml
+log:
+  weights_path: null
+  resume_path: null
+```
+
+### Weights-only warm start
+
+只載入模型權重，不恢復 optimizer、scheduler、epoch 與最佳指標。
+
+```yaml
+log:
+  weights_path: /path/to/checkpoint.pt
+  resume_path: null
+  prefer_ema: true
+```
+
+適合以下情況：
 
 ```text
-model
-ema
-optimizer
-scaler
-scheduler
-epoch
-rng_state
-weights_only
-full_resume
+模型結構有小幅調整
+新增 token-alignment projection head
+修改 Loss 或資料策略
+希望重新建立 optimizer 與 learning-rate schedule
 ```
 
-判斷方式：
+### 完整接續訓練
 
-| Checkpoint 狀態 | 建議載入方式 |
-|---|---|
-| 只有模型或 EMA 權重 | 使用 `weights=...` |
-| 包含 optimizer、scheduler 與 epoch | 可使用 `resume=...` |
-| 模型結構已修改 | 不建議完整 resume |
-| Loss 或資料策略已修改 | 建議使用 weights-only warm start |
+恢復模型、EMA、optimizer、scheduler、epoch 與可用的 RNG 狀態。
+
+```yaml
+log:
+  weights_path: null
+  resume_path: /path/to/latest.pt
+```
+
+`weights_path` 與 `resume_path` 不應同時設定。
 
 ---
 
-## 12. 訓練輸出
+## 驗證與後處理
 
-訓練過程範例：
-
-```text
-Epoch 8/300 [Train]:
-loss=0.7469
-bbox=0.0142
-giou=0.2635
-score=0.0743
-rank=0.0000
-txtneg=0.0001
-nq=3
+```yaml
+eval:
+  val_loss_interval: 5
+  eval_interval: 1
+  score_thr: 0.001
+  top_k: 20
+  nms_iou_thr: 0.5
+  use_nms: false
+  use_topk_fallback: false
+  compute_raw_oracle: true
+  raw_oracle_iou_thresholds: [0.25, 0.50, 0.75]
+  best_metric: map50_95
 ```
 
-| 欄位 | 說明 |
-|---|---|
-| `loss` | 加權後的總 Loss |
-| `bbox` | BBox L1 Loss |
-| `giou` | GIoU Loss |
-| `score` | 整體 Quality Focal Loss |
-| `rank` | 加入總 Loss 的 Ranking Loss 貢獻 |
-| `raw` | 尚未乘上權重的 Ranking Loss |
-| `ra` | Ranking warmup alpha |
-| `lrk` | 目前實際生效的 Ranking 權重 |
-| `txtneg` | 負文字 Query 的 QFL 監控值 |
-| `nq` | 當前 batch 中的負文字 Query 數量 |
+目前預設 `use_nms: false`，主要依賴 DETR-style Query assignment、文字對齊與 duplicate suppression 學習降低重複預測。
 
-```text
-nq=0
-```
-
-只代表目前 batch 沒有抽到負文字 Query，不代表整個訓練未使用負文字資料。
-
-驗證輸出包含：
+常見驗證指標包含：
 
 ```text
 mAP50
@@ -743,240 +616,149 @@ GT
 Pred
 ```
 
-當設定：
-
-```yaml
-eval:
-  best_metric: map50_95
-```
-
-最佳 checkpoint 會依照 `mAP50-95` 選擇。
+最佳 checkpoint 依 `best_metric: map50_95` 選擇。
 
 ---
 
-## 13. 輸出檔案
+## 訓練輸出
+
+預設輸出目錄：
 
 ```text
-/path/to/LightDet/units/model/runs/train/<experiment>/
-├── latest.pt
-├── best_map50_95.pt
-├── epoch_050.pt
-├── metrics_epoch.jsonl
-├── metrics_step.jsonl
-├── metrics_epoch.csv
-└── latest_metrics.json
+units/model/runs/train/lightdet_ODVG_token_alignment/
+```
+
+可能包含：
+
+```text
+latest.pt
+best_map50_95.pt
+epoch_050.pt
+metrics_epoch.jsonl
+metrics_step.jsonl
+metrics_epoch.csv
+latest_metrics.json
 ```
 
 | 檔案 | 說明 |
 |---|---|
-| `latest.pt` | 最新 epoch 的完整 checkpoint |
+| `latest.pt` | 最近一次保存的完整 checkpoint |
 | `best_map50_95.pt` | 驗證集 mAP50-95 最佳 checkpoint |
-| `epoch_XXX.pt` | 固定週期保存的 checkpoint |
+| `epoch_XXX.pt` | 依固定週期保存的 checkpoint |
 | `metrics_epoch.jsonl` | Epoch-level 指標 |
-| `metrics_step.jsonl` | Step-level 指標 |
-| `metrics_epoch.csv` | CSV 格式訓練指標 |
-| `latest_metrics.json` | 最新一次訓練與驗證結果 |
+| `metrics_step.jsonl` | Step-level 指標，需啟用 step metrics |
+| `metrics_epoch.csv` | CSV 格式的 epoch 指標 |
+| `latest_metrics.json` | 最近一次訓練與驗證摘要 |
 
 ---
 
-## 14. EMA
-
-設定：
-
-```yaml
-train:
-  use_ema: true
-  ema_decay: 0.999
-```
-
-Checkpoint 會同時保存：
-
-```text
-model
-ema
-```
-
-Weights-only warm start 時：
-
-```python
-prefer_ema=True
-```
-
-會優先載入 EMA 權重。
-
----
-
-## 20. 常見問題
+## 常見問題
 
 ### CUDA 無法使用
-
-檢查：
 
 ```bash
 python3 -c "import torch; print(torch.cuda.is_available())"
 ```
 
-如果輸出：
-
-```text
-False
-```
-
-請確認目前 Python 環境安裝的 PyTorch 是否支援所使用的運算裝置。
-
----
+輸出為 `False` 時，請確認 PyTorch、CUDA Runtime 與顯示卡驅動版本相容。
 
 ### GPU 編號錯誤
 
-```python
-device=1
+```yaml
+train:
+  device: cuda:1
 ```
 
-代表使用第 2 張 GPU。
-
-只有一張 GPU 時應使用：
-
-```python
-device=0
-```
-
-或：
-
-```python
-device="cuda:0"
-```
-
----
-
-### BERT Cache 缺少文字
-
-加入新的文字 Query 後，訓練程式會自動補建缺少的文字特徵。
-
-若快取格式已改變，可以刪除：
-
-```text
-/path/to/LightDet/units/model/cards/cache/bert_raw_cache.pt
-```
-
-再重新啟動訓練。
-
-刪除後會重新建立全部文字特徵。
-
----
-
-### Transformer Missing Keys
-
-錯誤：
-
-```text
-Missing key(s):
-transformer.transformer.layers.2.*
-```
-
-通常代表目前模型層數與 checkpoint 不一致。
-
-檢查：
+代表第 2 張 GPU。單 GPU 主機通常應改為：
 
 ```yaml
-model:
-  num_layers: 2
+train:
+  device: cuda:0
 ```
 
-模型結構必須與 checkpoint 建立時的設定一致。
+### Image Cache 尺寸不一致
 
----
+當 `image_size` 改變時，應同步修改或重建 `image_cache_dir`：
+
+```yaml
+data:
+  image_size: 1024
+  image_cache_dir: datasets/.cache/images_1024_uint8
+```
+
+### Checkpoint 出現 Missing Keys
+
+通常代表 checkpoint 與目前模型結構不一致，例如：
+
+```text
+Object Query 數量不同
+Transformer 層數不同
+新增 Stage 2 Query Refinement
+新增 Token Alignment Head
+新增 Auxiliary Head
+```
+
+這類情況應使用 weights-only warm start，並檢查未載入參數是否屬於新模組。
 
 ### `enable_nested_tensor` 警告
 
-```text
-enable_nested_tensor is True, but self.use_nested_tensor is False
-because encoder_layer.norm_first was True
-```
+PyTorch Transformer 可能顯示 nested tensor 的效能提示。若訓練可正常進行，通常不代表模型結構或數值計算錯誤。
 
-這是 PyTorch Transformer 的效能提示，不會中斷訓練，也不代表模型結構錯誤。
+### 驗證時仍出現重複框
 
----
-
-### `weights` 與 `resume` 同時設定
-
-以下寫法不支援：
-
-```python
-model.train(
-    weights="/path/to/best.pt",
-    resume="/path/to/latest.pt",
-)
-```
-
-請根據目的選擇其中一種：
+目前預設不使用 NMS。可先檢查：
 
 ```text
-weights：只載入模型權重並開始新實驗
-resume：恢復完整訓練狀態
+duplicate_suppression loss
+score calibration
+text alignment ranking
+Hungarian matcher score/alignment schedule
+score threshold 與 top-k
 ```
 
----
+如需進行對照實驗，可在 `train.yaml` 暫時啟用：
 
-### `resume=True` 找不到 checkpoint
-
-`resume=True` 會尋找：
-
-```text
-<project>/<name>/latest.pt
+```yaml
+eval:
+  use_nms: true
+  nms_iou_thr: 0.5
 ```
-
-需要確認：
-
-```python
-project="/path/to/LightDet/units/model/runs/train"
-name="lightdet_exp"
-```
-
-與原實驗輸出目錄一致。
-
----
-
-### `txtneg` 數值很低
-
-例如：
-
-```text
-txtneg=0.0001
-```
-
-通常代表模型已將負文字 Query 的 confidence 壓低。
-
-仍需搭配下列指標判斷：
-
-```text
-Recall
-Precision
-FP
-mAP50
-mAP50-95
-```
-
-避免負樣本抑制過強導致正樣本 Recall 下降。
 
 ---
 
 ## 快速啟動
 
 ```bash
-cd /path/to/LightDet
+git clone https://github.com/ImChouOWO/LightDet.git
+cd LightDet
 
 python3 -m venv venv
 source venv/bin/activate
 
 pip install torch torchvision
-pip install numpy pyyaml tqdm transformers scipy pillow
+pip install -r requirements.txt
+pip install numpy pyyaml scipy
 
-cd units/model
-python3 train.py
+python3 units/model/train.py
 ```
 
-訓練結果會輸出至：
+---
+
+## Repository
+
+GitHub：`https://github.com/ImChouOWO/LightDet`
+
+---
+
+## 專案狀態
+
+LightDet 目前仍處於研究與訓練策略迭代階段。模型結構、Loss、資料格式與 checkpoint 相容性可能隨版本更新而調整。進行長時間訓練前，建議固定當次實驗所使用的：
 
 ```text
-/path/to/LightDet/units/model/runs/train/<experiment>/
+Git commit
+model.yaml
+train.yaml
+資料集版本
+文字快取
+負文字 Pool
 ```
