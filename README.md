@@ -14,6 +14,25 @@ Image + Text Query -> Bounding Boxes + Scores
 
 ## 簡介
 
+### 模型能力
+![模型能力](https://github.com/ImChouOWO/LightDet/blob/main/units/runs/predict/lightdet_odvg/prediction.jpg)
+
+> 輸入文字：紅色的船
+
+#### 使用資料集
+ | 單位（張）| 訓練集 |驗證集|
+|---|---|---|
+|數量|15000|1500|
+
+>[!NOTE]
+>本模型訓練及驗證皆於自行收集之海事資料
+
+| Recall | Recall@1 | Recall@5 | Recall@10 |
+|---:|---:|---:|---:|
+| 65.00% | 23.94% | 52.33% | 61.03% |
+
+
+
 ### 模型資料流：
 
 ![模型資料流](https://github.com/ImChouOWO/LightDet/blob/main/img/dataFlow.png)
@@ -176,54 +195,126 @@ datasets/labels/val/000101.json
 
 ### 標記檔範例
 
-每張影像對應一個 JSON 陣列。每個元素代表一個物件及其可用文字描述。
+每張影像對應一個 JSON 物件，內容包含影像資訊、完整文字描述，以及文字片段與邊界框之間的 Grounding 關係。
 
 ```json
-[
-  {
-    "source_name": "000001.jpg",
-    "class_id": 0,
-    "bbox_xyxy": [120, 80, 420, 300],
-    "attributes": {
-      "main_colors": ["紅色"]
-    },
-    "query_texts_aug": [
-      "紅色的船",
-      "含紅色的船",
-      "船體是紅色的船"
+{
+  "filename": "2021_10_20_13_28_41_00000.jpg",
+  "height": 1296,
+  "width": 2304,
+  "grounding": {
+    "caption": "黃綠白相間的船。單色紅色的船。含綠色的船。",
+    "regions": [
+      {
+        "semantic_key": "colors_exact:白色|黃色|綠色",
+        "phrase": "黃綠白相間的船",
+        "tokens_positive": [
+          [0, 7]
+        ],
+        "bbox": [
+          [1858, 493, 2017, 558]
+        ]
+      },
+      {
+        "semantic_key": "single_color:紅色",
+        "phrase": "單色紅色的船",
+        "tokens_positive": [
+          [8, 14]
+        ],
+        "bbox": [
+          [1510, 433, 1535, 465]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:綠色",
+        "phrase": "含綠色的船",
+        "tokens_positive": [
+          [15, 20]
+        ],
+        "bbox": [
+          [1858, 493, 2017, 558],
+          [1590, 454, 1653, 501]
+        ]
+      }
     ]
   },
-  {
-    "source_name": "000001.jpg",
-    "class_id": 0,
-    "bbox_xyxy": [500, 100, 760, 340],
-    "attributes": {
-      "main_colors": ["白色"]
+  "metadata": {
+    "source_name": "2021_10_20_13_28_41_00000",
+    "source_label": "2021_10_20_13_28_41_00000.json",
+    "object_count": 3,
+    "region_count": 3,
+    "phrase_variants": {
+      "單色紅色的船": [
+        "純紅色的船",
+        "只有紅色的船"
+      ]
     },
-    "query_texts_aug": [
-      "白色的船",
-      "畫面中的白色船隻"
+    "original_query_texts": [
+      "黃綠白相間的船",
+      "紅色的船",
+      "綠色的船"
     ]
   }
-]
+}
 ```
 
 | 欄位 | 必要 | 說明 |
 |---|---:|---|
-| `source_name` | 是 | 對應的影像檔名 |
-| `bbox_xyxy` | 是 | 原始影像像素座標 `[x1, y1, x2, y2]` |
-| `class_id` | 否 | 類別編號，未指定時可使用預設類別 |
-| `attributes.main_colors` | 建議 | 物件主要顏色，可用於建立文字描述 |
-| `query_texts_aug` | 建議 | 同一物件的額外文字描述 |
+| `filename` | 是 | 對應的影像檔名 |
+| `height` | 是 | 原始影像高度 |
+| `width` | 是 | 原始影像寬度 |
+| `grounding.caption` | 是 | 包含所有目標描述的完整文字 |
+| `grounding.regions` | 是 | 文字描述與邊界框的對應清單 |
+| `regions[].semantic_key` | 建議 | 用於區分語意類型或描述規則 |
+| `regions[].phrase` | 是 | 對應目標的文字描述 |
+| `regions[].tokens_positive` | 是 | `phrase` 在 `caption` 中的字元區間 `[start, end]` |
+| `regions[].bbox` | 是 | 該文字描述對應的一個或多個邊界框 |
+| `metadata.object_count` | 否 | 影像中的實際物件數量 |
+| `metadata.region_count` | 否 | Grounding Region 的數量 |
+| `metadata.phrase_variants` | 否 | 各文字描述可使用的擴增句型 |
+| `metadata.original_query_texts` | 否 | 原始標記檔中的文字查詢 |
 
-邊界框必須符合：
+邊界框使用原始影像的像素座標：
 
 ```text
+[x1, y1, x2, y2]
+
 x1 < x2
 y1 < y2
 ```
 
-`bbox_xyxy` 應保存原始影像的像素座標，不需要預先正規化。資料載入流程會依照 `image_size` 縮放、裁切並轉換為模型使用的座標格式。
+同一個 `region` 可以包含多個邊界框，表示同一段文字描述對應多個物件；同一個物件也可以出現在不同的 `region` 中，表示該物件可由不同語意描述進行定位。
+
+`tokens_positive` 使用字元索引標記 `phrase` 在完整 `caption` 中的位置。資料載入時會依照 tokenizer 的 offset mapping，將字元區間轉換為 token-level 對齊標籤。
+
+邊界框不需要預先正規化。資料載入流程會依照 `image_size` 進行影像縮放，並將座標轉換為模型訓練使用的格式。
+
+---
+
+## Query Budget Batch
+
+當 `query_budget: true` 時，`batch_size` 代表一個 batch 可容納的 Grounding Region 預算，而不是固定的影像數量。
+
+```yaml
+data:
+  query_budget: true
+
+train:
+  batch_size: 48
+```
+
+例如：
+
+```text
+影像 A：9 個 Region
+影像 B：13 個 Region
+影像 C：10 個 Region
+影像 D：14 個 Region
+--------------------
+總計：46 個 Region
+```
+
+上述四張影像可被組合成同一個 batch。
 
 ---
 
@@ -256,7 +347,7 @@ train:
 
 ## 文字編碼與快取
 
-LightDet 預設使用中文 MacBERT：
+LightDet 預設使用中文 BERT：
 
 ```text
 hfl/chinese-macbert-base
@@ -650,113 +741,7 @@ latest_metrics.json
 
 ---
 
-## 常見問題
 
-### CUDA 無法使用
 
-```bash
-python3 -c "import torch; print(torch.cuda.is_available())"
-```
 
-輸出為 `False` 時，請確認 PyTorch、CUDA Runtime 與顯示卡驅動版本相容。
 
-### GPU 編號錯誤
-
-```yaml
-train:
-  device: cuda:1
-```
-
-代表第 2 張 GPU。單 GPU 主機通常應改為：
-
-```yaml
-train:
-  device: cuda:0
-```
-
-### Image Cache 尺寸不一致
-
-當 `image_size` 改變時，應同步修改或重建 `image_cache_dir`：
-
-```yaml
-data:
-  image_size: 1024
-  image_cache_dir: datasets/.cache/images_1024_uint8
-```
-
-### Checkpoint 出現 Missing Keys
-
-通常代表 checkpoint 與目前模型結構不一致，例如：
-
-```text
-Object Query 數量不同
-Transformer 層數不同
-新增 Stage 2 Query Refinement
-新增 Token Alignment Head
-新增 Auxiliary Head
-```
-
-這類情況應使用 weights-only warm start，並檢查未載入參數是否屬於新模組。
-
-### `enable_nested_tensor` 警告
-
-PyTorch Transformer 可能顯示 nested tensor 的效能提示。若訓練可正常進行，通常不代表模型結構或數值計算錯誤。
-
-### 驗證時仍出現重複框
-
-目前預設不使用 NMS。可先檢查：
-
-```text
-duplicate_suppression loss
-score calibration
-text alignment ranking
-Hungarian matcher score/alignment schedule
-score threshold 與 top-k
-```
-
-如需進行對照實驗，可在 `train.yaml` 暫時啟用：
-
-```yaml
-eval:
-  use_nms: true
-  nms_iou_thr: 0.5
-```
-
----
-
-## 快速啟動
-
-```bash
-git clone https://github.com/ImChouOWO/LightDet.git
-cd LightDet
-
-python3 -m venv venv
-source venv/bin/activate
-
-pip install torch torchvision
-pip install -r requirements.txt
-pip install numpy pyyaml scipy
-
-python3 units/model/train.py
-```
-
----
-
-## Repository
-
-GitHub：`https://github.com/ImChouOWO/LightDet`
-
----
-
-## 專案狀態
-
-LightDet 目前仍處於研究與訓練策略迭代階段。模型結構、Loss、資料格式與 checkpoint 相容性可能隨版本更新而調整。進行長時間訓練前，建議固定當次實驗所使用的：
-
-```text
-Git commit
-model.yaml
-train.yaml
-資料集版本
-文字快取
-負文字 Pool
-```
