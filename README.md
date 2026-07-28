@@ -12,39 +12,47 @@ Image + Text Query -> Bounding Boxes + Scores
 
 ---
 
-## 模型概觀
+## 簡介
 
-LightDet 的資料流可概括為：
+模型資料流：
 
-```text
-影像
-  -> Vision Backbone / Image Projection
-  -> Image Tokens
+```mermaid
+flowchart LR
+    IMG[Image] --> VISION[Vision Backbone<br/>Image Projection]
+    VISION --> IT[Image Tokens]
 
-文字描述
-  -> Chinese MacBERT / Precomputed Text Features
-  -> Text Tokens
+    TXT[Text Query] --> TEXT[BERT-Chinese]
+    TEXT --> TT[Text Tokens]
 
-Image Tokens + Text Tokens + Fusion Tokens
-  -> Stage 1 Localization Transformer
-  -> Object Query Bounding Boxes
-  -> Stage 2 Quality / Text-alignment Refinement Transformer
-  -> Bounding Boxes + Localization Scores + Token Alignment Scores
+    IT --> FUSION[Token Fusion]
+    TT --> FUSION
+    FT[Fusion Tokens] --> FUSION
+
+    FUSION --> S1[Stage 1<br/>Localization Transformer]
+    S1 --> QBOX[Object Queries<br/>Bounding Boxes]
+
+    QBOX --> S2[Stage 2<br/>Quality and Text-alignment<br/>Refinement Transformer]
+    TT --> S2
+
+    S2 --> OUT[Bounding Boxes<br/>Localization Scores<br/>Token Alignment Scores]
 ```
+
+>[!NOTE] </br>
+> 模型淺層時透過FPN擷取圖像資訊，深層時以`Token fusion`融合文字與圖像資訊並透過`Transformer`進行高階語意的擷取。
 
 目前模型包含以下主要設計：
 
 | 模組 | 說明 |
 |---|---|
-| Learnable Object Queries | 使用固定數量的可學習 Query 進行候選物件定位 |
-| Decoder-only Localization | 以 Query 從融合後的影像與文字記憶中擷取定位資訊 |
-| Staged Query Refinement | 第二階段進一步估計定位品質與文字對齊程度 |
-| H-DETR Auxiliary Branch | 訓練期間增加輔助分支，提高正樣本監督密度 |
-| Hungarian Matching | 根據 BBox、GIoU、Score 與文字對齊成本進行一對一匹配 |
-| Token-level Alignment | 學習 Object Query 與文字片段 token 的對應關係 |
-| Duplicate Suppression | 抑制多個 Query 對同一物件產生重複預測 |
-| Hard Negative Mining | 強化高分錯誤候選框與負文字片段的辨識能力 |
-| EMA | 保存模型參數的指數移動平均版本 |
+| `Learnable Object Queries` | 以 `Learnable parameters` 作為Query的學習依據，用於候選物件定位 |
+| `Decoder-only Localization` | 以 `Query` 從融合後的影像與文字記憶中擷取定位資訊 |
+| `Staged Query Refinement` | 第二階段進一步估計定位品質與文字對齊程度 |
+| `H-DETR Auxiliary Branch` | 訓練期間增加輔助分支，提高正樣本監督密度 |
+| `Hungarian Matching` | 根據 `BBox、GIoU、Score` 與文字對齊成本進行一對一匹配 |
+| `Token-level Alignment` | 學習 `Object Query` 與文字片段 token 的對應關係 |
+| `Duplicate Suppression` | 抑制多個 `Query` 對同一物件產生重複預測 |
+| `Hard Negative Mining` | 強化高分錯誤候選框與負文字片段的辨識能力 |
+| `EMA` | 保存模型參數的指數移動平均版本 |
 
 ---
 
