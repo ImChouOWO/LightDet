@@ -1,6 +1,6 @@
 from __future__ import annotations
 import math
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence, Mapping
 import yaml
 
 import os
@@ -1449,24 +1449,119 @@ class ImgProjector(nn.Module):
 class BackBone(nn.Module):
     def __init__(
         self,
-        in_channels_list=(192, 384, 768),
-        out_channels: int = 256,
-    ):
+        in_channels: int = 3,
+        base_channels: Sequence[int] = (
+            64,
+            128,
+            256,
+            512,
+            1024,
+        ),
+        base_depths: Sequence[int] = (
+            2,
+            3,
+            2,
+        ),
+        width_multiple: float = 0.75,
+        depth_multiple: float = 0.67,
+        max_channels: int = 1024,
+        channel_divisor: int = 8,
+        fpn_channels: int = 256,
+        hidden_dim: int = 512,
+        projector_layers: int = 2,
+        projector_expand_ratio: float = 2.0,
+        level_names: Sequence[str] = (
+            "c3",
+            "c4",
+            "c5",
+        ),
+        token_grids: Sequence[Sequence[int]] = (
+            (16, 16),
+            (8, 8),
+            (4, 4),
+        ),
+    ) -> None:
         super().__init__()
 
+        self.bottle_net = BottleNet(
+            in_channels=int(in_channels),
+            base_channels=tuple(int(value) for value in base_channels),
+            base_depths=tuple(int(value) for value in base_depths),
+            width_multiple=float(width_multiple),
+            depth_multiple=float(depth_multiple),
+            max_channels=int(max_channels),
+            channel_divisor=int(channel_divisor),
+        )
+
         self.fpn = FeaturePyramidNetwork(
-            in_channels_list=list(in_channels_list),
-            out_channels=out_channels,
+            in_channels_list=list(self.bottle_net.output_channels),
+            out_channels=int(fpn_channels),
             norm_layer=None,
         )
 
-        self.out_channels = out_channels
+        self.img_projector = ImgProjector(
+            in_channels=int(fpn_channels),
+            out_channels=int(hidden_dim),
+            layer_num=int(projector_layers),
+            expand_ratio=float(projector_expand_ratio),
+            level_names=tuple(str(name) for name in level_names),
+            token_grids=tuple(
+                (int(grid[0]), int(grid[1]))
+                for grid in token_grids
+            ),
+        )
+
+        self.output_channels = self.bottle_net.output_channels
+        self.fpn_channels = int(fpn_channels)
+        self.hidden_dim = int(hidden_dim)
+        self.tokens_per_level = dict(
+            self.img_projector.tokens_per_level
+        )
+        self.num_tokens = int(
+            self.img_projector.num_tokens
+        )
 
     def forward(
         self,
-        features: OrderedDict[str, torch.Tensor],
-    ) -> OrderedDict[str, torch.Tensor]:
-        return self.fpn(features)
+        image: torch.Tensor,
+    ) -> torch.Tensor:
+        if not torch.is_tensor(image):
+            raise TypeError(
+                "BackBone input must be torch.Tensor, "
+                f"got {type(image).__name__}"
+            )
+
+        if image.ndim != 4:
+            raise ValueError(
+                "BackBone input must have shape [B, C, H, W], "
+                f"got {tuple(image.shape)}"
+            )
+
+        features = self.bottle_net(image)
+        fpn_features = self.fpn(features)
+        image_tokens = self.img_projector(
+            fpn_features
+        )
+
+        if image_tokens.ndim != 3:
+            raise RuntimeError(
+                "BackBone output must have shape [B, N, C], "
+                f"got {tuple(image_tokens.shape)}"
+            )
+
+        if int(image_tokens.shape[1]) != self.num_tokens:
+            raise RuntimeError(
+                "BackBone image token count mismatch: "
+                f"{image_tokens.shape[1]} != {self.num_tokens}"
+            )
+
+        if int(image_tokens.shape[2]) != self.hidden_dim:
+            raise RuntimeError(
+                "BackBone hidden dimension mismatch: "
+                f"{image_tokens.shape[2]} != {self.hidden_dim}"
+            )
+
+        return image_tokens
 
 
 class BottleNet(nn.Module):
@@ -2000,7 +2095,7 @@ class _BaseVisionTextModel(nn.Module):
     Decoder-only, object-query-based LightDet model.
 
     Shared context:
-        BottleNet -> image projector -> Image Tokens
+        BottleNet -> FPN -> image projector -> Image Tokens
         BERT -> Text Tokens
         FusionBlock -> Fusion Tokens
 
@@ -2023,44 +2118,74 @@ class _BaseVisionTextModel(nn.Module):
 
     def __init__(
         self,
-        img_in_channels=1024,
-        hidden_dim=512,
-        target_size=(20, 20),
-        text_max_length=32,
-        fusion_token_num=16,
-        num_object_queries=100,
-        num_heads=8,
-        num_layers=1,
-        mlp_ratio=4.0,
-        dropout=0.1,
-        freeze_bert=True,
-        precomputed_bert_path=None,
-        use_auxiliary_head=True,
-        auxiliary_in_eval=False,
-        initialize_aux_from_main=True,
-        query_init_std=0.02,
-        query_group_init_std=0.02,
-        cnn_layer=3,
-    ):
+        backbone_config: Mapping[str, Any],
+        fpn_config: Mapping[str, Any],
+        image_projector_config: Mapping[str, Any],
+        hidden_dim: int = 512,
+        text_max_length: int = 256,
+        fusion_token_num: int = 16,
+        num_object_queries: int = 100,
+        num_heads: int = 8,
+        num_layers: int = 2,
+        mlp_ratio: float = 3.5,
+        dropout: float = 0.1,
+        freeze_bert: bool = True,
+        precomputed_bert_path: str | None = None,
+        use_auxiliary_head: bool = True,
+        auxiliary_in_eval: bool = False,
+        initialize_aux_from_main: bool = True,
+        query_init_std: float = 0.02,
+        query_group_init_std: float = 0.02,
+        freeze_img_projection: bool = False,
+    ) -> None:
         super().__init__()
 
-        if len(target_size) != 2:
-            raise ValueError(
-                "target_size must contain two dimensions, "
-                f"got {target_size}"
+        if not isinstance(backbone_config, Mapping):
+            raise TypeError(
+                "backbone_config must be a mapping, "
+                f"got {type(backbone_config).__name__}"
             )
 
+        if not isinstance(fpn_config, Mapping):
+            raise TypeError(
+                "fpn_config must be a mapping, "
+                f"got {type(fpn_config).__name__}"
+            )
+
+        if not isinstance(image_projector_config, Mapping):
+            raise TypeError(
+                "image_projector_config must be a mapping, "
+                f"got {type(image_projector_config).__name__}"
+            )
+
+        backbone_config = dict(backbone_config)
+        fpn_config = dict(fpn_config)
+        image_projector_config = dict(image_projector_config)
+
         self.hidden_dim = int(hidden_dim)
-        self.target_size = (
-            int(target_size[0]),
-            int(target_size[1]),
-        )
-        self.fusion_token_num = int(
-            fusion_token_num
-        )
-        self.num_object_queries = int(
-            num_object_queries
-        )
+        self.fusion_token_num = int(fusion_token_num)
+        self.num_object_queries = int(num_object_queries)
+        self.num_text = int(text_max_length)
+
+        self.num_heads = int(num_heads)
+        self.num_layers = int(num_layers)
+        self.mlp_ratio = float(mlp_ratio)
+        self.dropout = float(dropout)
+
+        self.use_auxiliary_head = bool(use_auxiliary_head)
+        self.auxiliary_in_eval = bool(auxiliary_in_eval)
+        self.freeze_img_projection = bool(freeze_img_projection)
+
+        if self.hidden_dim <= 0:
+            raise ValueError(
+                f"hidden_dim must be > 0, got {self.hidden_dim}"
+            )
+
+        if self.fusion_token_num <= 0:
+            raise ValueError(
+                "fusion_token_num must be > 0, "
+                f"got {self.fusion_token_num}"
+            )
 
         if self.num_object_queries <= 0:
             raise ValueError(
@@ -2068,43 +2193,120 @@ class _BaseVisionTextModel(nn.Module):
                 f"got {self.num_object_queries}"
             )
 
-        self.num_image = (
-            self.target_size[0]
-            * self.target_size[1]
-        )
-        self.num_text = int(
-            text_max_length
+        if self.num_text <= 0:
+            raise ValueError(
+                f"text_max_length must be > 0, got {self.num_text}"
+            )
+
+        if self.num_heads <= 0:
+            raise ValueError(
+                f"num_heads must be > 0, got {self.num_heads}"
+            )
+
+        if self.hidden_dim % self.num_heads != 0:
+            raise ValueError(
+                f"hidden_dim={self.hidden_dim} must be divisible by "
+                f"num_heads={self.num_heads}"
+            )
+
+        if self.num_layers <= 0:
+            raise ValueError(
+                f"num_layers must be > 0, got {self.num_layers}"
+            )
+
+        if self.mlp_ratio <= 0:
+            raise ValueError(
+                f"mlp_ratio must be > 0, got {self.mlp_ratio}"
+            )
+
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError(
+                f"dropout must be in [0, 1), got {self.dropout}"
+            )
+
+        fpn_channels = int(fpn_config["out_channels"])
+
+        projector_in_channels = int(
+            image_projector_config.get("in_channels", fpn_channels)
         )
 
-        self.use_auxiliary_head = bool(
-            use_auxiliary_head
-        )
-        self.auxiliary_in_eval = bool(
-            auxiliary_in_eval
+        projector_out_channels = int(
+            image_projector_config.get("out_channels", self.hidden_dim)
         )
 
-        self.bottle_net = BottleNet(
-            in_channels=3,
-            out_channels=img_in_channels,
+        if projector_in_channels != fpn_channels:
+            raise ValueError(
+                "image_projector.in_channels must match "
+                "fpn.out_channels: "
+                f"{projector_in_channels} != {fpn_channels}"
+            )
+
+        if projector_out_channels != self.hidden_dim:
+            raise ValueError(
+                "image_projector.out_channels must match hidden_dim: "
+                f"{projector_out_channels} != {self.hidden_dim}"
+            )
+
+        level_names = tuple(
+            str(name)
+            for name in image_projector_config["level_names"]
         )
+
+        token_grids = tuple(
+            (int(grid[0]), int(grid[1]))
+            for grid in image_projector_config["token_grids"]
+        )
+
+        if len(level_names) == 0:
+            raise ValueError(
+                "image_projector.level_names must not be empty"
+            )
+
+        if len(level_names) != len(token_grids):
+            raise ValueError(
+                "image_projector.level_names and token_grids "
+                "must have the same length"
+            )
 
         self.img_model = BackBone(
-            in_channels=img_in_channels,
-            out_channels=hidden_dim,
-            target_size=self.target_size,
-            layer_num=cnn_layer,
+            in_channels=int(backbone_config["in_channels"]),
+            base_channels=tuple(
+                int(value)
+                for value in backbone_config["base_channels"]
+            ),
+            base_depths=tuple(
+                int(value)
+                for value in backbone_config["base_depths"]
+            ),
+            width_multiple=float(backbone_config["width_multiple"]),
+            depth_multiple=float(backbone_config["depth_multiple"]),
+            max_channels=int(backbone_config["max_channels"]),
+            channel_divisor=int(
+                backbone_config.get("channel_divisor", 8)
+            ),
+            fpn_channels=fpn_channels,
+            hidden_dim=self.hidden_dim,
+            projector_layers=int(
+                image_projector_config["layer_num"]
+            ),
+            projector_expand_ratio=float(
+                image_projector_config["expand_ratio"]
+            ),
+            level_names=level_names,
+            token_grids=token_grids,
         )
 
-        # Learned 2D-grid position embedding after flattening the projected
-        # target_size feature map. This gives object queries explicit spatial
-        # information when reading image tokens.
-        self.image_position_embeddings = nn.Parameter(
-            torch.zeros(
-                1,
-                self.num_image,
-                self.hidden_dim,
+        self.num_image = int(self.img_model.num_tokens)
+
+        if self.num_image <= 0:
+            raise RuntimeError(
+                f"img_model.num_tokens must be > 0, got {self.num_image}"
             )
+
+        self.image_position_embeddings = nn.Parameter(
+            torch.zeros(1, self.num_image, self.hidden_dim)
         )
+
         nn.init.normal_(
             self.image_position_embeddings,
             mean=0.0,
@@ -2112,17 +2314,17 @@ class _BaseVisionTextModel(nn.Module):
         )
 
         self.text_model = Bert(
-            out_dim=hidden_dim,
-            max_length=text_max_length,
-            freeze_bert=freeze_bert,
+            out_dim=self.hidden_dim,
+            max_length=self.num_text,
+            freeze_bert=bool(freeze_bert),
             precomputed_bert_path=precomputed_bert_path,
         )
 
-        # Independent learned search slots for Main and Aux branches.
         self.main_object_queries = nn.Embedding(
             self.num_object_queries,
             self.hidden_dim,
         )
+
         self.aux_object_queries = (
             nn.Embedding(
                 self.num_object_queries,
@@ -2137,6 +2339,7 @@ class _BaseVisionTextModel(nn.Module):
             mean=0.0,
             std=float(query_init_std),
         )
+
         if self.aux_object_queries is not None:
             nn.init.normal_(
                 self.aux_object_queries.weight,
@@ -2145,24 +2348,22 @@ class _BaseVisionTextModel(nn.Module):
             )
 
         self.transformer = TransformerBlock(
-            hidden_dim=hidden_dim,
-            fusion_token_num=fusion_token_num,
-            num_heads=num_heads,
-            num_layers=num_layers,
-            mlp_ratio=mlp_ratio,
-            dropout=dropout,
-            query_group_init_std=query_group_init_std,
+            hidden_dim=self.hidden_dim,
+            fusion_token_num=self.fusion_token_num,
+            num_heads=self.num_heads,
+            num_layers=self.num_layers,
+            mlp_ratio=self.mlp_ratio,
+            dropout=self.dropout,
+            query_group_init_std=float(query_group_init_std),
         )
 
-        # Keep the "head.*" namespace for checkpoint compatibility. The
-        # parameter names inside QueryHead match the previous DenseHead.
         self.head = QueryHead(
-            hidden_dim=hidden_dim,
+            hidden_dim=self.hidden_dim,
         )
 
         self.aux_head = (
             QueryHead(
-                hidden_dim=hidden_dim,
+                hidden_dim=self.hidden_dim,
             )
             if self.use_auxiliary_head
             else None
@@ -2173,6 +2374,11 @@ class _BaseVisionTextModel(nn.Module):
             and bool(initialize_aux_from_main)
         ):
             self.initialize_auxiliary_head_from_main()
+
+        for parameter in self.img_model.parameters():
+            parameter.requires_grad_(
+                not self.freeze_img_projection
+            )
 
     @property
     def main_head(self):
@@ -2372,12 +2578,11 @@ class _BaseVisionTextModel(nn.Module):
         image_indices=None,
         return_aux=None,
     ):
-        img = self.bottle_net(img)
         img_token = self.img_model(img)
 
         if int(img_token.shape[1]) != self.num_image:
             raise RuntimeError(
-                "Image token count does not match configured target_size: "
+                "Image token count does not match configured multi-scale grids: "
                 f"{img_token.shape[1]} != {self.num_image}"
             )
 
@@ -2587,6 +2792,9 @@ class VisionTextModel(_BaseVisionTextModel):
     def __init__(
         self,
         *args: Any,
+        backbone_config: Optional[Mapping[str, Any]] = None,
+        fpn_config: Optional[Mapping[str, Any]] = None,
+        image_projector_config: Optional[Mapping[str, Any]] = None,
         staged_query_refinement: Optional[bool] = None,
         score_num_heads: Optional[int] = None,
         score_num_layers: Optional[int] = None,
@@ -2600,81 +2808,191 @@ class VisionTextModel(_BaseVisionTextModel):
         **kwargs: Any,
     ) -> None:
         defaults = _read_model_defaults()
-        super().__init__(*args, **kwargs)
 
         def resolve(name: str, value: Any, fallback: Any) -> Any:
-            return defaults.get(name, fallback) if value is None else value
+            if value is not None:
+                return value
 
-        self.staged_query_refinement = bool(resolve(
-            "staged_query_refinement",
-            staged_query_refinement,
-            True,
-        ))
-        self.score_bbox_conditioning = bool(resolve(
-            "score_bbox_conditioning",
-            score_bbox_conditioning,
-            True,
-        ))
-        self.score_bbox_detach = bool(resolve(
-            "score_bbox_detach",
-            score_bbox_detach,
-            True,
-        ))
-        self.freeze_img_projection = bool(resolve(
-            "freeze_img_projection",
-            freeze_img_projection,
-            False,
-        ))
-        score_fusion = str(resolve(
-            "score_fusion",
-            score_fusion,
-            "geometric_mean",
-        ))
-        score_fusion_eps = float(resolve(
-            "score_fusion_eps",
-            score_fusion_eps,
-            1e-6,
-        ))
+            return defaults.get(name, fallback)
+
+        if backbone_config is None:
+            backbone_config = defaults.get("backbone")
+
+        if fpn_config is None:
+            fpn_config = defaults.get("fpn")
+
+        if image_projector_config is None:
+            image_projector_config = defaults.get("image_projector")
+
+        if not isinstance(backbone_config, Mapping):
+            raise TypeError(
+                "backbone_config must be a mapping, "
+                f"got {type(backbone_config).__name__}"
+            )
+
+        if not isinstance(fpn_config, Mapping):
+            raise TypeError(
+                "fpn_config must be a mapping, "
+                f"got {type(fpn_config).__name__}"
+            )
+
+        if not isinstance(image_projector_config, Mapping):
+            raise TypeError(
+                "image_projector_config must be a mapping, "
+                f"got {type(image_projector_config).__name__}"
+            )
+
+        resolved_freeze_img_projection = bool(
+            resolve(
+                "freeze_img_projection",
+                freeze_img_projection,
+                False,
+            )
+        )
+
+        super().__init__(
+            *args,
+            backbone_config=dict(backbone_config),
+            fpn_config=dict(fpn_config),
+            image_projector_config=dict(image_projector_config),
+            freeze_img_projection=resolved_freeze_img_projection,
+            **kwargs,
+        )
+
+        self.staged_query_refinement = bool(
+            resolve(
+                "staged_query_refinement",
+                staged_query_refinement,
+                True,
+            )
+        )
+
+        self.score_bbox_conditioning = bool(
+            resolve(
+                "score_bbox_conditioning",
+                score_bbox_conditioning,
+                True,
+            )
+        )
+
+        self.score_bbox_detach = bool(
+            resolve(
+                "score_bbox_detach",
+                score_bbox_detach,
+                True,
+            )
+        )
+
+        self.freeze_img_projection = resolved_freeze_img_projection
+
+        resolved_score_fusion = str(
+            resolve(
+                "score_fusion",
+                score_fusion,
+                "geometric_mean",
+            )
+        )
+
+        resolved_score_fusion_eps = float(
+            resolve(
+                "score_fusion_eps",
+                score_fusion_eps,
+                1e-6,
+            )
+        )
+
+        resolved_score_num_heads = int(
+            resolve(
+                "score_num_heads",
+                score_num_heads,
+                defaults.get("num_heads", 8),
+            )
+        )
+
+        resolved_score_num_layers = int(
+            resolve(
+                "score_num_layers",
+                score_num_layers,
+                2,
+            )
+        )
+
+        resolved_score_mlp_ratio = float(
+            resolve(
+                "score_mlp_ratio",
+                score_mlp_ratio,
+                3.0,
+            )
+        )
+
+        resolved_score_dropout = float(
+            resolve(
+                "score_dropout",
+                score_dropout,
+                defaults.get("dropout", 0.1),
+            )
+        )
+
+        if resolved_score_num_heads <= 0:
+            raise ValueError("score_num_heads must be > 0")
+
+        if self.hidden_dim % resolved_score_num_heads != 0:
+            raise ValueError(
+                f"hidden_dim={self.hidden_dim} must be divisible by "
+                f"score_num_heads={resolved_score_num_heads}"
+            )
+
+        if resolved_score_num_layers <= 0:
+            raise ValueError("score_num_layers must be > 0")
+
+        if resolved_score_mlp_ratio <= 0:
+            raise ValueError("score_mlp_ratio must be > 0")
+
+        if not 0.0 <= resolved_score_dropout < 1.0:
+            raise ValueError("score_dropout must be in [0, 1)")
+
+        if resolved_score_fusion_eps <= 0:
+            raise ValueError("score_fusion_eps must be > 0")
 
         for prediction_head in (self.head, self.aux_head):
             if prediction_head is None:
                 continue
-            prediction_head.fusion_eps = max(score_fusion_eps, 1e-8)
-            prediction_head.set_score_fusion(score_fusion)
+
+            prediction_head.fusion_eps = max(
+                resolved_score_fusion_eps,
+                1e-8,
+            )
+
+            prediction_head.set_score_fusion(
+                resolved_score_fusion
+            )
+
+        if self.head is None:
+            raise RuntimeError(
+                "VisionTextModel requires a main prediction head"
+            )
 
         self.score_fusion = self.head.score_fusion
         self.score_fusion_eps = self.head.fusion_eps
 
         self.score_transformer = TransformerBlock(
             hidden_dim=self.hidden_dim,
-            fusion_token_num=int(defaults.get(
-                "fusion_token_num",
-                self.fusion_token_num,
-            )),
-            num_heads=int(resolve(
-                "score_num_heads",
-                score_num_heads,
-                defaults.get("num_heads", 8),
-            )),
-            num_layers=int(resolve(
-                "score_num_layers",
-                score_num_layers,
-                2,
-            )),
-            mlp_ratio=float(resolve(
-                "score_mlp_ratio",
-                score_mlp_ratio,
-                3.0,
-            )),
-            dropout=float(resolve(
-                "score_dropout",
-                score_dropout,
-                defaults.get("dropout", 0.1),
-            )),
-            query_group_init_std=float(defaults.get(
-                "query_group_init_std",
-                0.02,
-            )),
+            fusion_token_num=int(
+                defaults.get(
+                    "fusion_token_num",
+                    self.fusion_token_num,
+                )
+            ),
+            num_heads=resolved_score_num_heads,
+            num_layers=resolved_score_num_layers,
+            mlp_ratio=resolved_score_mlp_ratio,
+            dropout=resolved_score_dropout,
+            query_group_init_std=float(
+                defaults.get(
+                    "query_group_init_std",
+                    0.02,
+                )
+            ),
         )
 
         self.bbox_query_encoder = nn.Sequential(
@@ -2684,10 +3002,10 @@ class VisionTextModel(_BaseVisionTextModel):
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
 
-        # Explicitly keep the image projection trainable unless YAML requests
-        # otherwise. The stronger-ranking configuration sets this to false.
         for parameter in self.img_model.parameters():
-            parameter.requires_grad_(not self.freeze_img_projection)
+            parameter.requires_grad_(
+                not self.freeze_img_projection
+            )
 
 
     def _prepare_legacy_state_dict(self, state_dict):
@@ -2987,23 +3305,28 @@ class VisionTextModel(_BaseVisionTextModel):
 
 
 def test_img_projector():
-    bottle_net = BottleNet(
+    model = BackBone(
         in_channels=3,
+        base_channels=(
+            64,
+            128,
+            256,
+            512,
+            1024,
+        ),
+        base_depths=(
+            2,
+            3,
+            2,
+        ),
         width_multiple=0.75,
         depth_multiple=0.67,
         max_channels=1024,
-    )
-
-    backbone = BackBone(
-        in_channels_list=bottle_net.output_channels,
-        out_channels=256,
-    )
-
-    img_projector = ImgProjector(
-        in_channels=256,
-        out_channels=512,
-        layer_num=2,
-        expand_ratio=2.0,
+        channel_divisor=8,
+        fpn_channels=256,
+        hidden_dim=512,
+        projector_layers=2,
+        projector_expand_ratio=2.0,
         level_names=(
             "c3",
             "c4",
@@ -3016,9 +3339,7 @@ def test_img_projector():
         ),
     )
 
-    bottle_net.eval()
-    backbone.eval()
-    img_projector.eval()
+    model.eval()
 
     image = torch.randn(
         1,
@@ -3028,34 +3349,31 @@ def test_img_projector():
     )
 
     with torch.no_grad():
-        bottle_features = bottle_net(
-            image
-        )
+        image_tokens = model(image)
 
-        fpn_features = backbone(
-            bottle_features
-        )
+    print(
+        "Backbone channels:",
+        model.bottle_net.channels,
+    )
 
-        image_tokens = img_projector(
-            fpn_features
-        )
+    print(
+        "Backbone depths:",
+        model.bottle_net.depths,
+    )
 
-    print("FPN features:")
-
-    for name, feature in fpn_features.items():
-        print(
-            name,
-            tuple(feature.shape),
-        )
+    print(
+        "FPN input channels:",
+        model.bottle_net.output_channels,
+    )
 
     print(
         "tokens per level:",
-        img_projector.tokens_per_level,
+        model.tokens_per_level,
     )
 
     print(
         "total tokens:",
-        img_projector.num_tokens,
+        model.num_tokens,
     )
 
     print(
