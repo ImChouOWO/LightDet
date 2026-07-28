@@ -16,26 +16,14 @@ Image + Text Query -> Bounding Boxes + Scores
 
 ### 模型資料流：
 
-```mermaid
-flowchart LR
-    IMG[Image] --> VISION[Vision Backbone<br/>Image Projection]
-    VISION --> IT[Image Tokens]
+![模型資料流](https://github.com/ImChouOWO/LightDet/blob/main/img/dataFlow.png)
 
-    TXT[Text Query] --> TEXT[BERT-Chinese]
-    TEXT --> TT[Text Tokens]
+>[!NOTE] 
+> `訓練時`，模型輸出候選框與分數，經 Hungarian Matcher 與 Ground Truth 配對後計算 Loss</br>
+> `推論時`，依分預測數進行Threshold 與 Top-K 篩選最終結果
 
-    IT --> FUSION[Token Fusion]
-    TT --> FUSION
-    FT[Fusion Tokens] --> FUSION
+---
 
-    FUSION --> S1[Stage 1<br/>Localization Transformer]
-    S1 --> QBOX[Object Queries<br/>Bounding Boxes]
-
-    QBOX --> S2[Stage 2<br/>Quality and Text-alignment<br/>Refinement Transformer]
-    TT --> S2
-
-    S2 --> OUT[Bounding Boxes<br/>Localization Scores<br/>Token Alignment Scores]
-```
 ### 模型結構
 ![模型架構](https://github.com/ImChouOWO/LightDet/blob/main/img/LightDet.png)
 
