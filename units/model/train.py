@@ -2537,20 +2537,20 @@ def train(args: SimpleNamespace) -> None:
     )
 
     args.precomputed_bert_path = ensure_precomputed_bert_raw_cache(
-        cache_path=args.precomputed_bert_path,
-        datasets=[train_loader.dataset, val_loader.dataset],
-        device=device,
-        hidden_dim=args.hidden_dim,
-        max_length=args.text_max_length,
-        batch_size=max(128, args.batch_size),
-        enabled=bool(args.freeze_bert),
+    cache_path=args.precomputed_bert_path,
+    datasets=[train_loader.dataset, val_loader.dataset],
+    device=device,
+    hidden_dim=args.hidden_dim,
+    max_length=args.text_max_length,
+    batch_size=max(128, args.batch_size),
+    enabled=bool(args.freeze_bert),
     )
 
     model = VisionTextModel(
-        img_in_channels=args.img_in_channels,
-        cnn_layer= args.cnn_layers,
+        backbone_config=args.backbone_config,
+        fpn_config=args.fpn_config,
+        image_projector_config=args.image_projector_config,
         hidden_dim=args.hidden_dim,
-        target_size=(args.target_size, args.target_size),
         text_max_length=args.text_max_length,
         fusion_token_num=args.fusion_token_num,
         num_object_queries=args.num_object_queries,
@@ -2564,10 +2564,51 @@ def train(args: SimpleNamespace) -> None:
         auxiliary_in_eval=args.auxiliary_in_eval,
         initialize_aux_from_main=args.initialize_aux_from_main,
         query_group_init_std=args.query_group_init_std,
+        staged_query_refinement=args.staged_query_refinement,
+        score_num_heads=args.score_num_heads,
+        score_num_layers=args.score_num_layers,
+        score_mlp_ratio=args.score_mlp_ratio,
+        score_dropout=args.score_dropout,
+        score_bbox_conditioning=args.score_bbox_conditioning,
+        score_bbox_detach=args.score_bbox_detach,
+        freeze_img_projection=args.freeze_img_projection,
+        score_fusion=args.score_fusion,
+        score_fusion_eps=args.score_fusion_eps,
     ).to(device)
 
+    if not hasattr(model, "img_model"):
+        raise RuntimeError(
+            "VisionTextModel does not contain img_model"
+        )
+
+    if not hasattr(model, "num_image"):
+        raise RuntimeError(
+            "VisionTextModel does not contain num_image"
+        )
+
+    expected_num_image = sum(
+        int(grid[0]) * int(grid[1])
+        for grid in args.image_projector_config["token_grids"]
+    )
+
+    if int(model.num_image) != expected_num_image:
+        raise RuntimeError(
+            "Image token count mismatch: "
+            f"model={model.num_image}, "
+            f"config={expected_num_image}"
+        )
+
+    if int(model.hidden_dim) != int(args.hidden_dim):
+        raise RuntimeError(
+            "Hidden dimension mismatch: "
+            f"model={model.hidden_dim}, "
+            f"config={args.hidden_dim}"
+        )
+
     if args.channels_last:
-        model = model.to(memory_format=torch.channels_last)
+        model = model.to(
+            memory_format=torch.channels_last
+        )
 
     ema = (
         ModelEMA(
@@ -3649,7 +3690,7 @@ def main() -> None:
         model=str("/home/soic/Desktop/LightDet/units/model/cards/config/model.yaml"),
     )
     model.train(
-        cfg=str("/home/soic/Desktop/LightDet/units/model/cards/config/train_pos.yaml"),
+        cfg=str("/home/soic/Desktop/LightDet/units/model/cards/config/train.yaml"),
     )
 
 

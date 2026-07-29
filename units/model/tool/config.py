@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
@@ -66,10 +65,166 @@ def _require_sections(config: Dict[str, Any], sections, path: str) -> None:
         raise KeyError(f"Missing config sections in {path}: {missing}")
 
 
+def _require_mapping(value: Any, name: str, path: str) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise TypeError(
+            f"{name} must be a mapping in {path}, "
+            f"got {type(value).__name__}"
+        )
+    return value
+
+
+def _require_keys(
+    config: Dict[str, Any],
+    keys,
+    name: str,
+    path: str,
+) -> None:
+    missing = [key for key in keys if key not in config]
+    if missing:
+        raise KeyError(
+            f"Missing keys in {name} from {path}: {missing}"
+        )
+
+
+def _validate_model_config(config: Dict[str, Any], path: str) -> None:
+    model = _require_mapping(config["model"], "model", path)
+    _require_keys(
+        model,
+        (
+            "hidden_dim",
+            "backbone",
+            "fpn",
+            "image_projector",
+            "num_object_queries",
+            "query_group_init_std",
+            "fusion_token_num",
+            "num_heads",
+            "num_layers",
+            "mlp_ratio",
+            "dropout",
+            "text_max_length",
+            "freeze_bert",
+        ),
+        "model",
+        path,
+    )
+
+    backbone = _require_mapping(
+        model["backbone"],
+        "model.backbone",
+        path,
+    )
+    fpn = _require_mapping(
+        model["fpn"],
+        "model.fpn",
+        path,
+    )
+    projector = _require_mapping(
+        model["image_projector"],
+        "model.image_projector",
+        path,
+    )
+
+    _require_keys(
+        backbone,
+        (
+            "in_channels",
+            "base_channels",
+            "base_depths",
+            "width_multiple",
+            "depth_multiple",
+            "max_channels",
+        ),
+        "model.backbone",
+        path,
+    )
+    _require_keys(
+        fpn,
+        ("out_channels",),
+        "model.fpn",
+        path,
+    )
+    _require_keys(
+        projector,
+        (
+            "in_channels",
+            "out_channels",
+            "layer_num",
+            "expand_ratio",
+            "level_names",
+            "token_grids",
+        ),
+        "model.image_projector",
+        path,
+    )
+
+    base_channels = backbone["base_channels"]
+    base_depths = backbone["base_depths"]
+    level_names = projector["level_names"]
+    token_grids = projector["token_grids"]
+
+    if not isinstance(base_channels, (list, tuple)) or len(base_channels) != 5:
+        raise ValueError(
+            "model.backbone.base_channels must contain 5 values"
+        )
+
+    if not isinstance(base_depths, (list, tuple)) or len(base_depths) != 3:
+        raise ValueError(
+            "model.backbone.base_depths must contain 3 values"
+        )
+
+    if not isinstance(level_names, (list, tuple)) or not level_names:
+        raise ValueError(
+            "model.image_projector.level_names must not be empty"
+        )
+
+    if not isinstance(token_grids, (list, tuple)):
+        raise TypeError(
+            "model.image_projector.token_grids must be a sequence"
+        )
+
+    if len(level_names) != len(token_grids):
+        raise ValueError(
+            "model.image_projector.level_names and token_grids "
+            "must have the same length"
+        )
+
+    for index, grid in enumerate(token_grids):
+        if not isinstance(grid, (list, tuple)) or len(grid) != 2:
+            raise ValueError(
+                "Each model.image_projector.token_grids entry "
+                f"must contain 2 values, got index {index}: {grid}"
+            )
+        if int(grid[0]) <= 0 or int(grid[1]) <= 0:
+            raise ValueError(
+                "Each model.image_projector.token_grids value "
+                f"must be > 0, got index {index}: {grid}"
+            )
+
+    hidden_dim = int(model["hidden_dim"])
+    fpn_out_channels = int(fpn["out_channels"])
+    projector_in_channels = int(projector["in_channels"])
+    projector_out_channels = int(projector["out_channels"])
+
+    if projector_in_channels != fpn_out_channels:
+        raise ValueError(
+            "model.image_projector.in_channels must equal "
+            "model.fpn.out_channels"
+        )
+
+    if projector_out_channels != hidden_dim:
+        raise ValueError(
+            "model.image_projector.out_channels must equal "
+            "model.hidden_dim"
+        )
+
+
 def load_model_config(path: Optional[str] = None) -> Dict[str, Any]:
     config_path = str(path or DEFAULT_MODEL_CONFIG_PATH)
     config = load_yaml(config_path)
     _require_sections(config, ("model",), config_path)
+    _validate_model_config(config, config_path)
     model = config["model"]
     model["precomputed_bert_path"] = _project_path(
         model.get("precomputed_bert_path")
@@ -95,20 +250,105 @@ def load_train_config(path: Optional[str] = None) -> Dict[str, Any]:
 
 def normalize_device(device: Any) -> str:
     if device is None:
-        return "cuda:0" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            return "cuda:0"
+
+        if (
+            hasattr(torch.backends, "mps")
+            and torch.backends.mps.is_available()
+        ):
+            return "mps"
+
+        return "cpu"
+
+    if isinstance(device, bool):
+        raise TypeError(
+            "device cannot be bool"
+        )
 
     if isinstance(device, int):
-        return f"cuda:{device}" if torch.cuda.is_available() else "cpu"
+        device = f"cuda:{device}"
 
-    if isinstance(device, str):
-        device = device.strip()
+    elif isinstance(device, str):
+        device = device.strip().lower()
+
+        if not device:
+            raise ValueError(
+                "device cannot be empty"
+            )
 
         if device.isdigit():
-            return f"cuda:{device}" if torch.cuda.is_available() else "cpu"
+            device = f"cuda:{device}"
 
-        return device
+    else:
+        raise TypeError(
+            "Unsupported device type: "
+            f"{type(device).__name__}"
+        )
 
-    raise TypeError(f"Unsupported device type: {type(device)}")
+    if device == "auto":
+        if torch.cuda.is_available():
+            return "cuda:0"
+
+        if (
+            hasattr(torch.backends, "mps")
+            and torch.backends.mps.is_available()
+        ):
+            return "mps"
+
+        return "cpu"
+
+    if device == "cpu":
+        return "cpu"
+
+    if device == "mps":
+        mps_available = (
+            hasattr(torch.backends, "mps")
+            and torch.backends.mps.is_available()
+        )
+
+        if not mps_available:
+            raise RuntimeError(
+                "MPS was requested, but it is not available"
+            )
+
+        return "mps"
+
+    if device == "cuda":
+        device = "cuda:0"
+
+    if device.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested, but CUDA is not available"
+            )
+
+        index_text = device.split(":", maxsplit=1)[1]
+
+        if not index_text.isdigit():
+            raise ValueError(
+                "CUDA device must use format cuda:N, "
+                f"got {device!r}"
+            )
+
+        device_index = int(index_text)
+        device_count = torch.cuda.device_count()
+
+        if device_index < 0 or device_index >= device_count:
+            raise ValueError(
+                "CUDA device index is out of range: "
+                f"requested={device_index}, "
+                f"available=0-{device_count - 1}"
+            )
+
+        return f"cuda:{device_index}"
+
+    raise ValueError(
+        "Unsupported device value: "
+        f"{device!r}. "
+        "Supported values are auto, cpu, mps, "
+        "cuda, cuda:N, or integer N."
+    )
 
 
 def _parse_component_schedule(
@@ -175,6 +415,13 @@ def cfg_to_args(
     train_cfg_all: Dict[str, Any],
 ) -> SimpleNamespace:
     model_cfg = model_cfg_all["model"]
+
+    backbone_cfg = model_cfg["backbone"]
+    fpn_cfg = model_cfg["fpn"]
+    image_projector_cfg = model_cfg[
+        "image_projector"
+    ]
+
     data_cfg = train_cfg_all["data"]
     train_cfg = train_cfg_all["train"]
     optim_cfg = train_cfg_all["optim"]
@@ -307,7 +554,7 @@ def cfg_to_args(
         batch_size=train_cfg["batch_size"],
         warmup_epochs=train_cfg["warmup_epochs"],
         num_workers=train_cfg["num_workers"],
-        device=train_cfg["device"],
+        device=normalize_device(train_cfg.get("device")),
         seed=train_cfg["seed"],
         deterministic=train_cfg["deterministic"],
         use_amp=train_cfg["use_amp"],
@@ -328,30 +575,219 @@ def cfg_to_args(
         startup_smoke_test=train_cfg.get("startup_smoke_test", True),
 
         # model
-        img_in_channels=model_cfg["img_in_channels"],
-        cnn_layers = model_cfg.get("cnn_layers"),
-        hidden_dim=model_cfg["hidden_dim"],
-        target_size=model_cfg["image_grid_size"],
-        text_max_length=model_cfg["text_max_length"],
-        fusion_token_num=model_cfg["fusion_token_num"],
-        num_object_queries=int(model_cfg.get("num_object_queries", 100)),
+        backbone_config={
+            "in_channels": int(
+                backbone_cfg["in_channels"]
+            ),
+            "base_channels": tuple(
+                int(value)
+                for value in backbone_cfg[
+                    "base_channels"
+                ]
+            ),
+            "base_depths": tuple(
+                int(value)
+                for value in backbone_cfg[
+                    "base_depths"
+                ]
+            ),
+            "width_multiple": float(
+                backbone_cfg["width_multiple"]
+            ),
+            "depth_multiple": float(
+                backbone_cfg["depth_multiple"]
+            ),
+            "max_channels": int(
+                backbone_cfg["max_channels"]
+            ),
+            "channel_divisor": int(
+                backbone_cfg.get(
+                    "channel_divisor",
+                    8,
+                )
+            ),
+        },
+
+        fpn_config={
+            "out_channels": int(
+                fpn_cfg["out_channels"]
+            ),
+            "norm_layer": fpn_cfg.get(
+                "norm_layer"
+            ),
+        },
+
+        image_projector_config={
+            "in_channels": int(
+                image_projector_cfg[
+                    "in_channels"
+                ]
+            ),
+            "out_channels": int(
+                image_projector_cfg[
+                    "out_channels"
+                ]
+            ),
+            "layer_num": int(
+                image_projector_cfg[
+                    "layer_num"
+                ]
+            ),
+            "expand_ratio": float(
+                image_projector_cfg[
+                    "expand_ratio"
+                ]
+            ),
+            "level_names": tuple(
+                str(value)
+                for value in image_projector_cfg[
+                    "level_names"
+                ]
+            ),
+            "token_grids": tuple(
+                (
+                    int(grid[0]),
+                    int(grid[1]),
+                )
+                for grid in image_projector_cfg[
+                    "token_grids"
+                ]
+            ),
+        },
+
+        hidden_dim=int(
+            model_cfg["hidden_dim"]
+        ),
+
+        freeze_img_projection=bool(
+            model_cfg.get(
+                "freeze_img_projection",
+                False,
+            )
+        ),
+
+        num_object_queries=int(
+            model_cfg["num_object_queries"]
+        ),
+
         query_group_init_std=float(
-            model_cfg.get("query_group_init_std", 0.02)
+            model_cfg["query_group_init_std"]
         ),
-        num_heads=model_cfg["num_heads"],
-        num_layers=model_cfg["num_layers"],
-        mlp_ratio=model_cfg["mlp_ratio"],
-        dropout=model_cfg["dropout"],
-        freeze_bert=model_cfg["freeze_bert"],
-        precomputed_bert_path=model_cfg.get("precomputed_bert_path"),
+
+        fusion_token_num=int(
+            model_cfg["fusion_token_num"]
+        ),
+
+        num_heads=int(
+            model_cfg["num_heads"]
+        ),
+
+        num_layers=int(
+            model_cfg["num_layers"]
+        ),
+
+        mlp_ratio=float(
+            model_cfg["mlp_ratio"]
+        ),
+
+        dropout=float(
+            model_cfg["dropout"]
+        ),
+
+        staged_query_refinement=bool(
+            model_cfg.get(
+                "staged_query_refinement",
+                True,
+            )
+        ),
+
+        score_num_heads=int(
+            model_cfg.get(
+                "score_num_heads",
+                model_cfg["num_heads"],
+            )
+        ),
+
+        score_num_layers=int(
+            model_cfg.get(
+                "score_num_layers",
+                model_cfg["num_layers"],
+            )
+        ),
+
+        score_mlp_ratio=float(
+            model_cfg.get(
+                "score_mlp_ratio",
+                model_cfg["mlp_ratio"],
+            )
+        ),
+
+        score_dropout=float(
+            model_cfg.get(
+                "score_dropout",
+                model_cfg["dropout"],
+            )
+        ),
+
+        score_bbox_conditioning=bool(
+            model_cfg.get(
+                "score_bbox_conditioning",
+                True,
+            )
+        ),
+
+        score_bbox_detach=bool(
+            model_cfg.get(
+                "score_bbox_detach",
+                True,
+            )
+        ),
+
+        score_fusion=str(
+            model_cfg.get(
+                "score_fusion",
+                "geometric_mean",
+            )
+        ),
+
+        score_fusion_eps=float(
+            model_cfg.get(
+                "score_fusion_eps",
+                1e-6,
+            )
+        ),
+
+        text_max_length=int(
+            model_cfg["text_max_length"]
+        ),
+
+        freeze_bert=bool(
+            model_cfg["freeze_bert"]
+        ),
+
+        precomputed_bert_path=model_cfg.get(
+            "precomputed_bert_path"
+        ),
+
         use_auxiliary_head=bool(
-            model_cfg.get("use_auxiliary_head", True)
+            model_cfg.get(
+                "use_auxiliary_head",
+                True,
+            )
         ),
+
         auxiliary_in_eval=bool(
-            model_cfg.get("auxiliary_in_eval", False)
+            model_cfg.get(
+                "auxiliary_in_eval",
+                False,
+            )
         ),
+
         initialize_aux_from_main=bool(
-            model_cfg.get("initialize_aux_from_main", True)
+            model_cfg.get(
+                "initialize_aux_from_main",
+                True,
+            )
         ),
 
         # optimizer
@@ -698,16 +1134,36 @@ def print_config_summary(
         f"  compile      : {training.get('compile', False)}, "
         f"mode={training.get('compile_mode', 'reduce-overhead')}"
     )
+    backbone = model["backbone"]
+    fpn = model["fpn"]
+    projector = model["image_projector"]
+    level_names = projector["level_names"]
+    token_grids = projector["token_grids"]
+    tokens_per_level = {
+        str(name): int(grid[0]) * int(grid[1])
+        for name, grid in zip(level_names, token_grids)
+    }
+    total_image_tokens = sum(tokens_per_level.values())
+
     print(f"  hidden_dim   : {model['hidden_dim']}")
     print(
-        f"  grid         : {model['image_grid_size']}x"
-        f"{model['image_grid_size']}"
+        f"  backbone     : width={backbone['width_multiple']}, "
+        f"depth={backbone['depth_multiple']}"
+    )
+    print(f"  base channels: {backbone['base_channels']}")
+    print(f"  base depths  : {backbone['base_depths']}")
+    print(f"  fpn channels : {fpn['out_channels']}")
+    print(f"  token grids  : {token_grids}")
+    print(f"  token levels : {tokens_per_level}")
+    print(f"  image tokens : {total_image_tokens}")
+    print(
+        f"  projector    : layers={projector['layer_num']}, "
+        f"expand={projector['expand_ratio']}"
     )
     print(f"  object query : {model.get('num_object_queries', 100)}")
     print(f"  num_layers   : {model['num_layers']}")
     print(f"  num_heads    : {model['num_heads']}")
     print(f"  mlp_ratio    : {model['mlp_ratio']}")
-    print(f"  cnn_layers   : {model.get('cnn_layers', 3)}")
     print(f"  bert_cache   : {model.get('precomputed_bert_path')}")
     print(
         f"  hybrid head  : enabled="
@@ -811,4 +1267,3 @@ def print_config_summary(
         f"iou={evaluation.get('raw_oracle_iou_thresholds', [0.25, 0.5, 0.75])}"
     )
     print("")
-

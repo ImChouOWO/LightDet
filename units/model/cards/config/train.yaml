@@ -26,7 +26,7 @@ train:
   batch_size: 48
   warmup_epochs: 3
   num_workers: 16
-  device: cuda:1
+  device: 1
   seed: 49
   deterministic: false
 
@@ -228,10 +228,10 @@ eval:
   iou_thresholds: null
   compute_raw_oracle: true
   raw_oracle_iou_thresholds: [0.25, 0.50, 0.75]
-  best_metric: map50_95
+  best_metric: map50
 
 log:
-  save_dir: units/model/runs/train/lightdet_ODVG_token_alignment
+  save_dir: units/model/runs/train/lightdet_FPN
 
   # The token-alignment projection heads are new parameters. Use weights-only
   # loading for an old checkpoint; do not resume its optimizer state.

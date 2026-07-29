@@ -1,9 +1,41 @@
 model:
   # Image branch
-  img_in_channels: 1024
-  cnn_layers: 3
   hidden_dim: 512
-  image_grid_size: 10
+
+  backbone:
+    in_channels: 3
+    base_channels:
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+    base_depths:
+      - 2
+      - 3
+      - 2
+    width_multiple: 0.75
+    depth_multiple: 0.67
+    max_channels: 1024
+    channel_divisor: 8
+
+  fpn:
+    out_channels: 256
+    norm_layer: null
+
+  image_projector:
+    in_channels: 256
+    out_channels: 512
+    layer_num: 2
+    expand_ratio: 2.0
+    level_names:
+      - c3
+      - c4
+      - c5
+    token_grids:
+      - [16, 16]
+      - [8, 8]
+      - [4, 4]
 
   # Keep the image projection trainable. The vision LR schedule controls its
   # learning rate; it is not frozen by model construction.
