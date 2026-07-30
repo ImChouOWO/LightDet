@@ -1,3 +1,10 @@
+#training resource
+# batch size : 48
+# img size : 1024*1024
+# GPU : Nvidia 5000 Ada *1
+# training vram cost : 20-27 GB
+# Val vrame cost : 16-20 GB
+
 model:
   # Image branch
   hidden_dim: 256
