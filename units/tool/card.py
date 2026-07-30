@@ -900,14 +900,9 @@ class ConvGNAct(nn.Module):
                 )
             )
 
-        self.block = nn.Sequential(
-            *layers
-        )
+        self.block = nn.Sequential(*layers)
 
-    def forward(
-        self,
-        x,
-    ):
+    def forward(self,x,):
         return self.block(x)
 
 
@@ -1235,14 +1230,13 @@ class ImgProjector(nn.Module):
     ) -> nn.Sequential:
         """
         建立單一 FPN Level 的投影模組。
-
+        以迴圈依據輸入的尺度執行投影
         流程：
             1x1 ConvGNAct
             -> MobileNetV4 refinement blocks
         """
 
         layers = [
-            # 先將 FPN channel 投影至 Transformer hidden dim。
             ConvGNAct(
                 in_channels,
                 out_channels,
@@ -1251,8 +1245,6 @@ class ImgProjector(nn.Module):
             )
         ]
 
-        # 在較小的 token grid 上進行特徵 refinement，
-        # 不再改變空間解析度。
         for _ in range(layer_num):
             layers.append(
                 MobileNetV4ConvBlock(
@@ -1335,45 +1327,72 @@ class ImgProjector(nn.Module):
                     f"目前 keys={tuple(features.keys())}"
                 )
 
-            feature = features[level_name]
+            x = features[level_name]
 
             self._validate_feature(
                 level_name=level_name,
-                feature=feature,
+                feature=x,
             )
 
             if batch_size is None:
-                batch_size = int(
-                    feature.shape[0]
-                )
-            elif int(feature.shape[0]) != batch_size:
+                batch_size = int(x.shape[0])
+            elif int(x.shape[0]) != batch_size:
                 raise ValueError(
                     "所有 FPN Level 的 batch size "
                     "必須一致："
-                    f"{level_name}={feature.shape[0]}，"
+                    f"{level_name}={x.shape[0]}，"
                     f"預期={batch_size}"
                 )
 
-            # 先將每個 FPN Level 壓縮至指定 token grid。
-            #
-            # c3: 128x128 -> 16x16
-            # c4:  64x64  ->  8x8
-            # c5:  32x32  ->  4x4
-            feature = F.adaptive_avg_pool2d(
-                feature,
+            original_size = x.shape[-2:]
+
+            # 從 FPN 全局資訊。
+            global_feature = F.adaptive_avg_pool2d(
+                x,
                 output_size=target_grid,
             )
 
-            # 每個尺度使用獨立 projector。
-            feature = self.level_projectors[
+            #融合前處理
+            global_feature = F.interpolate(
+                global_feature,
+                size=original_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+            # 根據當前輸入影像動態產生融合權重。
+            gate_input = torch.cat([x,global_feature,],dim=1,)
+
+            gate = self.level_gates[
                 level_name
-            ](feature)
+            ](gate_input)
+
+            if gate.shape[0] != x.shape[0]:
+                raise RuntimeError(
+                    f"{level_name} gate batch size 錯誤："
+                    f"{gate.shape[0]} != {x.shape[0]}"
+                )
+
+            # 原始 FPN 特徵提供細節，
+            # Avg Pooling 提供全局資訊。
+            x = (gate * x + (1.0 - gate) * global_feature)
+
+            # 每個尺度使用獨立 projector。
+            x = self.level_projectors[
+                level_name
+            ](x)
+
+            # 將融合並投影後的特徵轉成固定 token grid。
+            x = F.adaptive_avg_pool2d(
+                x,
+                output_size=target_grid,
+            )
 
             # [B, C, H, W]
             # -> [B, C, H*W]
             # -> [B, H*W, C]
             tokens = (
-                feature
+                x
                 .flatten(2)
                 .transpose(1, 2)
                 .contiguous()
@@ -1398,13 +1417,6 @@ class ImgProjector(nn.Module):
                     f"{self.out_channels}"
                 )
 
-            # 加入尺度識別資訊。
-            #
-            # level_embedding:
-            # [1, 1, C]
-            #
-            # tokens:
-            # [B, N, C]
             level_embedding = (
                 self.level_embeddings[
                     level_index
@@ -1420,9 +1432,7 @@ class ImgProjector(nn.Module):
                 + level_embedding
             )
 
-            output_tokens.append(
-                tokens
-            )
+            output_tokens.append(tokens)
 
         image_tokens = torch.cat(
             output_tokens,
