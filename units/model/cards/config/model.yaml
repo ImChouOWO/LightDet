@@ -33,9 +33,9 @@ model:
       - c4
       - c5
     token_grids:
-      - [16, 16]
-      - [8, 8]
-      - [4, 4]
+      - [32, 32]
+      - [12, 12]
+      - [10, 10]
 
   # Keep the image projection trainable. The vision LR schedule controls its
   # learning rate; it is not frozen by model construction.

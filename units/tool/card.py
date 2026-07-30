@@ -1071,6 +1071,13 @@ class ImgProjector(nn.Module):
             for level_name in self.level_names
         })
 
+        self.level_gates = nn.ModuleDict({
+            level_name: self._make_level_gate(
+                in_channels=self.in_channels,
+            )
+            for level_name in self.level_names
+        })
+
         # 用於區分 c3、c4、c5 的尺度來源。
         #
         # shape:
@@ -1262,6 +1269,37 @@ class ImgProjector(nn.Module):
             *layers
         )
 
+    @staticmethod
+    def _make_level_gate(
+        in_channels: int,
+    ) -> nn.Sequential:
+        hidden_channels = max(
+            in_channels // 4,
+            16,
+        )
+
+        return nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(
+                in_channels=in_channels * 2,
+                out_channels=hidden_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=False,
+            ),
+            nn.SiLU(),
+            nn.Conv2d(
+                in_channels=hidden_channels,
+                out_channels=in_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=True,
+            ),
+            nn.Sigmoid(),
+        )
+
     def _validate_feature(
         self,
         level_name: str,
@@ -1361,21 +1399,41 @@ class ImgProjector(nn.Module):
             )
 
             # 根據當前輸入影像動態產生融合權重。
-            gate_input = torch.cat([x,global_feature,],dim=1,)
+            gate_input = torch.cat(
+                [
+                    x,
+                    global_feature,
+                ],
+                dim=1,
+            )
 
             gate = self.level_gates[
                 level_name
             ](gate_input)
 
-            if gate.shape[0] != x.shape[0]:
+            if tuple(gate.shape) != (
+                int(x.shape[0]),
+                self.in_channels,
+                1,
+                1,
+            ):
                 raise RuntimeError(
-                    f"{level_name} gate batch size 錯誤："
-                    f"{gate.shape[0]} != {x.shape[0]}"
+                    f"{level_name} gate shape 錯誤："
+                    f"{tuple(gate.shape)} != "
+                    f"{(
+                        int(x.shape[0]),
+                        self.in_channels,
+                        1,
+                        1,
+                    )}"
                 )
 
             # 原始 FPN 特徵提供細節，
             # Avg Pooling 提供全局資訊。
-            x = (gate * x + (1.0 - gate) * global_feature)
+            x = (
+                gate * x
+                + (1.0 - gate) * global_feature
+            )
 
             # 每個尺度使用獨立 projector。
             x = self.level_projectors[
@@ -1432,7 +1490,9 @@ class ImgProjector(nn.Module):
                 + level_embedding
             )
 
-            output_tokens.append(tokens)
+            output_tokens.append(
+                tokens
+            )
 
         image_tokens = torch.cat(
             output_tokens,
