@@ -1382,7 +1382,7 @@ class ImgProjector(nn.Module):
                 level_name
             ](x)
 
-            # 將融合並投影後的特徵轉成固定 token grid。
+            # fused tensor size -> target grids
             x = F.adaptive_avg_pool2d(
                 x,
                 output_size=target_grid,
