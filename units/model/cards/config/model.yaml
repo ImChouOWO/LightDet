@@ -1,6 +1,6 @@
 model:
   # Image branch
-  hidden_dim: 512
+  hidden_dim: 256
 
   backbone:
     in_channels: 3
@@ -23,17 +23,18 @@ model:
     out_channels: 256
     norm_layer: null
 
-  image_projector:
+
+  image_projector: #Bottle net
     in_channels: 256
-    out_channels: 512
-    layer_num: 2
-    expand_ratio: 2.0
+    out_channels: 256
+    layer_num: 3
+    expand_ratio: 2.0 #num of mid layer's channel = in channel * expand_ratio
     level_names:
       - c3
       - c4
       - c5
     token_grids:
-      - [32, 32]
+      - [24, 24]
       - [12, 12]
       - [10, 10]
 
