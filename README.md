@@ -53,7 +53,10 @@ Further research and additional computing resources are required to evaluate mod
 ### 模型能力
 ![模型能力](https://github.com/ImChouOWO/LightDet/blob/main/units/runs/predict/lightdet_odvg/prediction.jpg)
 
-> 輸入文字：紅色的船
+> 輸入文字：紅色的船　`F: 0.695`　`Q: 0.937`　`A: 0.515`  
+> `F：最終置信度`　`Q：定位品質分數`　`A：描述對齊分數`  
+> `F為 Q、Ａ之幾何平均`
+
 
 #### 使用資料集
  | 單位（張）| 訓練集 |驗證集|
