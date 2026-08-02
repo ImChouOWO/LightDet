@@ -458,9 +458,6 @@ class TransformerBlock(nn.Module):
             ],
             dim=1,
         )
-
-        # Main and Aux sequences are isolated by the batch dimension while
-        # still sharing exactly the same Transformer parameters.
         grouped_sequence = torch.cat(
             [
                 main_sequence,
@@ -2831,9 +2828,9 @@ class _BaseVisionTextModel(nn.Module):
         }
 
 
-# ------------------------------------------------------------------
-# Public LightDet interface
-# ------------------------------------------------------------------
+
+
+
 
 def _read_model_defaults() -> Dict[str, Any]:
     config_path = (
@@ -3082,16 +3079,14 @@ class VisionTextModel(_BaseVisionTextModel):
         prepared = super()._prepare_legacy_state_dict(state_dict)
         current_state = self.state_dict()
 
-        # Old scalar text-alignment parameters do not match the new
-        # token-level projection heads.
+     
         prepared = {
             key: value
             for key, value in prepared.items()
             if key in current_state
         }
 
-        # Preserve compatible tensors and initialize new/changed tensors from
-        # the current model definition.
+    
         for key, default_value in current_state.items():
             source_value = prepared.get(key)
 

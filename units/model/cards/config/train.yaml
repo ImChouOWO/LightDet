@@ -13,8 +13,6 @@ data:
   persistent_workers: true
   query_budget: true
 
-  # ODVG phrase-level negatives. Phrases are appended to the complete caption
-  # without a bbox, so they supervise token alignment only.
   negative_query_path: units/model/cards/cache/negative_query_pool.json
   negative_sample_ratio: 0.1
   negative_phrase_max_per_image: 3
@@ -71,7 +69,7 @@ loss:
     focal_alpha: 0.25
     focal_gamma: 2.0
 
-    # ODVG query-to-phrase token alignment cost.
+    # Token alignment matching is retained but slightly lower than bbox and GIoU.
     cost_alignment: 2.0
     alignment_negative_weight: 0.25
 
@@ -119,19 +117,17 @@ loss:
     enabled: true
     loss_weight: 1.0
 
-    # Matched query: non-phrase valid tokens.
+
     negative_weight: 0.25
 
-    # Unmatched query: every valid caption token.
+   
     unmatched_weight: 0.10
 
-    # Retained for future ODVG negative-caption rows.
+  
     negative_text_weight: 1.0
 
     focal_gamma: 2.0
 
-    # Matched query must rank above the hardest unmatched query for the same GT
-    # phrase token map.
     ranking_weight: 0.25
     ranking_margin: 0.15
 
@@ -192,8 +188,6 @@ loss:
     start_epoch: 10
     warmup_epoch: 5
 
-  # Legacy quality-ranking configuration remains disabled. Phrase ranking is
-  # now part of text_alignment and uses GT token maps.
   ranking:
     enabled: false
     lambda_rank: 0.0
@@ -233,10 +227,9 @@ eval:
 log:
   save_dir: units/model/runs/train/lightdet_FPN_gate_fused
 
-  # The token-alignment projection heads are new parameters. Use weights-only
-  # loading for an old checkpoint; do not resume its optimizer state.
+
   weights_path: null
-  resume_path: /home/soic/Desktop/LightDet/units/model/runs/train/lightdet_FPN_gate_fused/latest.pt
+  resume_path: null
   prefer_ema: true
 
   save_latest_interval: 1
@@ -245,3 +238,202 @@ log:
   log_interval: 50
   progress_leave: true
   progress_mininterval: 0.5
+
+
+
+# data
+# dataset_dir：資料集根目錄。
+# image_size：模型輸入影像尺寸。
+# max_text_aug_per_image：每張影像最多產生的文字增強數量。
+# cache_images：是否快取預處理後的影像。
+# image_cache_dir：影像快取儲存位置。
+# prebuild_image_cache：訓練前是否預先建立影像快取。
+# cache_workers：建立快取時使用的工作程序數量。
+# prefetch_factor：DataLoader 每個 worker 預先載入的 batch 數。
+# pin_memory：是否使用鎖頁記憶體，加速 CPU 至 GPU 傳輸。
+# persistent_workers：每個 epoch 後是否保留 DataLoader workers。
+# query_budget：是否限制每張影像使用的文字查詢數量。
+# negative_query_path：負向文字查詢池的位置。
+# negative_sample_ratio：訓練時負向查詢的取樣比例。
+# negative_phrase_max_per_image：每張影像最多加入的負向描述數量。
+# negative_phrase_separator：正向與負向描述之間的分隔文字。
+# use_negative_queries_in_val：驗證階段是否加入負向查詢。
+
+# train
+# epochs：總訓練週期數。
+# batch_size：每次迭代使用的樣本數量。
+# warmup_epochs：學習率暖身使用的 epoch 數。
+# num_workers：DataLoader 的工作程序數量。
+# device：訓練使用的 GPU 編號。
+# seed：隨機種子。
+# deterministic：是否啟用可重現但較慢的確定性運算。
+# use_amp：是否使用自動混合精度訓練。
+# amp_dtype：混合精度使用的資料型別。
+# allow_tf32：是否允許 NVIDIA GPU 使用 TF32 加速。
+# matmul_precision：矩陣乘法的精度策略。
+# channels_last：是否使用 channels-last 記憶體格式。
+# compile：是否使用 torch.compile 編譯模型。
+# compile_mode：torch.compile 的最佳化模式。
+# startup_smoke_test：正式訓練前是否執行快速測試。
+# use_ema：是否使用模型權重指數移動平均。
+# ema_decay：EMA 歷史權重保留比例。
+# ema_update_interval：每隔多少 step 更新一次 EMA 參數。
+# ema_buffer_update_interval：每隔多少 step 更新一次 EMA buffer。
+# grad_clip_norm：梯度裁切的最大範數。
+
+# optim
+# components：各模型模組的學習率排程設定。
+# components 格式：[排程模式, 最大學習率, 最小學習率, 起始比例, 結束比例]。
+# vision：影像 Backbone 的學習率設定。
+# text：文字編碼器的學習率設定。
+# transformer：Transformer 模組的學習率設定。
+# head：預測頭的學習率設定。
+# weight_decay：權重衰減強度。
+# max_warmup_steps：學習率暖身的最大 step 數。
+# fused：是否使用 fused optimizer 提升更新效率。
+
+# loss.matcher
+# cost_bbox：Hungarian matching 的邊界框 L1 成本權重。
+# cost_giou：Hungarian matching 的 GIoU 成本權重。
+# cost_score：Hungarian matching 的品質分數成本權重。
+# score_cost_type：分數匹配使用的 loss 類型。
+# focal_alpha：Focal Loss 的正負樣本平衡係數。
+# focal_gamma：Focal Loss 對困難樣本的聚焦強度。
+# cost_alignment：文字與影像對齊成本權重。
+# alignment_negative_weight：負向文字對齊成本權重。
+
+# loss.weight
+# dynamic：是否動態調整各項 loss 權重。
+# bbox、giou、score：邊界框、GIoU 與分數 loss 的基礎權重。
+# bbox_start、bbox_end：BBox loss 的起始與最終權重。
+# giou_start、giou_end：GIoU loss 的起始與最終權重。
+# score_start、score_end：Score loss 的起始與最終權重。
+# start_epoch、end_epoch：動態權重調整的起訖 epoch。
+# schedule：權重變化使用的排程方式。
+
+# loss.classification
+# type：分類目標類型，目前以 IoU 作為品質標籤。
+# ia_bce_alpha：IoU-aware BCE 的平衡係數。
+# negative_weight：負樣本分類 loss 權重。
+# normalize_by_num_gt：是否以 GT 數量正規化分類 loss。
+# negative_iou_ignore_thr：高於此 IoU 的負樣本不計入負樣本 loss。
+# negative_iou_ignore_start、end：忽略門檻的起始與最終值。
+# negative_iou_ignore_start_epoch、end_epoch：門檻調整的起訖 epoch。
+# negative_iou_ignore_schedule：忽略門檻的排程方式。
+
+# loss.quality
+# iou_pos_thr：被視為正樣本的最低 IoU。
+# quality_min、quality_max：品質標籤的最小與最大值。
+# qfl_beta：Quality Focal Loss 的聚焦係數。
+# quality_warmup_epoch：品質學習的暖身週期。
+# aux_score_enabled：是否對輔助輸出計算品質分數 loss。
+
+# loss.text_alignment
+# enabled：是否啟用文字與影像特徵對齊。
+# loss_weight：文字對齊 loss 的整體權重。
+# negative_weight：負向文字對齊權重。
+# unmatched_weight：未匹配 query 的對齊權重。
+# negative_text_weight：負向文字樣本的 loss 權重。
+# ranking_weight：文字對齊排序 loss 權重。
+# ranking_margin：正負文字相似度的最小間隔。
+# start_epoch：文字對齊開始訓練的 epoch。
+# warmup_epoch：文字對齊 loss 的暖身週期。
+
+# loss.matcher_schedule
+# start_epoch：分數匹配成本開始介入的 epoch。
+# warmup_epoch：分數匹配成本增強至完整權重的 epoch。
+# alpha_min：匹配成本的最低混合比例。
+
+# loss.score_sampling
+# positive_ratio：正樣本取樣比例。
+# max_positive_per_gt：每個 GT 最多保留的正樣本數。
+# min_extra_positive_iou：額外正樣本的最低 IoU。
+# hard_negative_ratio：困難負樣本相對正樣本的取樣比例。
+# aux_positive_label：輔助正樣本使用的品質標籤。
+# expand_cost_bbox：額外正樣本匹配的 BBox 成本。
+# expand_cost_giou：額外正樣本匹配的 GIoU 成本。
+
+# loss.hybrid
+# aux_loss_weight：輔助輸出 loss 的權重。
+# matcher_cost_score：混合匹配中的分數成本。
+# matcher_cost_alignment：混合匹配中的文字對齊成本。
+# warmup_epoch：Hybrid loss 的暖身週期。
+# decay_start_ratio：輔助 loss 開始衰減的訓練進度比例。
+# min_factor：輔助 loss 衰減後的最低倍率。
+# matcher_score_start_epoch：匹配分數開始生效的 epoch。
+# matcher_score_warmup_epoch：匹配分數的暖身週期。
+
+# loss.text_negative
+# as_empty_target：是否將負向文字視為無目標樣本。
+# classification_weight：負向文字分類 loss 權重。
+# max_query_loss_weight：單一 query loss 的最大權重。
+# lambda_text_negative：負向文字 loss 的總體權重。
+# text_negative_topk：計算負向文字 loss 時保留的前 K 個結果。
+# hard_topk：困難負向樣本保留數量。
+# text_negative_hard_mix、hard_mix：一般與困難負向樣本的混合比例。
+# start_epoch：負向文字 loss 開始生效的 epoch。
+# warmup_epoch：負向文字 loss 的暖身週期。
+
+# loss.duplicate_suppression
+# enabled：是否啟用重複預測抑制 loss。
+# loss_weight：重複抑制 loss 權重。
+# margin：重複框與正確框之間要求的分數間隔。
+# background_weight：背景重複框的 loss 權重。
+# classification_weight：重複框分類 loss 權重。
+# max_pairs：每批最多使用的重複框配對數。
+# start_epoch：重複抑制開始生效的 epoch。
+# warmup_epoch：重複抑制 loss 的暖身週期。
+
+# loss.hard_negative
+# enabled：是否啟用困難負樣本挖掘。
+# loss_weight：困難負樣本 loss 權重。
+# topk：每個樣本保留的困難負樣本數量。
+# max_iou：困難負樣本允許的最大 IoU。
+# start_epoch：困難負樣本挖掘開始的 epoch。
+# warmup_epoch：困難負樣本 loss 的暖身週期。
+
+# loss.ranking
+# enabled：是否啟用額外的預測排序 loss。
+# lambda_rank：排序 loss 權重。
+# rank_margin：正負候選框要求的分數間隔。
+# rank_min_quality_gap：建立排序配對所需的最小品質差距。
+# rank_max_pairs：每批最多建立的排序配對數。
+# rank_start_epoch：排序 loss 開始生效的 epoch。
+# rank_warmup_epoch：排序 loss 的暖身週期。
+# rank_alpha_min：排序 loss 的最低啟用比例。
+# rank_negative_iou_max：可視為負樣本的最大 IoU。
+
+# loss.query_refinement
+# identity_weight：限制 refinement query 偏離原始 query 的權重。
+# start_epoch：Query refinement loss 開始生效的 epoch。
+# warmup_epoch：Query refinement loss 的暖身週期。
+# detach_localization：是否切斷 refinement 對定位分支的梯度。
+
+# loss.pos_weight
+# value：正樣本 BCE loss 的加權倍率。
+
+# eval
+# val_loss_interval：每隔多少 epoch 計算一次完整驗證 loss。
+# eval_interval：每隔多少 epoch 執行一次評估。
+# max_val_batches：驗證時最多使用的 batch 數，null 表示全部。
+# score_thr：評估時預測框的最低分數門檻。
+# top_k：每個樣本最多保留的預測數量。
+# nms_iou_thr：NMS 使用的 IoU 門檻。
+# use_nms：是否啟用 NMS。
+# use_topk_fallback：無有效預測時是否回退使用 Top-K。
+# iou_thresholds：mAP 使用的 IoU 門檻，null 表示使用預設範圍。
+# compute_raw_oracle：是否計算未排序候選框的理論召回能力。
+# raw_oracle_iou_thresholds：Raw Oracle Recall 的 IoU 門檻。
+# best_metric：選擇最佳權重時使用的主要指標。
+
+# log
+# save_dir：訓練紀錄與權重儲存位置。
+# weights_path：初始化模型使用的權重路徑。
+# resume_path：中斷後接續訓練使用的 checkpoint。
+# prefer_ema：驗證與儲存最佳模型時是否優先使用 EMA 權重。
+# save_latest_interval：每隔多少 epoch 儲存 latest checkpoint。
+# save_epoch_interval：每隔多少 epoch 額外保存一份權重。
+# emit_step_metrics：是否記錄每個訓練 step 的指標。
+# log_interval：每隔多少 step 輸出一次訓練資訊。
+# progress_leave：epoch 完成後是否保留進度條。
+# progress_mininterval：進度條最短更新間隔秒數。
