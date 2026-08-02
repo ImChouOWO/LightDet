@@ -23,21 +23,26 @@ Image + Text Query -> Bounding Boxes + Scores
 
 目前版本採用 Decoder-only Object Query、兩階段 Query Refinement、H-DETR Main/Auxiliary 分支，以及 ODVG 風格的 token-level text alignment。
 
+
+
 <details>
-<summary><strong>當前限制/Current Limitations</strong></summary>
+<summary><em>當前限制 / Current Limitations</em></summary>
+
+<br>
+
 受限於現有硬體與運算資源，本專案目前尚未針對模型寬度、深度、Transformer 容量、訓練資料規模及訓練週期進行完整的規模化實驗。
 
-目前模型僅在既有測試資料集中展現出最低可用程度的準確率，相關結果應視為架構可行性的初步驗證，而非模型的最終效能。
+目前模型僅在既有測試資料集中展現出最低可用程度的準確率。相關結果應視為架構可行性的初步驗證，而非模型的最終效能。
 
 後續仍需投入更多運算與研究資源，以探討模型規模化效果、改善多模態特徵對齊、提升候選框排序與定位能力，並在更大且更多樣化的資料集上驗證其泛化能力。
 
-----------
+---
 
-Due to current hardware and computing-resource constraints, this project has not yet conducted systematic model scaling experiments, including increases in model width, depth, Transformer capacity, training data, or training duration.
+Due to current hardware and computing-resource constraints, this project has not yet conducted systematic model-scaling experiments, including increases in model width, depth, Transformer capacity, training-data scale, or training duration.
 
-The current model has only demonstrated a minimally usable level of accuracy on the existing test dataset. These results should be treated as an initial feasibility validation rather than the final performance of the architecture.
+The current model has demonstrated only a minimally usable level of accuracy on the existing test dataset. These results should be considered an initial validation of architectural feasibility rather than the final performance of the model.
 
-Further research requires additional computing resources to evaluate model scaling, improve multimodal feature alignment, optimize ranking and localization performance, and verify generalization across larger and more diverse datasets.
+Further research and additional computing resources are required to evaluate model scaling, improve multimodal feature alignment, enhance ranking and localization performance, and verify generalization on larger and more diverse datasets.
 
 </details>
 
