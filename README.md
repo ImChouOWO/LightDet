@@ -468,6 +468,8 @@ model:
 
 ## 訓練設定
 
+>[!NOTE]! [訓練參數說明](https://github.com/ImChouOWO/LightDet/blob/main/units/model/cards/config/readme.md)
+
 訓練設定檔：
 
 ```text
@@ -495,7 +497,7 @@ train:
   batch_size: 48
   warmup_epochs: 3
   num_workers: 16
-  device: cuda:1
+  device: 0
   seed: 49
   deterministic: false
   use_amp: true
