@@ -29,8 +29,9 @@ Image + Text Query -> Bounding Boxes + Scores
 
 | Recall | Recall@1 | Recall@5 | Recall@10 |
 |---:|---:|---:|---:|
-| 65.00% | 23.94% | 52.33% | 61.03% |
+| 64.91% | 22.27% | 50.95% | 61.07% |
 
+`模型版本：FPN_gate_fused`
 
 
 ### 模型資料流：
