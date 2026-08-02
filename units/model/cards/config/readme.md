@@ -1,14 +1,12 @@
-# LightDet 訓練設定檔說明
+# LightDet 訓練設定說明
 
-此設定檔用於控制目前的 `VisionTextModel` 訓練流程。模型輸入為整張影像與文字查詢，輸出為符合文字查詢的多目標物件偵測結果。
-
-目前模型不進行類別分類，不需要 `label prediction`。訓練目標為：
+LightDet 是一個文字條件式物件偵測模型。模型接收整張影像與文字查詢，輸出符合查詢描述的邊界框與信心分數。
 
 ```text
-image + query_text -> bbox + score_logit
+image + query_text -> bbox + score
 ```
 
-其中 bbox 格式為 normalized `xyxy`：
+模型目前不進行多類別分類。邊界框採 normalized `xyxy` 格式：
 
 ```text
 x1, y1, x2, y2 ∈ [0, 1]
@@ -16,125 +14,320 @@ x1 <= x2
 y1 <= y2
 ```
 
----
+## 執行方式
 
-## YAML 範例
+```bash
+python3 train.py
+```
+
+設定檔主要分為：
+
+```text
+model.yaml    模型結構
+config.yaml   資料、訓練、最佳化、Loss、評估與紀錄
+```
+
+## Training Resource
+
+| 項目 | 設定 |
+|---|---:|
+| Batch size | 48 |
+| Image size | 1024 × 1024 |
+| GPU | NVIDIA RTX 5000 Ada × 1 |
+| Training VRAM | 約 20–27 GB |
+| Validation VRAM | 約 16–20 GB |
+
+實際記憶體使用量會受到 CUDA、PyTorch、AMP、DataLoader、模型版本與驗證設定影響。
+
+# model.yaml
 
 ```yaml
 model:
-  img_in_channels: 1024
-  hidden_dim: 512
-  num_heads: 8
-  num_layers: 4
-  mlp_ratio: 4.0
-  image_grid_size: 10
-  text_max_length: 32
+  hidden_dim: 256
+
+  backbone:
+    in_channels: 3
+    base_channels:
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+    base_depths:
+      - 2
+      - 3
+      - 2
+    width_multiple: 0.75
+    depth_multiple: 0.67
+    max_channels: 1024
+    channel_divisor: 8
+
+  fpn:
+    out_channels: 256
+    norm_layer: null
+
+  image_projector:
+    in_channels: 256
+    out_channels: 256
+    layer_num: 3
+    expand_ratio: 2.0
+    level_names:
+      - c3
+      - c4
+      - c5
+    token_grids:
+      - [24, 24]
+      - [12, 12]
+      - [10, 10]
+
+  freeze_img_projection: false
+
+  num_object_queries: 100
+  query_group_init_std: 0.02
   fusion_token_num: 16
+
+  num_heads: 8
+  num_layers: 2
+  mlp_ratio: 3.5
   dropout: 0.1
+
+  staged_query_refinement: true
+  score_num_heads: 8
+  score_num_layers: 2
+  score_mlp_ratio: 3.0
+  score_dropout: 0.1
+  score_bbox_conditioning: true
+  score_bbox_detach: true
+  score_fusion: geometric_mean
+  score_fusion_eps: 0.000001
+
+  text_max_length: 256
   freeze_bert: true
+  precomputed_bert_path: units/model/cards/cache/bert_raw_cache.pt
 
-data:
-  dataset_dir: /home/soic/Desktop/LightDet/datasets
-  image_size: 640
-  max_text_aug_per_image: 1
-
-train:
-  epochs: 300
-  batch_size: 32
-  warmup_epochs: 5
-  num_workers: 18
-  device: cuda:1
-  seed: 42
-  use_amp: true
-  use_ema: true
-  ema_decay: 0.999
-  grad_clip_norm: 1.0
-
-optim:
-  lr_vision: 0.0001
-  lr_text: 0.00001
-  lr_transformer: 0.0001
-  lr_head: 0.0001
-  weight_decay: 0.0001
-  min_lr_ratio: 0.05
-  max_warmup_steps: 3000
-
-loss:
-  cost_bbox: 5.0
-  cost_giou: 2.0
-  cost_score: 1.0
-  min_pos_weight: 1.0
-  max_pos_weight: 5.0
-
-eval:
-  val_loss_interval: 1
-  eval_interval: 1
-  max_val_batches: 320
-  score_thr: 0.25
-  top_k: 20
-  nms_iou_thr: 0.5
-  best_metric: map50
-
-log:
-  save_dir: null
-  resume_path: null
-  save_epoch_interval: 50
-  emit_step_metrics: true
-  log_interval: 10
+  use_auxiliary_head: true
+  auxiliary_in_eval: false
+  initialize_aux_from_main: true
 ```
 
----
+## Model Parameters
 
-# 1. model
+### Model Base
 
-`model` 區塊控制模型結構與文字編碼設定。
+| 參數 | 功用 |
+|---|---|
+| `hidden_dim` | 模型內部影像、文字、Query 與 Transformer token 的共同維度。 |
 
-| 參數                 |    預設值 | 型別    | 說明                                                                        |
-| ------------------ | -----: | ----- | ------------------------------------------------------------------------- |
-| `img_in_channels`  | `1024` | int   | `BottleNet` 輸出的影像特徵 channel 數，也是後續 `BackBone / ImgProjector` 的輸入 channel。 |
-| `hidden_dim`       |  `512` | int   | 模型內部 token 維度。影像 token、文字 token、fusion token 都會投影到此維度。                    |
-| `num_heads`        |    `8` | int   | Transformer multi-head attention 的 head 數。需能整除 `hidden_dim`。              |
-| `num_layers`       |    `4` | int   | Transformer encoder layer 數量。越大表示融合能力越強，但訓練與推論成本也越高。                      |
-| `mlp_ratio`        |  `4.0` | float | Transformer feed-forward hidden dim 放大倍率。實際維度為 `hidden_dim * mlp_ratio`。  |
-| `image_grid_size`  |   `10` | int   | 影像 token grid 大小。若為 `10`，代表輸出 `10 × 10 = 100` 個 image tokens。             |
-| `text_max_length`  |   `32` | int   | BERT tokenizer 的最大文字長度。超過會截斷，不足會 padding。                                 |
-| `fusion_token_num` |   `16` | int   | learnable fusion tokens 數量，用於整合全域影像與文字資訊。                                 |
-| `dropout`          |  `0.1` | float | Transformer layer 中的 dropout rate。                                        |
-| `freeze_bert`      | `true` | bool  | 是否凍結 BERT。若為 `true`，BERT 不更新參數，只訓練 projection 與後續模組。                      |
+### Backbone
 
-## image_grid_size 對輸出數量的影響
+| 參數 | 功用 |
+|---|---|
+| `in_channels` | 輸入影像通道數，RGB 為 3。 |
+| `base_channels` | Backbone 各階段的基礎通道數。 |
+| `base_depths` | Backbone 各階段的基礎 block 數量。 |
+| `width_multiple` | 統一縮放各階段通道寬度。 |
+| `depth_multiple` | 統一縮放各階段深度。 |
+| `max_channels` | 限制 Backbone 最大通道數。 |
+| `channel_divisor` | 將通道數調整為指定倍數，便於硬體計算。 |
 
-模型每個 image token 會預測一個 bbox 與 score，因此：
+### FPN
+
+| 參數 | 功用 |
+|---|---|
+| `out_channels` | 將 C3、C4、C5 統一投影到相同通道數。 |
+| `norm_layer` | FPN 使用的正規化層；`null` 表示不額外指定。 |
+
+### Image Projector
+
+| 參數 | 功用 |
+|---|---|
+| `in_channels` | 投影層接收的 FPN 特徵通道數。 |
+| `out_channels` | 投影後輸出的特徵維度。 |
+| `layer_num` | 每個尺度使用的投影 block 數量。 |
+| `expand_ratio` | 中間通道擴張倍率，計算方式為 `in_channels × expand_ratio`。 |
+| `level_names` | 使用的 FPN 特徵層名稱。 |
+| `token_grids` | 各尺度壓縮後的 token 網格大小。 |
+| `freeze_img_projection` | 是否凍結影像投影層參數。 |
+
+目前 visual token 數量為：
 
 ```text
-num_predictions = image_grid_size × image_grid_size
+24 × 24 + 12 × 12 + 10 × 10 = 820
 ```
 
-例如：
+### Localization Transformer
 
-| `image_grid_size` | image token 數 | bbox 輸出 shape  |
-| ----------------: | ------------: | -------------- |
-|              `10` |         `100` | `[B, 100, 4]`  |
-|              `20` |         `400` | `[B, 400, 4]`  |
-|              `40` |        `1600` | `[B, 1600, 4]` |
+| 參數 | 功用 |
+|---|---|
+| `num_object_queries` | 可同時產生的物件候選 Query 數量。 |
+| `query_group_init_std` | Object Query 初始化時的標準差。 |
+| `fusion_token_num` | 用於整合全局影像與文字資訊的可學習 token 數量。 |
+| `num_heads` | 定位 Transformer 的注意力 head 數。 |
+| `num_layers` | 定位 Transformer 層數。 |
+| `mlp_ratio` | Feed-forward 中間維度的擴張倍率。 |
+| `dropout` | 定位 Transformer 的 dropout 比例。 |
 
-建議初期使用 `10` 或 `20`。若資料中同張圖的目標數很多，可以提高到 `20`，但會增加 Transformer 與 head 的計算量。
+### Score and Text Refinement
 
----
+| 參數 | 功用 |
+|---|---|
+| `staged_query_refinement` | 是否啟用第二階段 Query refinement。 |
+| `score_num_heads` | 第二階段 Transformer 的注意力 head 數。 |
+| `score_num_layers` | 第二階段 Transformer 層數。 |
+| `score_mlp_ratio` | 第二階段 MLP 擴張倍率。 |
+| `score_dropout` | 第二階段 dropout 比例。 |
+| `score_bbox_conditioning` | 是否將 bbox 資訊加入 score refinement。 |
+| `score_bbox_detach` | 是否阻止 score 分支梯度回傳至 bbox 分支。 |
+| `score_fusion` | Quality score 與文字相似度的融合方式。 |
+| `score_fusion_eps` | 分數融合時避免數值不穩定的小常數。 |
 
-# 2. data
+### Text Branch
 
-`data` 區塊控制資料集路徑與 dataloader 輸入尺寸。
+| 參數 | 功用 |
+|---|---|
+| `text_max_length` | 文字 tokenizer 的最大 token 長度。 |
+| `freeze_bert` | 是否凍結 BERT 參數。 |
+| `precomputed_bert_path` | 預先計算的 BERT 文字特徵快取位置。 |
 
-| 參數                       |                                    預設值 | 型別  | 說明                                                      |
-| ------------------------ | -------------------------------------: | --- | ------------------------------------------------------- |
-| `dataset_dir`            | `/home/soic/Desktop/LightDet/datasets` | str | 資料集根目錄。                                                 |
-| `image_size`             |                                  `640` | int | 輸入影像 resize 尺寸。影像會被 resize 成 `image_size × image_size`。 |
-| `max_text_aug_per_image` |                                    `1` | int | 每張圖最多抽樣幾組 `query_texts_aug`。用於控制文字增強樣本數量。               |
+### H-DETR Auxiliary Branch
 
-## 資料夾結構
+| 參數 | 功用 |
+|---|---|
+| `use_auxiliary_head` | 是否啟用輔助預測分支。 |
+| `auxiliary_in_eval` | 評估時是否保留輔助分支輸出。 |
+| `initialize_aux_from_main` | 是否使用主分支權重初始化輔助分支。 |
 
-建議資料夾結構如下：
+# config.yaml
+
+## Data
+
+| 參數 | 功用 |
+|---|---|
+| `dataset_dir` | 資料集根目錄。 |
+| `image_size` | 輸入影像尺寸。 |
+| `max_text_aug_per_image` | 每張影像最多使用的文字增強數量。 |
+| `cache_images` | 是否快取預處理後的影像。 |
+| `image_cache_dir` | 影像快取路徑。 |
+| `prebuild_image_cache` | 是否在訓練前建立完整快取。 |
+| `cache_workers` | 建立快取時使用的 worker 數量。 |
+| `prefetch_factor` | 每個 DataLoader worker 預先載入的 batch 數。 |
+| `pin_memory` | 是否使用鎖頁記憶體加速 CPU 至 GPU 傳輸。 |
+| `persistent_workers` | 每個 epoch 後是否保留 DataLoader workers。 |
+| `query_budget` | 是否限制每張影像使用的 Query 數量。 |
+| `negative_query_path` | 負向文字查詢池路徑。 |
+| `negative_sample_ratio` | 負向查詢的取樣比例。 |
+| `negative_phrase_max_per_image` | 每張影像最多加入的負向描述數量。 |
+| `use_negative_queries_in_val` | 驗證階段是否加入負向文字查詢。 |
+
+## Train
+
+| 參數 | 功用 |
+|---|---|
+| `epochs` | 總訓練 epoch 數。 |
+| `batch_size` | 每次迭代的樣本數。 |
+| `warmup_epochs` | 學習率暖身週期。 |
+| `num_workers` | DataLoader worker 數量。 |
+| `device` | 使用的 GPU 編號。 |
+| `seed` | 隨機種子。 |
+| `deterministic` | 是否使用可重現但較慢的確定性運算。 |
+| `use_amp` | 是否使用混合精度訓練。 |
+| `amp_dtype` | AMP 使用的資料型別。 |
+| `allow_tf32` | 是否允許 NVIDIA GPU 使用 TF32。 |
+| `matmul_precision` | PyTorch 矩陣乘法精度策略。 |
+| `compile` | 是否使用 `torch.compile`。 |
+| `use_ema` | 是否使用模型權重指數移動平均。 |
+| `ema_decay` | EMA 衰減係數。 |
+| `grad_clip_norm` | 梯度裁切上限。 |
+
+## Optimizer
+
+`components` 格式：
+
+```text
+[排程模式, 最大學習率, 最小學習率, 起始比例, 結束比例]
+```
+
+| 參數 | 功用 |
+|---|---|
+| `vision` | Backbone、FPN 與影像投影層的學習率排程。 |
+| `text` | 文字分支的學習率排程。 |
+| `transformer` | Transformer 的學習率排程。 |
+| `head` | 預測頭的學習率排程。 |
+| `weight_decay` | AdamW 權重衰減。 |
+| `max_warmup_steps` | Warmup 最大 step 數。 |
+| `fused` | 是否使用 fused optimizer。 |
+
+## Loss
+
+模型主要使用 Hungarian matching，並結合以下訓練目標：
+
+```text
+BBox L1
+GIoU
+IoU-aware score
+Text alignment
+Duplicate suppression
+Hard-negative mining
+Auxiliary loss
+```
+
+| 區塊 | 功用 |
+|---|---|
+| `matcher` | 控制 Hungarian matching 的 bbox、GIoU、score 與文字對齊成本。 |
+| `weight` | 控制各 loss 的權重及動態排程。 |
+| `classification` | 控制 IoU-aware classification 與負樣本忽略門檻。 |
+| `quality` | 控制 Quality Focal Loss 與品質標籤範圍。 |
+| `text_alignment` | 控制影像 Query 與文字特徵對齊。 |
+| `matcher_schedule` | 控制 score matching 成本逐步啟用。 |
+| `score_sampling` | 控制額外正樣本與困難負樣本取樣。 |
+| `hybrid` | 控制主分支與輔助分支 loss。 |
+| `text_negative` | 控制負向文字樣本的訓練方式。 |
+| `duplicate_suppression` | 降低多個 Query 對同一目標的重複預測。 |
+| `hard_negative` | 強化高分但低 IoU 的錯誤候選框。 |
+| `ranking` | 控制額外的候選框排序 loss。 |
+| `query_refinement` | 控制第二階段 Query refinement 的限制。 |
+| `pos_weight` | 控制 BCE 正樣本權重。 |
+
+## Evaluation
+
+| 參數 | 功用 |
+|---|---|
+| `val_loss_interval` | 完整計算 validation loss 的間隔。 |
+| `eval_interval` | 執行偵測評估的間隔。 |
+| `max_val_batches` | 驗證最多使用的 batch 數；`null` 表示全部。 |
+| `score_thr` | 評估時的最低 score 門檻。 |
+| `top_k` | 每筆樣本最多保留的預測框數。 |
+| `nms_iou_thr` | NMS 的 IoU 門檻。 |
+| `use_nms` | 是否啟用 NMS。 |
+| `compute_raw_oracle` | 是否計算未排序候選框的理論召回能力。 |
+| `raw_oracle_iou_thresholds` | Raw Oracle Recall 使用的 IoU 門檻。 |
+| `best_metric` | 選擇最佳 checkpoint 的主要指標。 |
+
+主要評估指標：
+
+| 指標 | 說明 |
+|---|---|
+| `mAP50` | IoU=0.5 時的 Average Precision。 |
+| `mAP50-95` | IoU 0.5 至 0.95 的平均 AP。 |
+| `Precision` | 預測框中正確命中的比例。 |
+| `Recall` | GT 目標中被模型找出的比例。 |
+| `Recall@K` | 僅檢查分數排名前 K 個預測時的召回率。 |
+| `Raw Oracle Recall` | 不考慮最終排序時，所有候選框能達到的理論召回率。 |
+
+## Logging
+
+| 參數 | 功用 |
+|---|---|
+| `save_dir` | 權重與訓練紀錄輸出位置。 |
+| `weights_path` | 初始化模型權重路徑。 |
+| `resume_path` | 接續訓練使用的 checkpoint。 |
+| `prefer_ema` | 驗證與保存最佳模型時優先使用 EMA。 |
+| `save_latest_interval` | 儲存 latest checkpoint 的間隔。 |
+| `save_epoch_interval` | 額外保存 epoch checkpoint 的間隔。 |
+| `emit_step_metrics` | 是否記錄 step-level 指標。 |
+| `log_interval` | 輸出訓練資訊的 step 間隔。 |
+
+# Dataset Structure
 
 ```text
 datasets/
@@ -146,331 +339,12 @@ datasets/
     └── val/
 ```
 
-每個 JSON 標記檔應對應一張影像，且 bbox 應使用 `bbox_xyxy` 格式。
-
----
-
-# 3. train
-
-`train` 區塊控制訓練週期、batch、GPU、AMP、EMA 等設定。
-
-| 參數               |      預設值 | 型別    | 說明                                     |
-| ---------------- | -------: | ----- | -------------------------------------- |
-| `epochs`         |    `300` | int   | 總訓練 epoch 數。                           |
-| `batch_size`     |     `32` | int   | 每次訓練 batch 大小。                         |
-| `warmup_epochs`  |      `5` | int   | learning rate warmup 的 epoch 數。        |
-| `num_workers`    |     `18` | int   | dataloader worker 數量。                  |
-| `device`         | `cuda:1` | str   | 指定訓練裝置，例如 `cuda:0`、`cuda:1`、`cpu`。     |
-| `seed`           |     `42` | int   | 隨機種子，用於提高實驗可重現性。                       |
-| `use_amp`        |   `true` | bool  | 是否使用 AMP mixed precision。CUDA 訓練時建議開啟。 |
-| `use_ema`        |   `true` | bool  | 是否使用 EMA model 做驗證與保存最佳權重。             |
-| `ema_decay`      |  `0.999` | float | EMA 更新係數。越接近 `1.0`，EMA 模型變化越慢。         |
-| `grad_clip_norm` |    `1.0` | float | gradient clipping 上限。可降低訓練初期梯度爆炸風險。    |
-
-## batch_size 建議
-
-| GPU VRAM | 建議 batch_size |
-| -------: | ------------: |
-|     8 GB |       `4 ~ 8` |
-|    12 GB |      `8 ~ 16` |
-|    24 GB |     `16 ~ 32` |
-|    32 GB |    `32` 以上可嘗試 |
-
-如果出現 CUDA out of memory，優先降低：
-
-```yaml
-train:
-  batch_size: 16
-```
-
-其次降低：
-
-```yaml
-model:
-  image_grid_size: 10
-  num_layers: 2
-```
-
----
-
-# 4. optim
-
-`optim` 區塊控制 optimizer 與 learning rate schedule。
-
-| 參數                 |       預設值 | 型別    | 說明                                                                              |
-| ------------------ | --------: | ----- | ------------------------------------------------------------------------------- |
-| `lr_vision`        |  `0.0001` | float | 影像端模組 learning rate，例如 `BottleNet`、`ImgProjector`。                              |
-| `lr_text`          | `0.00001` | float | BERT 相關模組 learning rate。若 `freeze_bert=true`，主要影響文字 projection。                 |
-| `lr_transformer`   |  `0.0001` | float | Transformer fusion block learning rate。                                         |
-| `lr_head`          |  `0.0001` | float | DenseHead learning rate。                                                        |
-| `weight_decay`     |  `0.0001` | float | AdamW weight decay，用於正則化。                                                       |
-| `min_lr_ratio`     |    `0.05` | float | cosine scheduler 最低 learning rate 比例。                                           |
-| `max_warmup_steps` |    `3000` | int   | warmup 最大 step 數。實際 warmup step 會取 `warmup_epochs × len(train_loader)` 與此值的較小值。 |
-
-## learning rate 分組邏輯
-
-目前 optimizer 會依照模組名稱分配 learning rate：
-
-| 模組                        | 使用參數             |
-| ------------------------- | ---------------- |
-| `bottle_net`, `img_model` | `lr_vision`      |
-| `text_model.model`        | `lr_text`        |
-| `transformer`             | `lr_transformer` |
-| `head`                    | `lr_head`        |
-
-若 BERT 凍結，BERT 本體不會更新，但文字 projection 仍會訓練。
-
----
-
-# 5. loss
-
-`loss` 區塊控制 Hungarian matching 與 loss 權重相關設定。
-
-目前 loss 組成為：
-
-```text
-loss = λ_bbox × L1 + λ_giou × GIoU + λ_score × BCE
-```
-
-其中：
-
-| Loss   | 說明                                       |
-| ------ | ---------------------------------------- |
-| `L1`   | 預測 bbox 與 GT bbox 的座標距離                  |
-| `GIoU` | bbox 幾何重疊品質                              |
-| `BCE`  | 每個 image token 是否對應 query 目標的 score loss |
-
-| 參數               |   預設值 | 型別    | 說明                                    |
-| ---------------- | ----: | ----- | ------------------------------------- |
-| `cost_bbox`      | `5.0` | float | Hungarian matching 時 bbox L1 cost 權重。 |
-| `cost_giou`      | `2.0` | float | Hungarian matching 時 GIoU cost 權重。    |
-| `cost_score`     | `1.0` | float | Hungarian matching 時 score cost 權重。   |
-| `min_pos_weight` | `1.0` | float | BCE positive sample 最小權重。             |
-| `max_pos_weight` | `5.0` | float | BCE positive sample 最大權重。             |
-
-## cost 與 loss 的差異
-
-`cost_*` 用於 Hungarian matching，決定哪個 prediction 對應哪個 GT。
-
-真正反向傳播的 loss 權重則由訓練腳本中的動態 schedule 控制，例如：
-
-```text
-lambda_bbox
-lambda_giou
-lambda_score
-```
-
-`cost_bbox`、`cost_giou`、`cost_score` 不直接等於最終 loss 權重，但會影響匹配結果。
-
-## pos_weight
-
-因為 image token 很多，但正樣本通常很少，例如：
-
-```text
-100 個 image tokens 中，可能只有 1~5 個是正樣本
-```
-
-所以 `pos_weight` 用於提高正樣本在 BCE 中的重要性。
-
-若模型初期完全不出框或 score 很低，可以提高：
-
-```yaml
-loss:
-  max_pos_weight: 8.0
-```
-
-若 false positive 太多，可以降低：
-
-```yaml
-loss:
-  max_pos_weight: 3.0
-```
-
----
-
-# 6. eval
-
-`eval` 區塊控制驗證頻率與物件偵測指標計算方式。
-
-| 參數                  |     預設值 | 型別    | 說明                                          |
-| ------------------- | ------: | ----- | ------------------------------------------- |
-| `val_loss_interval` |     `1` | int   | 每幾個 epoch 計算一次 validation loss。             |
-| `eval_interval`     |     `1` | int   | 每幾個 epoch 計算一次 mAP / precision / recall。    |
-| `max_val_batches`   |   `320` | int   | 每次驗證最多使用幾個 validation batch。若資料很大，可降低以加快驗證。 |
-| `score_thr`         |  `0.25` | float | 推論時保留 prediction 的 score threshold。         |
-| `top_k`             |    `20` | int   | 每張圖最多保留前 K 個 prediction。                    |
-| `nms_iou_thr`       |   `0.5` | float | NMS IoU threshold。                          |
-| `best_metric`       | `map50` | str   | 用於保存最佳 checkpoint 的指標。                      |
-
-## 評估指標
-
-目前評估是 query-conditioned binary detection，不是多類別 COCO mAP。
-
-每筆樣本的語意是：
-
-```text
-image + query_text -> 找出符合 query 的所有 bbox
-```
-
-因此指標代表：
-
-| 指標          | 說明                                       |
-| ----------- | ---------------------------------------- |
-| `map50`     | IoU threshold = 0.5 時的 Average Precision |
-| `map50_95`  | IoU threshold 從 0.5 到 0.95 的平均 AP        |
-| `precision` | 被模型選出的框中，有多少比例是正確命中                      |
-| `recall`    | GT 目標中，有多少比例被模型找出                        |
-| `tp`        | true positive 數量                         |
-| `fp`        | false positive 數量                        |
-| `num_gt`    | GT bbox 總數                               |
-| `num_pred`  | 預測 bbox 總數                               |
-
-## score_thr 調整建議
-
-| 現象                | 調整方式                         |
-| ----------------- | ---------------------------- |
-| false positive 太多 | 提高 `score_thr`               |
-| recall 太低         | 降低 `score_thr`               |
-| 預測框太多             | 降低 `top_k` 或降低 `nms_iou_thr` |
-| 預測框被 NMS 過度移除     | 提高 `nms_iou_thr`             |
-
----
-
-# 7. log
-
-`log` 區塊控制 checkpoint 與訓練紀錄輸出。
-
-| 參數                    |    預設值 | 型別         | 說明                                     |
-| --------------------- | -----: | ---------- | -------------------------------------- |
-| `save_dir`            | `null` | str 或 null | checkpoint 儲存位置。若為 `null`，會自動建立時間戳資料夾。 |
-| `resume_path`         | `null` | str 或 null | 要恢復訓練的 checkpoint 路徑。                  |
-| `save_epoch_interval` |   `50` | int        | 每幾個 epoch 額外保存一次 checkpoint。           |
-| `emit_step_metrics`   | `true` | bool       | 是否輸出 step-level metrics。適合外部監聽訓練曲線。    |
-| `log_interval`        |   `10` | int        | 每幾個 step 寫入一次 step-level metrics。      |
-
-## 輸出檔案
-
-訓練時會在 `save_dir` 下輸出：
-
-```text
-latest.pt
-best_map50.pt
-metrics_step.jsonl
-metrics_epoch.jsonl
-metrics_epoch.csv
-latest_metrics.json
-```
-
-| 檔案                    | 說明                                                |
-| --------------------- | ------------------------------------------------- |
-| `latest.pt`           | 最新 checkpoint                                     |
-| `best_map50.pt`       | 根據 `best_metric` 保存的最佳 checkpoint                 |
-| `metrics_step.jsonl`  | step-level loss 紀錄                                |
-| `metrics_epoch.jsonl` | epoch-level loss / mAP / precision / recall       |
-| `metrics_epoch.csv`   | 與 `metrics_epoch.jsonl` 相同，但方便用 pandas / Excel 讀取 |
-| `latest_metrics.json` | 最新一筆 epoch 指標，適合外部監聽程式讀取                          |
-
----
-
-# 8. 常用設定建議
-
-## 低 VRAM 設定
-
-```yaml
-model:
-  num_layers: 2
-  image_grid_size: 10
-
-train:
-  batch_size: 8
-  use_amp: true
-```
-
-## 提高多目標能力
-
-```yaml
-model:
-  image_grid_size: 20
-
-eval:
-  top_k: 50
-```
-
-## 降低 false positive
-
-```yaml
-eval:
-  score_thr: 0.4
-  top_k: 10
-
-loss:
-  max_pos_weight: 3.0
-```
-
-## 提高 recall
-
-```yaml
-eval:
-  score_thr: 0.15
-  top_k: 50
-
-loss:
-  max_pos_weight: 5.0
-```
-
-## 訓練不穩定時
-
-```yaml
-train:
-  grad_clip_norm: 1.0
-
-optim:
-  lr_vision: 0.00005
-  lr_transformer: 0.00005
-  lr_head: 0.00005
-```
-
----
-
-# 9. 執行方式
-
-使用 YAML 訓練：
-
-```bash
-python3 train_card.py --config cards/config/model.yaml
-```
-
-臨時覆蓋 batch size：
-
-```bash
-python3 train_card.py \
-  --config cards/config/model.yaml \
-  --batch-size 16
-```
-
-指定 GPU：
-
-```bash
-python3 train_card.py \
-  --config cards/config/model.yaml \
-  --device cuda:0
-```
-
-恢復訓練：
-
-```bash
-python3 train_card.py \
-  --config cards/config/model.yaml \
-  --resume-path checkpoints/results_xxxx/latest.pt
-```
-
----
-
-# 10. 注意事項
-
-1. GT bbox 必須是 normalized `xyxy` 或在 dataloader 中轉成 normalized `xyxy`。
-2. 模型輸出的 bbox 必須是 normalized `xyxy`。
-3. `score_logit` 應直接丟給 `BCEWithLogitsLoss`，不要先做 sigmoid。
-4. 推論與評估時才對 `score_logit` 做 sigmoid。
-5. 目前不需要 class label prediction。
-6. 目前 mAP / precision / recall 是文字查詢條件下的 binary detection 指標，不是多類別分類指標。
+每筆標記需包含文字查詢與對應的 `bbox_xyxy`。訓練前需確認 bbox 已正規化，或由 DataLoader 轉換為 normalized `xyxy`。
+
+# Notes
+
+- `score_logit` 應直接輸入 `BCEWithLogitsLoss`，不要預先執行 sigmoid。
+- Sigmoid 僅在推論與評估階段使用。
+- 評估為文字條件式 binary detection，不是多類別 COCO classification。
+- `hidden_dim` 必須能被 Transformer 的 `num_heads` 與 `score_num_heads` 整除。
+- 修改 `token_grids`、Transformer 層數或 batch size 時，需重新確認 VRAM 使用量。
