@@ -12,6 +12,7 @@ outputs/
 logs/
 *.log
 
+
 # Dataset
 datasets/images/
 datasets/labels/
@@ -29,7 +30,7 @@ datasets/labels/
 units/model/checkpoints/
 units/model/bert_cache/
 units/model/resnet/checkpoints/
-
+units/model/cards/config/train_pos.yaml
 # Large pretrained model folders
 units/model/bert/
 units/model/resnet/
