@@ -1,11 +1,12 @@
 # LightDet
 
 ![Framework](https://img.shields.io/badge/framework-PyTorch-EE4C2C)
-![Task](https://img.shields.io/badge/task-Text--Conditioned%20Object%20Detection-2F80ED)
-![Architecture](https://img.shields.io/badge/architecture-FPN%20%2B%20Transformer-8A2BE2)
-![Backbone](https://img.shields.io/badge/backbone-Lightweight%20CNN-4CAF50)
+![Architecture](https://img.shields.io/badge/architecture-DETR%20%2B%20FPN%20%2B%20Transformer-8A2BE2)
+![Modality](https://img.shields.io/badge/input-Text%20%2B%20Image-2F80ED)
+![Task](https://img.shields.io/badge/task-Multimodal%20Object%20Detection-4CAF50)
 ![Precision](https://img.shields.io/badge/precision-BF16%20AMP-FF9800)
-![GPU](https://img.shields.io/badge/GPU-NVIDIA%20RTX%205000%20Ada-76B900)
+![GPU](https://img.shields.io/badge/GPU-NVIDIA-76B900)
+![Input Size](https://img.shields.io/badge/image-1024%C3%971024-607D8B)
 ![Status](https://img.shields.io/badge/status-active%20research-yellow)
 
 LightDet 是一個以 DETR 為基礎的文字引導物件偵測模型（text-guided object detection）。模型接收影像與文字描述，輸出與文字語意對應的邊界框與信心分數。
