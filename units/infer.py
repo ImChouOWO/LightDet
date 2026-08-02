@@ -1849,17 +1849,16 @@ def main() -> None:
 
     model = LightDet(
         model=(
-            "/home/soic/Desktop/LightDet/"
-            "units/model/cards/config/model.yaml"
+            "path/to/your/model_config.yaml"
         )
     )
 
     model.predict(
         weights=(
-            "/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_ODVG_token_alignment/best_map50_95.pt"
+            "path/to/your/model_weights.pt"
         ),
         source=(
-            "/home/soic/Desktop/datasetPreTest15000/dataset/sys/rain/2021_11_14_16_43_48_01330.jpg"
+            "path/to/your/image.jpg"
         ),
 
         

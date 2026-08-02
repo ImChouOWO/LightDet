@@ -3683,16 +3683,19 @@ class LightDet:
         return train(args)
 
 
-def main() -> None:
+def main(model_cfg:str, train_cfg:str) -> None:
     os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
     model = LightDet(
-        model=str("/home/soic/Desktop/LightDet/units/model/cards/config/model.yaml"),
+        model=model_cfg,
     )
     model.train(
-        cfg=str("/home/soic/Desktop/LightDet/units/model/cards/config/train.yaml"),
+        cfg=train_cfg,
     )
 
 
 if __name__ == "__main__":
-    main()
+    main(
+        model_cfg="path/to/your/model_config.yaml",
+        train_cfg="path/to/your/train_config.yaml"
+    )

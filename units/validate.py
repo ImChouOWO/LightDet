@@ -76,9 +76,9 @@ from units.model.train import (
 from units.tool.card import VisionTextModel
 
 
-# ---------------------------------------------------------------------------
+
 # Checkpoint
-# ---------------------------------------------------------------------------
+
 
 
 def normalize_state_dict_keys(
@@ -279,9 +279,9 @@ def load_checkpoint_for_validation(
     }
 
 
-# ---------------------------------------------------------------------------
+
 # Build model / loss
-# ---------------------------------------------------------------------------
+
 
 
 def build_validation_model(
@@ -375,9 +375,9 @@ def build_validation_criterion(
     )
 
 
-# ---------------------------------------------------------------------------
+
 # Output
-# ---------------------------------------------------------------------------
+
 
 
 def write_json_atomic(
@@ -411,9 +411,9 @@ def write_json_atomic(
     )
 
 
-# ---------------------------------------------------------------------------
+
 # Validation core
-# ---------------------------------------------------------------------------
+
 
 
 def validate(
@@ -847,9 +847,9 @@ def validate(
     return result
 
 
-# ---------------------------------------------------------------------------
+
 # YOLO-style interface
-# ---------------------------------------------------------------------------
+
 
 
 class LightDet(TrainLightDet):
@@ -988,22 +988,19 @@ def main() -> None:
 
     model = LightDet(
         model=(
-            "/home/soic/Desktop/LightDet/"
-            "units/model/cards/config/model.yaml"
+            "path/to/your/model_config.yaml"
         )
     )
 
     model.val(
         cfg=(
-            "/home/soic/Desktop/LightDet/"
-            "units/model/cards/config/train.yaml"
+            "path/to/your/train_config.yaml"
         ),
         weights=(
-            "/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_HDETR_transformer_layer_decoupled_v2/epoch_100.pt"
+            "path/to/your/model_weights.pt"
         ),
         data=(
-            "/home/soic/Desktop/LightDet/"
-            "datasets"
+            "path/to/your/datasets"
         ),
         imgsz=512,
         batch=48,
