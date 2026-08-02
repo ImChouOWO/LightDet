@@ -6,7 +6,6 @@
 ![Backbone](https://img.shields.io/badge/backbone-Lightweight%20CNN-4CAF50)
 ![Precision](https://img.shields.io/badge/precision-BF16%20AMP-FF9800)
 ![GPU](https://img.shields.io/badge/GPU-NVIDIA%20RTX%205000%20Ada-76B900)
-![Input](https://img.shields.io/badge/input-1024%C3%971024-607D8B)
 ![Status](https://img.shields.io/badge/status-active%20research-yellow)
 
 LightDet 是一個以 DETR 為基礎的文字引導物件偵測模型（text-guided object detection）。模型接收影像與文字描述，輸出與文字語意對應的邊界框與信心分數。
