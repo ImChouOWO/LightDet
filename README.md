@@ -7,6 +7,13 @@
 ![Precision](https://img.shields.io/badge/precision-BF16%20AMP-FF9800)
 ![GPU](https://img.shields.io/badge/GPU-NVIDIA-76B900)
 ![Status](https://img.shields.io/badge/status-active%20research-yellow)
+---
+![Modality](https://img.shields.io/badge/modality-Vision--Language-2F80ED)
+![Task](https://img.shields.io/badge/task-Object%20Detection-4CAF50)
+![Architecture](https://img.shields.io/badge/architecture-DETR--like-8A2BE2)
+![Decoder](https://img.shields.io/badge/decoder-Decoder--only-FF9800)
+![Training](https://img.shields.io/badge/training-H--DETR-E91E63)
+![Alignment](https://img.shields.io/badge/alignment-ODVG%20Token%20Alignment-00A6A6)
 
 LightDet 是一個以 DETR 為基礎的文字引導物件偵測模型（text-guided object detection）。模型接收影像與文字描述，輸出與文字語意對應的邊界框與信心分數。
 
@@ -16,7 +23,7 @@ Image + Text Query -> Bounding Boxes + Scores
 
 目前版本採用 Decoder-only Object Query、兩階段 Query Refinement、H-DETR Main/Auxiliary 分支，以及 ODVG 風格的 token-level text alignment。
 
-`Vision-Language` `Object Detection` `DETR-like` `Decoder-only` `H-DETR` `ODVG Token Alignment`
+
 
 ---
 
