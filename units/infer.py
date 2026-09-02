@@ -1189,6 +1189,9 @@ class LightDet:
             else None
         )
 
+        print(f"\n[LightDet] Inference complete")
+        print(f"Saved image: {result['saved_image']}")
+
         return result
 
 
@@ -1201,7 +1204,9 @@ def main() -> None:
     """
     model = LightDet(
         model=(
-            "path/to/your/model_config.yaml"
+
+            "/path/to/LightDet/units/model/cards/config/model.yaml"
+
         )
     )
 
@@ -1211,13 +1216,16 @@ def main() -> None:
         ),
         source=(
             "path/to/your/image.jpg"
+
+            "weights/path"
         ),
+
         caption="紅色黑色的船",
         phrases=[
             "紅色黑色的船",
         ],
         imgsz=1024,
-        device=1,
+        device=0,
         conf=0.60,
         quality_thr=0.3,
         alignment_thr=0.3,
