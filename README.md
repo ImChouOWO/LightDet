@@ -825,6 +825,49 @@ Aux：
 → 要求 IoU 高於閾值或 Query 中心位於 GT 內
 → 限制每個 GT 的最大候選數
 → 作為額外定位正樣本
+
+
+輸入影像
+├─ object_1：bbox=[1858,493,2017,558]
+│  └─ 黃、綠、白色船
+└─ object_2：bbox=[1510,433,1535,465]
+   └─ 紅色船
+
+輸入描述
+├─ phrase_A：黃綠白相間的船
+├─ phrase_B：含綠色的船
+└─ phrase_C：單色紅色的船
+            │
+            ▼
+     Image / Text Encoder
+            │
+            ▼
+   Object Queries：Q1、Q2、...、Q100
+            │
+            ▼
+       預測候選框
+            │
+            ▼
+┌──────── Hungarian Matching ────────┐
+│ Q7  ↔ object_1 bbox                │
+│ Q23 ↔ object_2 bbox                │
+│ 其他 Query ↔ Background            │
+└────────────────────────────────────┘
+            │
+            ▼
+       描述對齊監督
+
+             phrase_A   phrase_B   phrase_C
+Q7/object_1      正          正          負
+Q23/object_2     負          負          正
+其他 Query       負          負          負
+            │
+            ▼
+Loss =
+BBox Loss + GIoU Loss
++ Quality Loss
++ Alignment Loss
++ Ranking Loss
 ```
 
 不單獨使用總成本固定閾值，因為 BBox L1、GIoU、Quality 與 Alignment cost 的尺度會隨訓練變化。採用 `Top-K + IoU 閾值 + 最大候選數` 可限制低品質候選污染輔助分支。
