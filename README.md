@@ -783,7 +783,54 @@ latest_metrics.json
 
 ---
 
+---
 
+<details>
+<summary><em>待辦事項：物件關係標註與 One-to-Many 輔助分配</em></summary>
 
+<br>
 
+### 資料結構
 
+將物件框與文字描述分開儲存，並以物件 ID 建立關係：
+
+```text
+objects：
+object_id → 唯一 BBox
+
+phrases：
+phrase → positive_object_ids / negative_object_ids / ignore_object_ids
+```
+
+同一個 BBox 只作為一份定位 GT，但可以對應多個正向描述。取樣時建立「描述 × 物件」關係矩陣，明確區分正例、負例與忽略項目。
+
+如此可避免同一物件因多段描述而產生重複定位 GT，並讓定位與文字對齊分別接受一致的監督。
+
+### Matching 與輔助分配
+
+```text
+成本矩陣 → 選出哪些 Query 對應某個物件
+關係矩陣 → 定義該物件符合哪些文字描述
+```
+
+建議流程：
+
+```text
+Main：
+Hungarian one-to-one
+→ 每個 GT 選擇 1 個主要 Query
+
+Aux：
+每個 GT 從相同成本矩陣選擇 Top-K Queries
+→ 要求 IoU 高於閾值或 Query 中心位於 GT 內
+→ 限制每個 GT 的最大候選數
+→ 作為額外定位正樣本
+```
+
+不單獨使用總成本固定閾值，因為 BBox L1、GIoU、Quality 與 Alignment cost 的尺度會隨訓練變化。採用 `Top-K + IoU 閾值 + 最大候選數` 可限制低品質候選污染輔助分支。
+
+描述的正負關係仍由資料集關係矩陣決定，不使用模型當前的 Alignment 分數產生標籤。Main 與 Aux 匹配完成後，再對已分配的 Query 計算 Token Alignment Loss 與 Phrase Ranking Loss。
+
+訓練前期以 BBox 與 GIoU cost 為主，後續再逐步加入 Quality 與 Alignment cost，降低文字對齊能力尚未穩定時造成的錯誤分配。
+
+</details>
