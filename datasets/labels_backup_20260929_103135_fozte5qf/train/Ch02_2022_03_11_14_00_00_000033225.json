@@ -1,0 +1,67 @@
+{
+  "filename": "Ch02_2022_03_11_14_00_00_000033225.jpg",
+  "height": 2160,
+  "width": 3840,
+  "grounding": {
+    "caption": "單色灰色的船。含灰色的船。",
+    "regions": [
+      {
+        "semantic_key": "single_color:灰色",
+        "phrase": "單色灰色的船",
+        "tokens_positive": [
+          [
+            0,
+            6
+          ]
+        ],
+        "bbox": [
+          [
+            1973,
+            840,
+            2812,
+            1311
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:灰色",
+        "phrase": "含灰色的船",
+        "tokens_positive": [
+          [
+            7,
+            12
+          ]
+        ],
+        "bbox": [
+          [
+            1973,
+            840,
+            2812,
+            1311
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "Ch02_2022_03_11_14_00_00_000033225",
+    "source_label": "Ch02_2022_03_11_14_00_00_000033225.json",
+    "object_count": 1,
+    "region_count": 2,
+    "phrase_variants": {
+      "單色灰色的船": [
+        "純灰色的船",
+        "船體僅為灰色的船",
+        "只有灰色的船"
+      ],
+      "含灰色的船": [
+        "帶有灰色的船",
+        "船體包含灰色的船",
+        "有灰色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "灰色的船"
+    ]
+  }
+}

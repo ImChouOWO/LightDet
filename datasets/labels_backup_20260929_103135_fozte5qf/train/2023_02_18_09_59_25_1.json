@@ -1,0 +1,42 @@
+{
+  "filename": "2023_02_18_09_59_25_1.jpg",
+  "height": 720,
+  "width": 1280,
+  "grounding": {
+    "caption": "船。",
+    "regions": [
+      {
+        "semantic_key": "raw_query:船",
+        "phrase": "船",
+        "tokens_positive": [
+          [
+            0,
+            1
+          ]
+        ],
+        "bbox": [
+          [
+            2,
+            84,
+            488,
+            513
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "2023_02_18_09_59_25_1",
+    "source_label": "2023_02_18_09_59_25_1.json",
+    "object_count": 1,
+    "region_count": 1,
+    "phrase_variants": {
+      "船": [
+        "一艘船"
+      ]
+    },
+    "original_query_texts": [
+      "船"
+    ]
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "filename": "Ch02_2022_03_14_13_00_00_000010080.jpg",
+  "height": 2160,
+  "width": 3840,
+  "grounding": {
+    "caption": "單色紅色的船。含紅色的船。",
+    "regions": [
+      {
+        "semantic_key": "single_color:紅色",
+        "phrase": "單色紅色的船",
+        "tokens_positive": [
+          [
+            0,
+            6
+          ]
+        ],
+        "bbox": [
+          [
+            0,
+            977,
+            3727,
+            2160
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:紅色",
+        "phrase": "含紅色的船",
+        "tokens_positive": [
+          [
+            7,
+            12
+          ]
+        ],
+        "bbox": [
+          [
+            0,
+            977,
+            3727,
+            2160
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "Ch02_2022_03_14_13_00_00_000010080",
+    "source_label": "Ch02_2022_03_14_13_00_00_000010080.json",
+    "object_count": 1,
+    "region_count": 2,
+    "phrase_variants": {
+      "單色紅色的船": [
+        "純紅色的船",
+        "船體僅為紅色的船",
+        "只有紅色的船"
+      ],
+      "含紅色的船": [
+        "帶有紅色的船",
+        "船體包含紅色的船",
+        "有紅色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "紅色的船"
+    ]
+  }
+}

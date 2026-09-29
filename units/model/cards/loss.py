@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from units.model.cards.relation_loss import phrase_predictions, relation_cost, relation_loss
 
 try:
     from scipy.optimize import linear_sum_assignment
@@ -354,6 +355,7 @@ class HungarianOneToOneMatcher:
         positive_token_maps: Optional[Sequence[torch.Tensor]] = None,
         alignment_text_mask: Optional[torch.Tensor] = None,
         alignment_cost_alpha: float = 1.0,
+        phrase_costs: Optional[Sequence[torch.Tensor]] = None,
     ) -> AssignmentResult:
         if pred_bbox.ndim != 3 or pred_bbox.shape[-1] != 4:
             raise ValueError(f"pred_bbox must be [B,Q,4], got {tuple(pred_bbox.shape)}")
@@ -398,9 +400,11 @@ class HungarianOneToOneMatcher:
         score_cost = self._score_cost(score_logit.detach().float().sigmoid())
         empty = torch.empty(0, dtype=torch.long, device=pred_bbox.device)
         rows: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        self.cost_matrices = []
         for batch_index, target_count in enumerate(packed_targets.counts):
             target_count = int(target_count)
             if target_count == 0 or num_queries == 0:
+                self.cost_matrices.append(pred_bbox.new_empty((num_queries, target_count)))
                 rows.append((empty, empty))
                 continue
             start = int(packed_targets.offsets[batch_index].item())
@@ -417,7 +421,9 @@ class HungarianOneToOneMatcher:
                     * score_cost_alpha
                     * score_cost[batch_index, :, None]
                 )
-            if use_alignment:
+            if phrase_costs is not None and alignment_cost_alpha > 0:
+                cost = cost + self.cost_alignment * alignment_cost_alpha * phrase_costs[batch_index].detach()
+            elif use_alignment:
                 token_cost = _balanced_token_cost(
                     pred_token_alignment_logit[batch_index],
                     positive_token_maps[batch_index],
@@ -434,6 +440,7 @@ class HungarianOneToOneMatcher:
                     * alignment_cost_alpha
                     * token_cost
                 )
+            self.cost_matrices.append(cost.detach())
             if target_count == 1:
                 pred_index = torch.argmin(cost[:, 0]).reshape(1)
                 gt_index = torch.zeros(1, dtype=torch.long, device=pred_bbox.device)
@@ -519,18 +526,25 @@ class HDETRRepeatedHungarianMatcher(HungarianOneToOneMatcher):
                 used[primary_pred] = True
             pred_rows = [primary_pred]
             gt_rows = [primary_gt]
-            for gt_index in range(target_count):
-                need = min(self.repeat_k - 1, int((~used).sum().item()))
-                if need <= 0:
-                    break
-                candidate = pair_iou[:, gt_index].masked_fill(used, -1.0)
-                values, indices = torch.topk(candidate, k=need, largest=True)
-                keep = values >= self.min_extra_positive_iou
-                indices = indices[keep]
-                if indices.numel():
-                    used[indices] = True
-                    pred_rows.append(indices)
-                    gt_rows.append(torch.full_like(indices, gt_index))
+            cost = self.cost_matrices[batch_index]
+            eligible = (~used[:, None]) & (pair_iou >= self.min_extra_positive_iou)
+            candidate = cost.masked_fill(~eligible, torch.inf)
+            k = min(self.repeat_k - 1, boxes.shape[0])
+            values, indices = candidate.topk(k, dim=0, largest=False)
+            gt_grid = torch.arange(target_count, device=boxes.device).expand_as(indices)
+            finite = torch.isfinite(values)
+            pairs = list(zip(values[finite].tolist(), indices[finite].tolist(), gt_grid[finite].tolist()))
+            # Resolve collisions by cost globally, not by GT annotation order.
+            claimed = set(primary_pred.tolist())
+            extra_pred, extra_gt = [], []
+            for _, q, g in sorted(pairs):
+                if q not in claimed:
+                    claimed.add(q)
+                    extra_pred.append(q)
+                    extra_gt.append(g)
+            if extra_pred:
+                pred_rows.append(torch.tensor(extra_pred, device=boxes.device, dtype=torch.long))
+                gt_rows.append(torch.tensor(extra_gt, device=boxes.device, dtype=torch.long))
             rows.append((torch.cat(pred_rows), torch.cat(gt_rows)))
         return AssignmentResult.from_per_batch(
             rows,
@@ -792,7 +806,7 @@ class GroundingLoss(nn.Module):
             "focal_gamma",
             classification.get("focal_gamma", quality.get("qfl_beta", 2.0)),
         )
-        return cls(
+        instance = cls(
             cost_bbox=matcher.get("cost_bbox", 5.0),
             cost_giou=matcher.get("cost_giou", 2.0),
             cost_score=matcher.get("cost_score", 2.0),
@@ -880,6 +894,9 @@ class GroundingLoss(nn.Module):
             rank_alpha_min=ranking.get("rank_alpha_min", 0.0),
             rank_negative_iou_max=ranking.get("rank_negative_iou_max", 0.20),
         )
+        instance.alignment_match_start = int(matcher_schedule.get("alignment_start_epoch", 10))
+        instance.alignment_match_warmup = int(matcher_schedule.get("alignment_warmup_epoch", 15))
+        return instance
 
     def resolve_epoch_alpha(
         self,
@@ -1552,6 +1569,14 @@ class GroundingLoss(nn.Module):
             and valid_token_mask is not None
             and schedule.alignment_alpha > 0.0
         )
+        phrase_logits = None
+        phrase_costs = None
+        alignment_match_alpha = schedule_progress(current_epoch,
+            getattr(self, "alignment_match_start", 10), getattr(self, "alignment_match_warmup", 15))
+        if self.text_alignment_enabled and token_logits is not None:
+            offsets = self._extract_metadata(quality_logit, token_offsets, "_token_offsets")
+            phrase_logits = phrase_predictions(token_logits, offsets, valid_token_mask, effective_targets)
+            phrase_costs = [relation_cost(p, t) for p, t in zip(phrase_logits, effective_targets)]
         assignments = self.main_matcher(
             pred_bbox=pred_bbox,
             pred_score_logit=quality_logit,
@@ -1561,7 +1586,8 @@ class GroundingLoss(nn.Module):
             pred_token_alignment_logit=token_logits if use_token_matching else None,
             positive_token_maps=token_maps if use_token_matching else None,
             alignment_text_mask=valid_token_mask if use_token_matching else None,
-            alignment_cost_alpha=schedule.alignment_alpha,
+            alignment_cost_alpha=alignment_match_alpha,
+            phrase_costs=phrase_costs,
         )
         main_loss, main_metrics = self._branch_loss(
             pred_bbox=pred_bbox,
@@ -1594,15 +1620,10 @@ class GroundingLoss(nn.Module):
             "ignored_count": zero,
             "rank_pair_count": zero,
         }
-        if use_token_matching:
-            alignment_loss, alignment_rank_loss, alignment_metrics = self._token_alignment_loss(
-                token_logits=token_logits,
-                positive_token_maps=token_maps,
-                valid_token_mask=valid_token_mask,
-                assignments=assignments,
-                text_negative_mask=negative_mask,
-                query_loss_weights=query_loss_weights,
-            )
+        if phrase_logits is not None:
+            alignment_loss, alignment_rank_loss, alignment_metrics = relation_loss(
+                phrase_logits, effective_targets, assignments, self.text_alignment_focal_gamma,
+                self.text_alignment_ranking_margin, self.text_alignment_negative_weight)
         alignment_weight = (
             self.text_alignment_loss_weight
             if lambda_text_alignment is None
@@ -1633,6 +1654,10 @@ class GroundingLoss(nn.Module):
                 aux_token_candidate,
                 "_token_alignment_logits",
             )
+            aux_phrases = (phrase_predictions(aux_token, offsets, valid_token_mask, effective_targets)
+                           if phrase_logits is not None and aux_token is not None else None)
+            aux_phrase_costs = ([relation_cost(p, t) for p, t in zip(aux_phrases, effective_targets)]
+                                if aux_phrases is not None else None)
             aux_assignments = self.aux_matcher(
                 pred_bbox=aux_pred_bbox,
                 pred_score_logit=aux_quality,
@@ -1642,7 +1667,8 @@ class GroundingLoss(nn.Module):
                 pred_token_alignment_logit=aux_token if use_token_matching else None,
                 positive_token_maps=token_maps if use_token_matching else None,
                 alignment_text_mask=valid_token_mask if use_token_matching else None,
-                alignment_cost_alpha=schedule.alignment_alpha,
+                alignment_cost_alpha=alignment_match_alpha,
+                phrase_costs=aux_phrase_costs,
             )
             aux_loss, aux_metrics = self._branch_loss(
                 pred_bbox=aux_pred_bbox,
@@ -1660,6 +1686,14 @@ class GroundingLoss(nn.Module):
                 negative_iou_ignore_thr=0.0,
                 enable_extra_negative_losses=False,
             )
+            if aux_phrases is not None:
+                aux_align, aux_rank, _ = relation_loss(aux_phrases, effective_targets, aux_assignments,
+                    self.text_alignment_focal_gamma, self.text_alignment_ranking_margin,
+                    self.text_alignment_negative_weight)
+                aux_loss = aux_loss + schedule.alignment_alpha * (
+                    alignment_weight * aux_align + self.text_alignment_ranking_weight * aux_rank)
+                aux_metrics["loss_alignment"] = aux_align.detach()
+                aux_metrics["loss_alignment_rank"] = aux_rank.detach()
         elif (aux_pred_bbox is None) != (aux_pred_score_logit is None):
             raise ValueError("aux_pred_bbox and aux_pred_score_logit must be provided together")
         lambda_aux_eff = self.aux_loss_weight if lambda_aux is None else max(0.0, float(lambda_aux))

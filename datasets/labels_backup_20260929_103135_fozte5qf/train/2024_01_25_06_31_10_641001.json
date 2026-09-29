@@ -1,0 +1,114 @@
+{
+  "filename": "2024_01_25_06_31_10_641001.jpg",
+  "height": 1080,
+  "width": 1920,
+  "grounding": {
+    "caption": "單色灰白的船。單色灰色的船。含灰白的船。含灰色的船。",
+    "regions": [
+      {
+        "semantic_key": "single_color:灰白",
+        "phrase": "單色灰白的船",
+        "tokens_positive": [
+          [
+            0,
+            6
+          ]
+        ],
+        "bbox": [
+          [
+            1815,
+            519,
+            1920,
+            628
+          ]
+        ]
+      },
+      {
+        "semantic_key": "single_color:灰色",
+        "phrase": "單色灰色的船",
+        "tokens_positive": [
+          [
+            7,
+            13
+          ]
+        ],
+        "bbox": [
+          [
+            273,
+            615,
+            364,
+            657
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:灰白",
+        "phrase": "含灰白的船",
+        "tokens_positive": [
+          [
+            14,
+            19
+          ]
+        ],
+        "bbox": [
+          [
+            1815,
+            519,
+            1920,
+            628
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:灰色",
+        "phrase": "含灰色的船",
+        "tokens_positive": [
+          [
+            20,
+            25
+          ]
+        ],
+        "bbox": [
+          [
+            273,
+            615,
+            364,
+            657
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "2024_01_25_06_31_10_641001",
+    "source_label": "2024_01_25_06_31_10_641001.json",
+    "object_count": 2,
+    "region_count": 4,
+    "phrase_variants": {
+      "單色灰白的船": [
+        "純灰白的船",
+        "船體僅為灰白的船",
+        "只有灰白的船"
+      ],
+      "單色灰色的船": [
+        "純灰色的船",
+        "船體僅為灰色的船",
+        "只有灰色的船"
+      ],
+      "含灰白的船": [
+        "帶有灰白的船",
+        "船體包含灰白的船",
+        "有灰白部分的船"
+      ],
+      "含灰色的船": [
+        "帶有灰色的船",
+        "船體包含灰色的船",
+        "有灰色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "灰白的船",
+      "灰的船"
+    ]
+  }
+}

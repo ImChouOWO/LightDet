@@ -1,0 +1,113 @@
+{
+  "filename": "ch002_20220717235306_000033984.jpg",
+  "height": 2160,
+  "width": 3840,
+  "grounding": {
+    "caption": "灰藍黃相間的船。含灰色的船。含藍色的船。含黃色的船。",
+    "regions": [
+      {
+        "semantic_key": "colors_exact:灰色|黃色|藍色",
+        "phrase": "灰藍黃相間的船",
+        "tokens_positive": [
+          [
+            0,
+            7
+          ]
+        ],
+        "bbox": [
+          [
+            1,
+            533,
+            258,
+            1021
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:灰色",
+        "phrase": "含灰色的船",
+        "tokens_positive": [
+          [
+            8,
+            13
+          ]
+        ],
+        "bbox": [
+          [
+            1,
+            533,
+            258,
+            1021
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:藍色",
+        "phrase": "含藍色的船",
+        "tokens_positive": [
+          [
+            14,
+            19
+          ]
+        ],
+        "bbox": [
+          [
+            1,
+            533,
+            258,
+            1021
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:黃色",
+        "phrase": "含黃色的船",
+        "tokens_positive": [
+          [
+            20,
+            25
+          ]
+        ],
+        "bbox": [
+          [
+            1,
+            533,
+            258,
+            1021
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "ch002_20220717235306_000033984",
+    "source_label": "ch002_20220717235306_000033984.json",
+    "object_count": 1,
+    "region_count": 4,
+    "phrase_variants": {
+      "灰藍黃相間的船": [
+        "灰、藍、黃相間的船",
+        "一艘灰藍黃相間的船",
+        "灰藍黃多色的船"
+      ],
+      "含灰色的船": [
+        "帶有灰色的船",
+        "船體包含灰色的船",
+        "有灰色部分的船"
+      ],
+      "含藍色的船": [
+        "帶有藍色的船",
+        "船體包含藍色的船",
+        "有藍色部分的船"
+      ],
+      "含黃色的船": [
+        "帶有黃色的船",
+        "船體包含黃色的船",
+        "有黃色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "灰藍黃相間的船"
+    ]
+  }
+}

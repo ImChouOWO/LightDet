@@ -1,0 +1,67 @@
+{
+  "filename": "Ch01_2022_07_09_08_00_00_000033030.jpg",
+  "height": 2160,
+  "width": 3840,
+  "grounding": {
+    "caption": "深藍色的船。含深藍色的船。",
+    "regions": [
+      {
+        "semantic_key": "colors_exact:深藍色",
+        "phrase": "深藍色的船",
+        "tokens_positive": [
+          [
+            0,
+            5
+          ]
+        ],
+        "bbox": [
+          [
+            0,
+            905,
+            1635,
+            1260
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:深藍色",
+        "phrase": "含深藍色的船",
+        "tokens_positive": [
+          [
+            6,
+            12
+          ]
+        ],
+        "bbox": [
+          [
+            0,
+            905,
+            1635,
+            1260
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "Ch01_2022_07_09_08_00_00_000033030",
+    "source_label": "Ch01_2022_07_09_08_00_00_000033030.json",
+    "object_count": 1,
+    "region_count": 2,
+    "phrase_variants": {
+      "深藍色的船": [
+        "一艘深藍色的船",
+        "深藍色船隻",
+        "船體是深藍色的船"
+      ],
+      "含深藍色的船": [
+        "帶有深藍色的船",
+        "船體包含深藍色的船",
+        "有深藍色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "深藍色的船"
+    ]
+  }
+}

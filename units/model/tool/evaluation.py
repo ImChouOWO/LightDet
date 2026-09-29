@@ -709,7 +709,7 @@ def build_phrase_evaluation_rows(
                 else:
                     target_indices = []
 
-                if not target_indices:
+                if image_mapping is None:
                     # Structural fallback for older ODVG collates.
                     target_indices = list(
                         range(target_boxes.shape[0])

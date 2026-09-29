@@ -1,0 +1,67 @@
+{
+  "filename": "ch002_20220718083129_001_000013320.jpg",
+  "height": 2160,
+  "width": 3840,
+  "grounding": {
+    "caption": "黑色的船。含黑色的船。",
+    "regions": [
+      {
+        "semantic_key": "colors_exact:黑色",
+        "phrase": "黑色的船",
+        "tokens_positive": [
+          [
+            0,
+            4
+          ]
+        ],
+        "bbox": [
+          [
+            1211,
+            625,
+            3759,
+            1277
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:黑色",
+        "phrase": "含黑色的船",
+        "tokens_positive": [
+          [
+            5,
+            10
+          ]
+        ],
+        "bbox": [
+          [
+            1211,
+            625,
+            3759,
+            1277
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "ch002_20220718083129_001_000013320",
+    "source_label": "ch002_20220718083129_001_000013320.json",
+    "object_count": 1,
+    "region_count": 2,
+    "phrase_variants": {
+      "黑色的船": [
+        "一艘黑色的船",
+        "黑色船隻",
+        "船體是黑色的船"
+      ],
+      "含黑色的船": [
+        "帶有黑色的船",
+        "船體包含黑色的船",
+        "有黑色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "黑色的船"
+    ]
+  }
+}

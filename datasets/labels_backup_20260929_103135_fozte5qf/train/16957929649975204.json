@@ -1,0 +1,114 @@
+{
+  "filename": "16957929649975204.jpg",
+  "height": 2160,
+  "width": 3840,
+  "grounding": {
+    "caption": "單色棕色的船。單色綠色的船。含棕色的船。含綠色的船。",
+    "regions": [
+      {
+        "semantic_key": "single_color:棕色",
+        "phrase": "單色棕色的船",
+        "tokens_positive": [
+          [
+            0,
+            6
+          ]
+        ],
+        "bbox": [
+          [
+            2502,
+            932,
+            2820,
+            1083
+          ]
+        ]
+      },
+      {
+        "semantic_key": "single_color:綠色",
+        "phrase": "單色綠色的船",
+        "tokens_positive": [
+          [
+            7,
+            13
+          ]
+        ],
+        "bbox": [
+          [
+            2314,
+            788,
+            2797,
+            939
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:棕色",
+        "phrase": "含棕色的船",
+        "tokens_positive": [
+          [
+            14,
+            19
+          ]
+        ],
+        "bbox": [
+          [
+            2502,
+            932,
+            2820,
+            1083
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:綠色",
+        "phrase": "含綠色的船",
+        "tokens_positive": [
+          [
+            20,
+            25
+          ]
+        ],
+        "bbox": [
+          [
+            2314,
+            788,
+            2797,
+            939
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "16957929649975204",
+    "source_label": "16957929649975204.json",
+    "object_count": 2,
+    "region_count": 4,
+    "phrase_variants": {
+      "單色棕色的船": [
+        "純棕色的船",
+        "船體僅為棕色的船",
+        "只有棕色的船"
+      ],
+      "單色綠色的船": [
+        "純綠色的船",
+        "船體僅為綠色的船",
+        "只有綠色的船"
+      ],
+      "含棕色的船": [
+        "帶有棕色的船",
+        "船體包含棕色的船",
+        "有棕色部分的船"
+      ],
+      "含綠色的船": [
+        "帶有綠色的船",
+        "船體包含綠色的船",
+        "有綠色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "棕色的船",
+      "綠色的船"
+    ]
+  }
+}

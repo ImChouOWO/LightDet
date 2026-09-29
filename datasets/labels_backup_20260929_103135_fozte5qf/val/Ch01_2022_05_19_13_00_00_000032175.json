@@ -1,0 +1,114 @@
+{
+  "filename": "Ch01_2022_05_19_13_00_00_000032175.jpg",
+  "height": 2160,
+  "width": 3840,
+  "grounding": {
+    "caption": "單色白色的船。單色米色的船。含白色的船。含米色的船。",
+    "regions": [
+      {
+        "semantic_key": "single_color:白色",
+        "phrase": "單色白色的船",
+        "tokens_positive": [
+          [
+            0,
+            6
+          ]
+        ],
+        "bbox": [
+          [
+            1046,
+            9,
+            1241,
+            70
+          ]
+        ]
+      },
+      {
+        "semantic_key": "single_color:米色",
+        "phrase": "單色米色的船",
+        "tokens_positive": [
+          [
+            7,
+            13
+          ]
+        ],
+        "bbox": [
+          [
+            2332,
+            1012,
+            2716,
+            1253
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:白色",
+        "phrase": "含白色的船",
+        "tokens_positive": [
+          [
+            14,
+            19
+          ]
+        ],
+        "bbox": [
+          [
+            1046,
+            9,
+            1241,
+            70
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:米色",
+        "phrase": "含米色的船",
+        "tokens_positive": [
+          [
+            20,
+            25
+          ]
+        ],
+        "bbox": [
+          [
+            2332,
+            1012,
+            2716,
+            1253
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "Ch01_2022_05_19_13_00_00_000032175",
+    "source_label": "Ch01_2022_05_19_13_00_00_000032175.json",
+    "object_count": 2,
+    "region_count": 4,
+    "phrase_variants": {
+      "單色白色的船": [
+        "純白色的船",
+        "船體僅為白色的船",
+        "只有白色的船"
+      ],
+      "單色米色的船": [
+        "純米色的船",
+        "船體僅為米色的船",
+        "只有米色的船"
+      ],
+      "含白色的船": [
+        "帶有白色的船",
+        "船體包含白色的船",
+        "有白色部分的船"
+      ],
+      "含米色的船": [
+        "帶有米色的船",
+        "船體包含米色的船",
+        "有米色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "米色的船",
+      "白色的船"
+    ]
+  }
+}

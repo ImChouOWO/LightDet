@@ -1,0 +1,67 @@
+{
+  "filename": "20231019_v_0000156690_1.jpg",
+  "height": 720,
+  "width": 1280,
+  "grounding": {
+    "caption": "單色白色的船。含白色的船。",
+    "regions": [
+      {
+        "semantic_key": "single_color:白色",
+        "phrase": "單色白色的船",
+        "tokens_positive": [
+          [
+            0,
+            6
+          ]
+        ],
+        "bbox": [
+          [
+            871,
+            325,
+            887,
+            335
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:白色",
+        "phrase": "含白色的船",
+        "tokens_positive": [
+          [
+            7,
+            12
+          ]
+        ],
+        "bbox": [
+          [
+            871,
+            325,
+            887,
+            335
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "20231019_v_0000156690_1",
+    "source_label": "20231019_v_0000156690_1.json",
+    "object_count": 1,
+    "region_count": 2,
+    "phrase_variants": {
+      "單色白色的船": [
+        "純白色的船",
+        "船體僅為白色的船",
+        "只有白色的船"
+      ],
+      "含白色的船": [
+        "帶有白色的船",
+        "船體包含白色的船",
+        "有白色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "白色的船"
+    ]
+  }
+}

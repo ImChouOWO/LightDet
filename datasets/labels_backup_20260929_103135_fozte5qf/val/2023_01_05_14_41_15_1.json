@@ -1,0 +1,114 @@
+{
+  "filename": "2023_01_05_14_41_15_1.jpg",
+  "height": 720,
+  "width": 1280,
+  "grounding": {
+    "caption": "單色灰白的船。單色綠色的船。含灰白的船。含綠色的船。",
+    "regions": [
+      {
+        "semantic_key": "single_color:灰白",
+        "phrase": "單色灰白的船",
+        "tokens_positive": [
+          [
+            0,
+            6
+          ]
+        ],
+        "bbox": [
+          [
+            832,
+            368,
+            891,
+            436
+          ]
+        ]
+      },
+      {
+        "semantic_key": "single_color:綠色",
+        "phrase": "單色綠色的船",
+        "tokens_positive": [
+          [
+            7,
+            13
+          ]
+        ],
+        "bbox": [
+          [
+            1145,
+            344,
+            1280,
+            492
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:灰白",
+        "phrase": "含灰白的船",
+        "tokens_positive": [
+          [
+            14,
+            19
+          ]
+        ],
+        "bbox": [
+          [
+            832,
+            368,
+            891,
+            436
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:綠色",
+        "phrase": "含綠色的船",
+        "tokens_positive": [
+          [
+            20,
+            25
+          ]
+        ],
+        "bbox": [
+          [
+            1145,
+            344,
+            1280,
+            492
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "2023_01_05_14_41_15_1",
+    "source_label": "2023_01_05_14_41_15_1.json",
+    "object_count": 2,
+    "region_count": 4,
+    "phrase_variants": {
+      "單色灰白的船": [
+        "純灰白的船",
+        "船體僅為灰白的船",
+        "只有灰白的船"
+      ],
+      "單色綠色的船": [
+        "純綠色的船",
+        "船體僅為綠色的船",
+        "只有綠色的船"
+      ],
+      "含灰白的船": [
+        "帶有灰白的船",
+        "船體包含灰白的船",
+        "有灰白部分的船"
+      ],
+      "含綠色的船": [
+        "帶有綠色的船",
+        "船體包含綠色的船",
+        "有綠色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "灰白的船",
+      "綠色的船"
+    ]
+  }
+}

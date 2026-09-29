@@ -1,0 +1,114 @@
+{
+  "filename": "Ch01_2022_03_21_15_00_00_000032535.jpg",
+  "height": 2160,
+  "width": 3840,
+  "grounding": {
+    "caption": "單色橘色的船。單色米色的船。含橘色的船。含米色的船。",
+    "regions": [
+      {
+        "semantic_key": "single_color:橘色",
+        "phrase": "單色橘色的船",
+        "tokens_positive": [
+          [
+            0,
+            6
+          ]
+        ],
+        "bbox": [
+          [
+            2738,
+            1,
+            3542,
+            98
+          ]
+        ]
+      },
+      {
+        "semantic_key": "single_color:米色",
+        "phrase": "單色米色的船",
+        "tokens_positive": [
+          [
+            7,
+            13
+          ]
+        ],
+        "bbox": [
+          [
+            2413,
+            716,
+            2982,
+            1150
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:橘色",
+        "phrase": "含橘色的船",
+        "tokens_positive": [
+          [
+            14,
+            19
+          ]
+        ],
+        "bbox": [
+          [
+            2738,
+            1,
+            3542,
+            98
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:米色",
+        "phrase": "含米色的船",
+        "tokens_positive": [
+          [
+            20,
+            25
+          ]
+        ],
+        "bbox": [
+          [
+            2413,
+            716,
+            2982,
+            1150
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "Ch01_2022_03_21_15_00_00_000032535",
+    "source_label": "Ch01_2022_03_21_15_00_00_000032535.json",
+    "object_count": 2,
+    "region_count": 4,
+    "phrase_variants": {
+      "單色橘色的船": [
+        "純橘色的船",
+        "船體僅為橘色的船",
+        "只有橘色的船"
+      ],
+      "單色米色的船": [
+        "純米色的船",
+        "船體僅為米色的船",
+        "只有米色的船"
+      ],
+      "含橘色的船": [
+        "帶有橘色的船",
+        "船體包含橘色的船",
+        "有橘色部分的船"
+      ],
+      "含米色的船": [
+        "帶有米色的船",
+        "船體包含米色的船",
+        "有米色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "橙色的船",
+      "米色的船"
+    ]
+  }
+}

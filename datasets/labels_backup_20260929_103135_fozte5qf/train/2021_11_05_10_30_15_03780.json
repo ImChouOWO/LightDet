@@ -1,0 +1,114 @@
+{
+  "filename": "2021_11_05_10_30_15_03780.jpg",
+  "height": 960,
+  "width": 1280,
+  "grounding": {
+    "caption": "單色灰白的船。單色灰黑的船。含灰白的船。含灰黑的船。",
+    "regions": [
+      {
+        "semantic_key": "single_color:灰白",
+        "phrase": "單色灰白的船",
+        "tokens_positive": [
+          [
+            0,
+            6
+          ]
+        ],
+        "bbox": [
+          [
+            194,
+            478,
+            541,
+            614
+          ]
+        ]
+      },
+      {
+        "semantic_key": "single_color:灰黑",
+        "phrase": "單色灰黑的船",
+        "tokens_positive": [
+          [
+            7,
+            13
+          ]
+        ],
+        "bbox": [
+          [
+            1087,
+            454,
+            1241,
+            591
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:灰白",
+        "phrase": "含灰白的船",
+        "tokens_positive": [
+          [
+            14,
+            19
+          ]
+        ],
+        "bbox": [
+          [
+            194,
+            478,
+            541,
+            614
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:灰黑",
+        "phrase": "含灰黑的船",
+        "tokens_positive": [
+          [
+            20,
+            25
+          ]
+        ],
+        "bbox": [
+          [
+            1087,
+            454,
+            1241,
+            591
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "2021_11_05_10_30_15_03780",
+    "source_label": "2021_11_05_10_30_15_03780.json",
+    "object_count": 2,
+    "region_count": 4,
+    "phrase_variants": {
+      "單色灰白的船": [
+        "純灰白的船",
+        "船體僅為灰白的船",
+        "只有灰白的船"
+      ],
+      "單色灰黑的船": [
+        "純灰黑的船",
+        "船體僅為灰黑的船",
+        "只有灰黑的船"
+      ],
+      "含灰白的船": [
+        "帶有灰白的船",
+        "船體包含灰白的船",
+        "有灰白部分的船"
+      ],
+      "含灰黑的船": [
+        "帶有灰黑的船",
+        "船體包含灰黑的船",
+        "有灰黑部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "灰白的船",
+      "灰黑的船"
+    ]
+  }
+}

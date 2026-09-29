@@ -1,0 +1,161 @@
+{
+  "filename": "khFerry_2_01140.jpg",
+  "height": 1080,
+  "width": 1920,
+  "grounding": {
+    "caption": "灰白的船。灰黑的船。單色黑色的船。含灰白的船。含灰黑的船。含黑色的船。",
+    "regions": [
+      {
+        "semantic_key": "colors_exact:灰白",
+        "phrase": "灰白的船",
+        "tokens_positive": [
+          [
+            0,
+            4
+          ]
+        ],
+        "bbox": [
+          [
+            1395,
+            666,
+            1520,
+            720
+          ]
+        ]
+      },
+      {
+        "semantic_key": "colors_exact:灰黑",
+        "phrase": "灰黑的船",
+        "tokens_positive": [
+          [
+            5,
+            9
+          ]
+        ],
+        "bbox": [
+          [
+            493,
+            612,
+            703,
+            697
+          ]
+        ]
+      },
+      {
+        "semantic_key": "single_color:黑色",
+        "phrase": "單色黑色的船",
+        "tokens_positive": [
+          [
+            10,
+            16
+          ]
+        ],
+        "bbox": [
+          [
+            1170,
+            672,
+            1309,
+            714
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:灰白",
+        "phrase": "含灰白的船",
+        "tokens_positive": [
+          [
+            17,
+            22
+          ]
+        ],
+        "bbox": [
+          [
+            1395,
+            666,
+            1520,
+            720
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:灰黑",
+        "phrase": "含灰黑的船",
+        "tokens_positive": [
+          [
+            23,
+            28
+          ]
+        ],
+        "bbox": [
+          [
+            493,
+            612,
+            703,
+            697
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:黑色",
+        "phrase": "含黑色的船",
+        "tokens_positive": [
+          [
+            29,
+            34
+          ]
+        ],
+        "bbox": [
+          [
+            1170,
+            672,
+            1309,
+            714
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "khFerry_2_01140",
+    "source_label": "khFerry_2_01140.json",
+    "object_count": 3,
+    "region_count": 6,
+    "phrase_variants": {
+      "灰白的船": [
+        "一艘灰白的船",
+        "灰白船隻",
+        "船體是灰白的船"
+      ],
+      "灰黑的船": [
+        "一艘灰黑的船",
+        "灰黑船隻",
+        "船體是灰黑的船"
+      ],
+      "單色黑色的船": [
+        "純黑色的船",
+        "船體僅為黑色的船",
+        "只有黑色的船"
+      ],
+      "含灰白的船": [
+        "帶有灰白的船",
+        "船體包含灰白的船",
+        "有灰白部分的船"
+      ],
+      "含灰黑的船": [
+        "帶有灰黑的船",
+        "船體包含灰黑的船",
+        "有灰黑部分的船"
+      ],
+      "含黑色的船": [
+        "帶有黑色的船",
+        "船體包含黑色的船",
+        "有黑色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "灰黑的船",
+      "灰白的船",
+      "黑色的船"
+    ]
+  }
+}

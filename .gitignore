@@ -31,6 +31,7 @@ units/model/checkpoints/
 units/model/bert_cache/
 units/model/resnet/checkpoints/
 units/model/cards/config/train_pos.yaml
+units/model/_train.py
 # Large pretrained model folders
 units/model/bert/
 units/model/resnet/

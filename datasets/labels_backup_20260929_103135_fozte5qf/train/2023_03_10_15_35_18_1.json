@@ -1,0 +1,67 @@
+{
+  "filename": "2023_03_10_15_35_18_1.jpg",
+  "height": 720,
+  "width": 1280,
+  "grounding": {
+    "caption": "單色深灰色的船。含深灰色的船。",
+    "regions": [
+      {
+        "semantic_key": "single_color:深灰色",
+        "phrase": "單色深灰色的船",
+        "tokens_positive": [
+          [
+            0,
+            7
+          ]
+        ],
+        "bbox": [
+          [
+            15,
+            198,
+            1191,
+            565
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:深灰色",
+        "phrase": "含深灰色的船",
+        "tokens_positive": [
+          [
+            8,
+            14
+          ]
+        ],
+        "bbox": [
+          [
+            15,
+            198,
+            1191,
+            565
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "2023_03_10_15_35_18_1",
+    "source_label": "2023_03_10_15_35_18_1.json",
+    "object_count": 1,
+    "region_count": 2,
+    "phrase_variants": {
+      "單色深灰色的船": [
+        "純深灰色的船",
+        "船體僅為深灰色的船",
+        "只有深灰色的船"
+      ],
+      "含深灰色的船": [
+        "帶有深灰色的船",
+        "船體包含深灰色的船",
+        "有深灰色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "深灰色的船"
+    ]
+  }
+}

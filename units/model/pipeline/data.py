@@ -5,6 +5,7 @@ import json
 import math
 import os
 import random
+from units.model.pipeline.relations import normalize_record, sample_record
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -478,6 +479,8 @@ class ShipGroundingDataset(Dataset):
         self.strict_size = bool(strict_size)
         self.random_seed = int(random_seed or 0)
         self.rng = random.Random(self.random_seed)
+        self.epoch_state = torch.zeros((), dtype=torch.int64).share_memory_()
+        self.training_sampling = False
 
         self.negative_phrase_pool_path = negative_phrase_pool_path
         self.negative_phrase_ratio = max(
@@ -488,11 +491,8 @@ class ShipGroundingDataset(Dataset):
             0,
             int(negative_phrase_max_per_image),
         )
-        self.enable_negative_phrases = bool(
-            enable_negative_phrases
-            and self.negative_phrase_ratio > 0.0
-            and self.negative_phrase_max_per_image > 0
-        )
+        # Negatives come from verified object/phrase relations, never string absence.
+        self.enable_negative_phrases = False
         self.negative_phrase_separator = str(
             negative_phrase_separator
         )
@@ -533,10 +533,10 @@ class ShipGroundingDataset(Dataset):
             with open(anno_path, "r", encoding="utf-8") as file:
                 raw_record = json.load(file)
 
-            record = validate_odvg_record(raw_record, anno_path=anno_path)
-            merged = merge_regions_to_unique_targets(record["regions"])
-            record["unique_targets"] = merged["targets"]
-            record["region_to_target_indices"] = merged["region_to_target_indices"]
+            try:
+                record = normalize_record(raw_record)
+            except (ValueError, KeyError) as error:
+                raise ValueError(f"{anno_path}: {error}") from error
 
             image_path = self.find_image_path(record["filename"])
             if image_path is None:
@@ -586,6 +586,9 @@ class ShipGroundingDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.records)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch_state.fill_(int(epoch))
 
     def get_query_count_for_dataset_index(self, idx: int) -> int:
         record = self.records[int(idx)]
@@ -930,6 +933,9 @@ class ShipGroundingDataset(Dataset):
 
         return {
             "boxes": boxes,
+            "object_ids": [unique_targets[i]["id"] for i in kept_indices],
+            "phrase_char_spans": [p["tokens_positive"] for p in record["regions"]],
+            "phrase_relations": torch.tensor(record["phrase_relations"], dtype=torch.int8)[:, kept_indices],
             "boxes_pixel": boxes_pixel,
             "boxes_orig": boxes_orig,
             "labels": labels,
@@ -1004,7 +1010,8 @@ class ShipGroundingDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
             record_index = int(idx)
-            record = self.records[record_index]
+            record = sample_record(self.records[record_index], self.random_seed,
+                                   int(self.epoch_state.item()), record_index, self.training_sampling)
             image_path = self.image_paths[record_index]
             anno_path = self.anno_paths[record_index]
 
@@ -1016,6 +1023,10 @@ class ShipGroundingDataset(Dataset):
                 orig_w=orig_w,
                 orig_h=orig_h,
             )
+            kept = target["target_indices"].tolist()
+            remap = {old: new for new, old in enumerate(kept)}
+            region_mapping = [[remap[i] for i in indices if i in remap]
+                              for indices in record["region_to_target_indices"]]
 
             negative_phrases = self.sample_negative_phrases(
                 record=record,
@@ -1047,7 +1058,7 @@ class ShipGroundingDataset(Dataset):
                 "negative_char_spans": negative_char_spans,
                 "regions": record["regions"],
                 "region_to_target_indices": (
-                    record["region_to_target_indices"]
+                    region_mapping
                 ),
                 "image_path": image_path,
                 "anno_path": anno_path,
@@ -1089,11 +1100,13 @@ class QueryBudgetBatchSampler(Sampler[List[int]]):
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
+        self.dataset.set_epoch(epoch)
+        self._base_batches = self._build_fixed_batches()
 
     def _build_fixed_batches(self) -> Tuple[Tuple[int, ...], ...]:
         order = list(range(len(self.indices)))
         if self.shuffle:
-            random.Random(self.seed).shuffle(order)
+            random.Random(self.seed + self.epoch).shuffle(order)
 
         batches: List[List[int]] = []
         batch: List[int] = []
@@ -1111,7 +1124,7 @@ class QueryBudgetBatchSampler(Sampler[List[int]]):
             batch.append(dataset_index)
             budget_sum += item_cost
 
-        if batch and (not self.drop_last or budget_sum >= self.query_budget):
+        if batch:
             batches.append(batch)
 
         if not batches and self.indices:
@@ -1423,6 +1436,8 @@ def build_dataloaders(
             negative_phrase_separator
         ),
     )
+
+    train_dataset.training_sampling = True
 
     if prebuild_image_cache:
         train_dataset.build_image_cache(

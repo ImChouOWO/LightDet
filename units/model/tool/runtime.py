@@ -256,6 +256,10 @@ def compact_grounding_collate_fn(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Compact images/boxes while preserving ODVG phrase supervision."""
     batch = grounding_collate_fn(items)
     targets = batch.pop("targets", [])
+    batch["relation_targets"] = [
+        {k: t[k] for k in ("object_ids", "phrase_char_spans", "phrase_relations")}
+        for t in targets
+    ]
 
     box_tensors: List[torch.Tensor] = []
     offsets = [0]
@@ -343,6 +347,7 @@ def get_raw_targets(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
             }
             if index < len(captions):
                 target["caption"] = str(captions[index])
+            target.update(batch["relation_targets"][index])
             result.append(target)
         return result
 

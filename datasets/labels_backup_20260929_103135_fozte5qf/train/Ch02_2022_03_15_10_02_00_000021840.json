@@ -1,0 +1,67 @@
+{
+  "filename": "Ch02_2022_03_15_10_02_00_000021840.jpg",
+  "height": 2160,
+  "width": 3840,
+  "grounding": {
+    "caption": "單色米色的船。含米色的船。",
+    "regions": [
+      {
+        "semantic_key": "single_color:米色",
+        "phrase": "單色米色的船",
+        "tokens_positive": [
+          [
+            0,
+            6
+          ]
+        ],
+        "bbox": [
+          [
+            1479,
+            620,
+            1952,
+            1247
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:米色",
+        "phrase": "含米色的船",
+        "tokens_positive": [
+          [
+            7,
+            12
+          ]
+        ],
+        "bbox": [
+          [
+            1479,
+            620,
+            1952,
+            1247
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "Ch02_2022_03_15_10_02_00_000021840",
+    "source_label": "Ch02_2022_03_15_10_02_00_000021840.json",
+    "object_count": 1,
+    "region_count": 2,
+    "phrase_variants": {
+      "單色米色的船": [
+        "純米色的船",
+        "船體僅為米色的船",
+        "只有米色的船"
+      ],
+      "含米色的船": [
+        "帶有米色的船",
+        "船體包含米色的船",
+        "有米色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "米色的船"
+    ]
+  }
+}

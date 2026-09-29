@@ -1,0 +1,79 @@
+{
+  "filename": "2023_01_05_14_43_12_1.jpg",
+  "height": 720,
+  "width": 1280,
+  "grounding": {
+    "caption": "單色黃色的船。含黃色的船。",
+    "regions": [
+      {
+        "semantic_key": "single_color:黃色",
+        "phrase": "單色黃色的船",
+        "tokens_positive": [
+          [
+            0,
+            6
+          ]
+        ],
+        "bbox": [
+          [
+            663,
+            410,
+            727,
+            433
+          ],
+          [
+            979,
+            315,
+            1065,
+            428
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:黃色",
+        "phrase": "含黃色的船",
+        "tokens_positive": [
+          [
+            7,
+            12
+          ]
+        ],
+        "bbox": [
+          [
+            663,
+            410,
+            727,
+            433
+          ],
+          [
+            979,
+            315,
+            1065,
+            428
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "2023_01_05_14_43_12_1",
+    "source_label": "2023_01_05_14_43_12_1.json",
+    "object_count": 2,
+    "region_count": 2,
+    "phrase_variants": {
+      "單色黃色的船": [
+        "純黃色的船",
+        "船體僅為黃色的船",
+        "只有黃色的船"
+      ],
+      "含黃色的船": [
+        "帶有黃色的船",
+        "船體包含黃色的船",
+        "有黃色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "黃色的船"
+    ]
+  }
+}

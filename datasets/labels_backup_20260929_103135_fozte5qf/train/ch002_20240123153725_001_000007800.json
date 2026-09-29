@@ -1,0 +1,67 @@
+{
+  "filename": "ch002_20240123153725_001_000007800.jpg",
+  "height": 2160,
+  "width": 3840,
+  "grounding": {
+    "caption": "單色棕色的船。含棕色的船。",
+    "regions": [
+      {
+        "semantic_key": "single_color:棕色",
+        "phrase": "單色棕色的船",
+        "tokens_positive": [
+          [
+            0,
+            6
+          ]
+        ],
+        "bbox": [
+          [
+            1860,
+            1330,
+            1968,
+            1390
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:棕色",
+        "phrase": "含棕色的船",
+        "tokens_positive": [
+          [
+            7,
+            12
+          ]
+        ],
+        "bbox": [
+          [
+            1860,
+            1330,
+            1968,
+            1390
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "ch002_20240123153725_001_000007800",
+    "source_label": "ch002_20240123153725_001_000007800.json",
+    "object_count": 1,
+    "region_count": 2,
+    "phrase_variants": {
+      "單色棕色的船": [
+        "純棕色的船",
+        "船體僅為棕色的船",
+        "只有棕色的船"
+      ],
+      "含棕色的船": [
+        "帶有棕色的船",
+        "船體包含棕色的船",
+        "有棕色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "棕色的船"
+    ]
+  }
+}

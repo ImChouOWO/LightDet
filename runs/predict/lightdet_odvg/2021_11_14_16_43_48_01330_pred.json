@@ -1,0 +1,124 @@
+{
+  "image_path": "/home/soic/Desktop/datasetPreTest15000/dataset/sys/rain/2021_11_14_16_43_48_01330.jpg",
+  "original_size": {
+    "width": 1280,
+    "height": 960
+  },
+  "model_input_size": {
+    "height": 1024,
+    "width": 1024
+  },
+  "caption": "紅色的船",
+  "score_threshold": 0.3,
+  "top_k": 20,
+  "use_nms": false,
+  "nms_iou_threshold": 0.5,
+  "token_reduction": "mean",
+  "score_fusion": "geometric_mean",
+  "device": "cuda:1",
+  "checkpoint": "/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_FPN_gate_fused/best_map50.pt",
+  "checkpoint_info": {
+    "source": "model",
+    "strict": true,
+    "missing_keys": [],
+    "unexpected_keys": [],
+    "epoch": 295,
+    "best_metric": 0.3105456531047821,
+    "best_metric_name": "map50"
+  },
+  "phrases": [
+    {
+      "phrase": "紅色的船",
+      "char_spans": [
+        [
+          0,
+          4
+        ]
+      ],
+      "positive_token_indices": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "num_detections": 4,
+      "detections": [
+        {
+          "query_index": 23,
+          "bbox_xyxy_normalized": [
+            0.2294921875,
+            0.3671875,
+            0.412109375,
+            0.83203125
+          ],
+          "bbox_xyxy_pixel": [
+            293.75,
+            352.5,
+            527.5,
+            798.75
+          ],
+          "quality_score": 0.907312273979187,
+          "phrase_alignment_score": 0.6222999691963196,
+          "final_score": 0.7514122724533081
+        },
+        {
+          "query_index": 26,
+          "bbox_xyxy_normalized": [
+            0.333984375,
+            0.33203125,
+            0.90234375,
+            0.56640625
+          ],
+          "bbox_xyxy_pixel": [
+            427.5,
+            318.75,
+            1155.0,
+            543.75
+          ],
+          "quality_score": 0.8643104434013367,
+          "phrase_alignment_score": 0.466704785823822,
+          "final_score": 0.6351203322410583
+        },
+        {
+          "query_index": 45,
+          "bbox_xyxy_normalized": [
+            0.3828125,
+            0.50390625,
+            0.44140625,
+            0.609375
+          ],
+          "bbox_xyxy_pixel": [
+            490.0,
+            483.75,
+            565.0,
+            585.0
+          ],
+          "quality_score": 0.7057850360870361,
+          "phrase_alignment_score": 0.3112701177597046,
+          "final_score": 0.4687107801437378
+        },
+        {
+          "query_index": 97,
+          "bbox_xyxy_normalized": [
+            0.37890625,
+            0.5078125,
+            0.439453125,
+            0.609375
+          ],
+          "bbox_xyxy_pixel": [
+            485.0,
+            487.5,
+            562.5,
+            585.0
+          ],
+          "quality_score": 0.6118459105491638,
+          "phrase_alignment_score": 0.2712288200855255,
+          "final_score": 0.4073699414730072
+        }
+      ]
+    }
+  ],
+  "quality_threshold": 0.0,
+  "alignment_threshold": 0.0,
+  "cache_hit": false
+}

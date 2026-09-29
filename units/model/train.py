@@ -1182,6 +1182,9 @@ def train_one_epoch(
 ) -> Dict[str, float]:
     model.train()
 
+    if hasattr(train_loader.dataset, "set_epoch"):
+        train_loader.dataset.set_epoch(epoch)
+
     batch_sampler = getattr(
         train_loader,
         "batch_sampler",

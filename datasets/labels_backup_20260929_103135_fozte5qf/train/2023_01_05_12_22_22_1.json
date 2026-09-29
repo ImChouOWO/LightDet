@@ -1,0 +1,67 @@
+{
+  "filename": "2023_01_05_12_22_22_1.jpg",
+  "height": 720,
+  "width": 1280,
+  "grounding": {
+    "caption": "單色米白色的船。含米白色的船。",
+    "regions": [
+      {
+        "semantic_key": "single_color:米白色",
+        "phrase": "單色米白色的船",
+        "tokens_positive": [
+          [
+            0,
+            7
+          ]
+        ],
+        "bbox": [
+          [
+            58,
+            421,
+            293,
+            508
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:米白色",
+        "phrase": "含米白色的船",
+        "tokens_positive": [
+          [
+            8,
+            14
+          ]
+        ],
+        "bbox": [
+          [
+            58,
+            421,
+            293,
+            508
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "2023_01_05_12_22_22_1",
+    "source_label": "2023_01_05_12_22_22_1.json",
+    "object_count": 1,
+    "region_count": 2,
+    "phrase_variants": {
+      "單色米白色的船": [
+        "純米白色的船",
+        "船體僅為米白色的船",
+        "只有米白色的船"
+      ],
+      "含米白色的船": [
+        "帶有米白色的船",
+        "船體包含米白色的船",
+        "有米白色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "米白色的船"
+    ]
+  }
+}

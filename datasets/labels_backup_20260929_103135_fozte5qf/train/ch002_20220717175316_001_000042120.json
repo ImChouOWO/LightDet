@@ -1,0 +1,67 @@
+{
+  "filename": "ch002_20220717175316_001_000042120.jpg",
+  "height": 2160,
+  "width": 3840,
+  "grounding": {
+    "caption": "單色深綠色的船。含深綠色的船。",
+    "regions": [
+      {
+        "semantic_key": "single_color:深綠色",
+        "phrase": "單色深綠色的船",
+        "tokens_positive": [
+          [
+            0,
+            7
+          ]
+        ],
+        "bbox": [
+          [
+            1614,
+            572,
+            2873,
+            1102
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:深綠色",
+        "phrase": "含深綠色的船",
+        "tokens_positive": [
+          [
+            8,
+            14
+          ]
+        ],
+        "bbox": [
+          [
+            1614,
+            572,
+            2873,
+            1102
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "ch002_20220717175316_001_000042120",
+    "source_label": "ch002_20220717175316_001_000042120.json",
+    "object_count": 1,
+    "region_count": 2,
+    "phrase_variants": {
+      "單色深綠色的船": [
+        "純深綠色的船",
+        "船體僅為深綠色的船",
+        "只有深綠色的船"
+      ],
+      "含深綠色的船": [
+        "帶有深綠色的船",
+        "船體包含深綠色的船",
+        "有深綠色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "深綠色的船"
+    ]
+  }
+}

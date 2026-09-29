@@ -1,0 +1,114 @@
+{
+  "filename": "ch006_20220913165058_009_000006636.jpg",
+  "height": 1080,
+  "width": 1920,
+  "grounding": {
+    "caption": "單色灰色的船。單色紅色的船。含灰色的船。含紅色的船。",
+    "regions": [
+      {
+        "semantic_key": "single_color:灰色",
+        "phrase": "單色灰色的船",
+        "tokens_positive": [
+          [
+            0,
+            6
+          ]
+        ],
+        "bbox": [
+          [
+            313,
+            852,
+            512,
+            1080
+          ]
+        ]
+      },
+      {
+        "semantic_key": "single_color:紅色",
+        "phrase": "單色紅色的船",
+        "tokens_positive": [
+          [
+            7,
+            13
+          ]
+        ],
+        "bbox": [
+          [
+            878,
+            1005,
+            950,
+            1040
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:灰色",
+        "phrase": "含灰色的船",
+        "tokens_positive": [
+          [
+            14,
+            19
+          ]
+        ],
+        "bbox": [
+          [
+            313,
+            852,
+            512,
+            1080
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:紅色",
+        "phrase": "含紅色的船",
+        "tokens_positive": [
+          [
+            20,
+            25
+          ]
+        ],
+        "bbox": [
+          [
+            878,
+            1005,
+            950,
+            1040
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "ch006_20220913165058_009_000006636",
+    "source_label": "ch006_20220913165058_009_000006636.json",
+    "object_count": 2,
+    "region_count": 4,
+    "phrase_variants": {
+      "單色灰色的船": [
+        "純灰色的船",
+        "船體僅為灰色的船",
+        "只有灰色的船"
+      ],
+      "單色紅色的船": [
+        "純紅色的船",
+        "船體僅為紅色的船",
+        "只有紅色的船"
+      ],
+      "含灰色的船": [
+        "帶有灰色的船",
+        "船體包含灰色的船",
+        "有灰色部分的船"
+      ],
+      "含紅色的船": [
+        "帶有紅色的船",
+        "船體包含紅色的船",
+        "有紅色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "灰色的船",
+      "紅色的船"
+    ]
+  }
+}

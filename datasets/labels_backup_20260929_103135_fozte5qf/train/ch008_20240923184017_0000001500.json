@@ -1,0 +1,90 @@
+{
+  "filename": "ch008_20240923184017_0000001500.jpg",
+  "height": 1080,
+  "width": 1920,
+  "grounding": {
+    "caption": "深紅色白色相間的船。含深紅色的船。含白色的船。",
+    "regions": [
+      {
+        "semantic_key": "colors_exact:白色|深紅色",
+        "phrase": "深紅色白色相間的船",
+        "tokens_positive": [
+          [
+            0,
+            9
+          ]
+        ],
+        "bbox": [
+          [
+            779,
+            454,
+            1324,
+            682
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:深紅色",
+        "phrase": "含深紅色的船",
+        "tokens_positive": [
+          [
+            10,
+            16
+          ]
+        ],
+        "bbox": [
+          [
+            779,
+            454,
+            1324,
+            682
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:白色",
+        "phrase": "含白色的船",
+        "tokens_positive": [
+          [
+            17,
+            22
+          ]
+        ],
+        "bbox": [
+          [
+            779,
+            454,
+            1324,
+            682
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "ch008_20240923184017_0000001500",
+    "source_label": "ch008_20240923184017_0000001500.json",
+    "object_count": 1,
+    "region_count": 3,
+    "phrase_variants": {
+      "深紅色白色相間的船": [
+        "深紅色、白色相間的船",
+        "一艘深紅色白色相間的船",
+        "深紅色白色多色的船"
+      ],
+      "含深紅色的船": [
+        "帶有深紅色的船",
+        "船體包含深紅色的船",
+        "有深紅色部分的船"
+      ],
+      "含白色的船": [
+        "帶有白色的船",
+        "船體包含白色的船",
+        "有白色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "深紅色白色相間的船"
+    ]
+  }
+}

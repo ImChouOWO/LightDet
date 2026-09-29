@@ -1,0 +1,90 @@
+{
+  "filename": "ch002_20220717235306_001_000008520.jpg",
+  "height": 2160,
+  "width": 3840,
+  "grounding": {
+    "caption": "藍色橙色相間的船。含橘色的船。含藍色的船。",
+    "regions": [
+      {
+        "semantic_key": "colors_exact:橘色|藍色",
+        "phrase": "藍色橙色相間的船",
+        "tokens_positive": [
+          [
+            0,
+            8
+          ]
+        ],
+        "bbox": [
+          [
+            1083,
+            724,
+            1295,
+            965
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:橘色",
+        "phrase": "含橘色的船",
+        "tokens_positive": [
+          [
+            9,
+            14
+          ]
+        ],
+        "bbox": [
+          [
+            1083,
+            724,
+            1295,
+            965
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:藍色",
+        "phrase": "含藍色的船",
+        "tokens_positive": [
+          [
+            15,
+            20
+          ]
+        ],
+        "bbox": [
+          [
+            1083,
+            724,
+            1295,
+            965
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "ch002_20220717235306_001_000008520",
+    "source_label": "ch002_20220717235306_001_000008520.json",
+    "object_count": 1,
+    "region_count": 3,
+    "phrase_variants": {
+      "藍色橙色相間的船": [
+        "藍色、橙色相間的船",
+        "一艘藍色橙色相間的船",
+        "藍色橙色多色的船"
+      ],
+      "含橘色的船": [
+        "帶有橘色的船",
+        "船體包含橘色的船",
+        "有橘色部分的船"
+      ],
+      "含藍色的船": [
+        "帶有藍色的船",
+        "船體包含藍色的船",
+        "有藍色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "藍色橙色相間的船"
+    ]
+  }
+}

@@ -1,0 +1,137 @@
+{
+  "filename": "khFerry_2_01530.jpg",
+  "height": 1080,
+  "width": 1920,
+  "grounding": {
+    "caption": "藍色白色相間的船。單色綠色的船。含白色的船。含綠色的船。含藍色的船。",
+    "regions": [
+      {
+        "semantic_key": "colors_exact:白色|藍色",
+        "phrase": "藍色白色相間的船",
+        "tokens_positive": [
+          [
+            0,
+            8
+          ]
+        ],
+        "bbox": [
+          [
+            418,
+            536,
+            883,
+            895
+          ]
+        ]
+      },
+      {
+        "semantic_key": "single_color:綠色",
+        "phrase": "單色綠色的船",
+        "tokens_positive": [
+          [
+            9,
+            15
+          ]
+        ],
+        "bbox": [
+          [
+            44,
+            577,
+            324,
+            852
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:白色",
+        "phrase": "含白色的船",
+        "tokens_positive": [
+          [
+            16,
+            21
+          ]
+        ],
+        "bbox": [
+          [
+            418,
+            536,
+            883,
+            895
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:綠色",
+        "phrase": "含綠色的船",
+        "tokens_positive": [
+          [
+            22,
+            27
+          ]
+        ],
+        "bbox": [
+          [
+            44,
+            577,
+            324,
+            852
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:藍色",
+        "phrase": "含藍色的船",
+        "tokens_positive": [
+          [
+            28,
+            33
+          ]
+        ],
+        "bbox": [
+          [
+            418,
+            536,
+            883,
+            895
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "khFerry_2_01530",
+    "source_label": "khFerry_2_01530.json",
+    "object_count": 2,
+    "region_count": 5,
+    "phrase_variants": {
+      "藍色白色相間的船": [
+        "藍色、白色相間的船",
+        "一艘藍色白色相間的船",
+        "藍色白色多色的船"
+      ],
+      "單色綠色的船": [
+        "純綠色的船",
+        "船體僅為綠色的船",
+        "只有綠色的船"
+      ],
+      "含白色的船": [
+        "帶有白色的船",
+        "船體包含白色的船",
+        "有白色部分的船"
+      ],
+      "含綠色的船": [
+        "帶有綠色的船",
+        "船體包含綠色的船",
+        "有綠色部分的船"
+      ],
+      "含藍色的船": [
+        "帶有藍色的船",
+        "船體包含藍色的船",
+        "有藍色部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "綠色的船",
+      "藍色白色相間的船"
+    ]
+  }
+}

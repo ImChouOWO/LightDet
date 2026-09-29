@@ -1,0 +1,67 @@
+{
+  "filename": "Ch01_2022_05_18_18_00_00_000012948.jpg",
+  "height": 2160,
+  "width": 3840,
+  "grounding": {
+    "caption": "灰白的船。含灰白的船。",
+    "regions": [
+      {
+        "semantic_key": "colors_exact:灰白",
+        "phrase": "灰白的船",
+        "tokens_positive": [
+          [
+            0,
+            4
+          ]
+        ],
+        "bbox": [
+          [
+            456,
+            1393,
+            1373,
+            1750
+          ]
+        ]
+      },
+      {
+        "semantic_key": "contains_color:灰白",
+        "phrase": "含灰白的船",
+        "tokens_positive": [
+          [
+            5,
+            10
+          ]
+        ],
+        "bbox": [
+          [
+            456,
+            1393,
+            1373,
+            1750
+          ]
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "source_name": "Ch01_2022_05_18_18_00_00_000012948",
+    "source_label": "Ch01_2022_05_18_18_00_00_000012948.json",
+    "object_count": 1,
+    "region_count": 2,
+    "phrase_variants": {
+      "灰白的船": [
+        "一艘灰白的船",
+        "灰白船隻",
+        "船體是灰白的船"
+      ],
+      "含灰白的船": [
+        "帶有灰白的船",
+        "船體包含灰白的船",
+        "有灰白部分的船"
+      ]
+    },
+    "original_query_texts": [
+      "灰白的船"
+    ]
+  }
+}
