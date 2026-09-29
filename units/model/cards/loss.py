@@ -440,6 +440,13 @@ class HungarianOneToOneMatcher:
                     * alignment_cost_alpha
                     * token_cost
                 )
+            if not torch.isfinite(cost).all():
+                raise FloatingPointError(
+                    f"Non-finite Hungarian cost at batch index {batch_index}; "
+                    f"bbox_finite={bool(torch.isfinite(boxes).all())}, "
+                    f"gt_finite={bool(torch.isfinite(gt_boxes).all())}, "
+                    f"score_finite={bool(torch.isfinite(score_cost[batch_index]).all())}"
+                )
             self.cost_matrices.append(cost.detach())
             if target_count == 1:
                 pred_index = torch.argmin(cost[:, 0]).reshape(1)

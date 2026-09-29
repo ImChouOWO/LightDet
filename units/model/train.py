@@ -1391,6 +1391,11 @@ def train_one_epoch(
                 ),
             )
 
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                f"Non-finite loss before backward: epoch={epoch}, step={step}"
+            )
+
         if scaler.is_enabled():
             scaler.scale(loss).backward()
 
@@ -1401,6 +1406,7 @@ def train_one_epoch(
                 torch.nn.utils.clip_grad_norm_(
                     ema_source_model.parameters(),
                     grad_clip_norm,
+                    error_if_nonfinite=True,
                 )
 
             scaler.step(
@@ -1414,6 +1420,7 @@ def train_one_epoch(
                 torch.nn.utils.clip_grad_norm_(
                     ema_source_model.parameters(),
                     grad_clip_norm,
+                    error_if_nonfinite=True,
                 )
 
             optimizer.step()

@@ -5,6 +5,12 @@ import torch.nn.functional as F
 
 
 def phrase_predictions(token_logits, offsets, token_mask, targets):
+    # Autocast matmul can round probabilities to 1 before logit and poison gradients.
+    with torch.autocast(device_type=token_logits.device.type, enabled=False):
+        return _phrase_predictions_fp32(token_logits.float(), offsets, token_mask, targets)
+
+
+def _phrase_predictions_fp32(token_logits, offsets, token_mask, targets):
     if offsets is None:
         raise ValueError("Relation supervision requires tokenizer offsets")
     predictions = []
@@ -29,6 +35,11 @@ def phrase_predictions(token_logits, offsets, token_mask, targets):
 
 
 def relation_cost(logits, target):
+    with torch.autocast(device_type=logits.device.type, enabled=False):
+        return _relation_cost_fp32(logits.float(), target)
+
+
+def _relation_cost_fp32(logits, target):
     relations = target["phrase_relations"].to(logits.device)
     positive, negative = (relations == 1).float(), (relations == 0).float()
     pos = F.softplus(-logits) @ positive / positive.sum(0).clamp_min(1)

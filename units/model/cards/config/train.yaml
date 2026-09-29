@@ -181,7 +181,7 @@ eval:
 log:
   save_dir: units/model/runs/train/lightdet_relations_100ep
   weights_path: null
-  resume_path: null
+  resume_path: units/model/runs/train/lightdet_relations_100ep/latest.pt
   prefer_ema: true
   save_latest_interval: 1
   save_epoch_interval: 10
