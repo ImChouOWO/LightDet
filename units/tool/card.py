@@ -710,6 +710,9 @@ class Bert(nn.Module):
             }
 
         missing = []
+        # Keep newly encoded items available for this forward even when the
+        # bounded runtime cache evicts older captions.
+        pending_cache = {}
 
         for text in texts:
             in_precomputed = (
@@ -742,15 +745,27 @@ class Bert(nn.Module):
                     len(self.cache)
                     >= self.max_cache_size
                 ):
-                    self.cache.clear()
+                    # Evict one oldest insertion instead of clearing the
+                    # complete cache. This prevents a large request from
+                    # invalidating keys that are still needed below.
+                    oldest_text = next(
+                        iter(self.cache),
+                        None,
+                    )
+                    if oldest_text is not None:
+                        self.cache.pop(
+                            oldest_text,
+                            None,
+                        )
 
-                self.cache[text] = {
+                pending_cache[text] = {
                     "last_hidden_state": (
                         encoded[
                             "last_hidden_state"
                         ][index]
                         .detach()
                         .cpu()
+                        .half()
                     ),
                     "attention_mask": (
                         encoded[
@@ -760,6 +775,7 @@ class Bert(nn.Module):
                         .cpu()
                     ),
                 }
+                self.cache[text] = pending_cache[text]
 
         hidden_states = []
         masks = []
@@ -777,7 +793,36 @@ class Bert(nn.Module):
                     ]
                 )
             else:
-                item = self.cache[text]
+                item = self.cache.get(text)
+
+                if item is None:
+                    item = pending_cache.get(text)
+
+            if item is None:
+                # Defensive fallback for cache mutation or an oversized
+                # request: encode the current text instead of raising KeyError.
+                encoded = self._encode_texts(
+                    [text],
+                    device,
+                )
+                item = {
+                    "last_hidden_state": (
+                        encoded[
+                            "last_hidden_state"
+                        ][0]
+                        .detach()
+                        .cpu()
+                        .half()
+                    ),
+                    "attention_mask": (
+                        encoded[
+                            "attention_mask"
+                        ][0]
+                        .detach()
+                        .cpu()
+                    ),
+                }
+                pending_cache[text] = item
 
             hidden_states.append(
                 item[
