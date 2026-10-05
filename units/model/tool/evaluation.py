@@ -4,17 +4,15 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-import numpy as np
 import torch
 from torch.amp import autocast
 from torchvision.ops import batched_nms
-from tqdm import tqdm
+
+from units.model.tool.grounding_metrics import GroundingMetrics
 
 from units.model.tool.runtime import (
-    box_iou_xyxy,
     forward_model_batch,
     get_raw_targets,
-    get_target_boxes_cpu,
     make_progress_bar,
     move_targets_to_device,
     prepare_model_batch,
@@ -136,406 +134,6 @@ def select_predictions_batch(
     return results
 
 
-class BinaryDetectionAPAccumulator:
-    """Global AP accumulator for phrase-conditioned binary detection."""
-
-    def __init__(
-        self,
-        iou_thresholds: Optional[Sequence[float]] = None,
-    ) -> None:
-        if iou_thresholds is None:
-            iou_thresholds = [
-                round(value, 2)
-                for value in np.arange(0.50, 0.96, 0.05)
-            ]
-        self.iou_thresholds = torch.as_tensor(
-            list(iou_thresholds),
-            dtype=torch.float32,
-        )
-        if self.iou_thresholds.numel() == 0:
-            raise ValueError("iou_thresholds must not be empty")
-
-        self.score_chunks: List[torch.Tensor] = []
-        self.tp_chunks: List[torch.Tensor] = []
-        self.num_gt = 0
-        self.num_pred = 0
-
-    def update(
-        self,
-        pred_boxes: torch.Tensor,
-        pred_scores: torch.Tensor,
-        gt_boxes: torch.Tensor,
-    ) -> None:
-        pred_boxes = pred_boxes.float().reshape(-1, 4)
-        pred_scores = pred_scores.float().reshape(-1)
-        gt_boxes = gt_boxes.float().reshape(-1, 4)
-
-        num_pred = int(pred_boxes.shape[0])
-        num_gt = int(gt_boxes.shape[0])
-        num_thresholds = int(self.iou_thresholds.numel())
-
-        if pred_scores.numel() != num_pred:
-            raise ValueError("pred_boxes/pred_scores size mismatch")
-
-        self.num_gt += num_gt
-        self.num_pred += num_pred
-        if num_pred == 0:
-            return
-
-        order = torch.argsort(
-            pred_scores,
-            descending=True,
-            stable=True,
-        )
-        pred_boxes = pred_boxes[order]
-        pred_scores = pred_scores[order]
-
-        tp_matrix = torch.zeros(
-            (num_pred, num_thresholds),
-            dtype=torch.bool,
-            device=pred_boxes.device,
-        )
-
-        if num_gt > 0:
-            if gt_boxes.device != pred_boxes.device:
-                gt_boxes = gt_boxes.to(pred_boxes.device)
-
-            iou_matrix = box_iou_xyxy(
-                pred_boxes,
-                gt_boxes,
-            )
-            thresholds = self.iou_thresholds.to(
-                device=pred_boxes.device,
-                dtype=iou_matrix.dtype,
-            )
-            matched_gt = torch.zeros(
-                (num_thresholds, num_gt),
-                dtype=torch.bool,
-                device=pred_boxes.device,
-            )
-            threshold_indices = torch.arange(
-                num_thresholds,
-                device=pred_boxes.device,
-            )
-
-            for prediction_index in range(num_pred):
-                candidate = (
-                    iou_matrix[prediction_index]
-                    .unsqueeze(0)
-                    .expand(num_thresholds, -1)
-                    .masked_fill(matched_gt, -1.0)
-                )
-                best_iou, best_gt = candidate.max(dim=1)
-                is_tp = best_iou >= thresholds
-                tp_matrix[prediction_index] = is_tp
-                matched_gt[
-                    threshold_indices[is_tp],
-                    best_gt[is_tp],
-                ] = True
-
-        self.score_chunks.append(
-            pred_scores.detach().cpu().contiguous()
-        )
-        self.tp_chunks.append(
-            tp_matrix.detach().cpu().contiguous()
-        )
-
-    def compute(self) -> Dict[str, float]:
-        if self.num_gt == 0:
-            return {
-                "map50": 0.0,
-                "map50_95": 0.0,
-                "precision": 0.0,
-                "recall": 0.0,
-                "tp": 0,
-                "fp": int(self.num_pred),
-                "num_gt": 0,
-                "num_pred": int(self.num_pred),
-            }
-
-        if not self.score_chunks:
-            return {
-                "map50": 0.0,
-                "map50_95": 0.0,
-                "precision": 0.0,
-                "recall": 0.0,
-                "tp": 0,
-                "fp": 0,
-                "num_gt": int(self.num_gt),
-                "num_pred": 0,
-            }
-
-        all_scores = torch.cat(self.score_chunks, dim=0)
-        all_tp = torch.cat(
-            self.tp_chunks,
-            dim=0,
-        ).to(torch.float32)
-
-        order = torch.argsort(
-            all_scores,
-            descending=True,
-            stable=True,
-        )
-        all_tp = all_tp[order]
-        all_fp = 1.0 - all_tp
-
-        cumulative_tp = torch.cumsum(all_tp, dim=0)
-        cumulative_fp = torch.cumsum(all_fp, dim=0)
-        recall = cumulative_tp / max(1, self.num_gt)
-        precision = cumulative_tp / torch.clamp(
-            cumulative_tp + cumulative_fp,
-            min=1e-7,
-        )
-
-        precision_envelope = torch.flip(
-            torch.cummax(
-                torch.flip(precision, dims=[0]),
-                dim=0,
-            ).values,
-            dims=[0],
-        )
-        previous_recall = torch.cat(
-            [
-                torch.zeros(
-                    (1, recall.shape[1]),
-                    dtype=recall.dtype,
-                ),
-                recall[:-1],
-            ],
-            dim=0,
-        )
-        ap_per_threshold = torch.sum(
-            (recall - previous_recall)
-            * precision_envelope,
-            dim=0,
-        )
-
-        threshold_50_index = int(
-            torch.argmin(
-                torch.abs(self.iou_thresholds - 0.50)
-            ).item()
-        )
-        final_tp = cumulative_tp[-1]
-        final_fp = cumulative_fp[-1]
-        tp50 = int(final_tp[threshold_50_index].item())
-        fp50 = int(final_fp[threshold_50_index].item())
-
-        return {
-            "map50": float(
-                ap_per_threshold[threshold_50_index].item()
-            ),
-            "map50_95": float(
-                ap_per_threshold.mean().item()
-            ),
-            "precision": tp50 / max(1, tp50 + fp50),
-            "recall": tp50 / max(1, self.num_gt),
-            "tp": tp50,
-            "fp": fp50,
-            "num_gt": int(self.num_gt),
-            "num_pred": int(self.num_pred),
-        }
-
-
-class RankedRecallAtKAccumulator:
-    """Phrase-conditioned Recall@K at one IoU threshold."""
-
-    def __init__(
-        self,
-        ks: Sequence[int] = (1, 5, 10),
-        iou_threshold: float = 0.50,
-    ) -> None:
-        self.ks = tuple(
-            sorted({max(1, int(value)) for value in ks})
-        )
-        self.iou_threshold = float(iou_threshold)
-        self.num_gt = 0
-        self.hits = {value: 0 for value in self.ks}
-
-    def update(
-        self,
-        pred_boxes: torch.Tensor,
-        pred_scores: torch.Tensor,
-        gt_boxes: torch.Tensor,
-    ) -> None:
-        pred_boxes = pred_boxes.detach().float().reshape(-1, 4).cpu()
-        pred_scores = pred_scores.detach().float().reshape(-1).cpu()
-        gt_boxes = gt_boxes.detach().float().reshape(-1, 4).cpu()
-
-        num_gt = int(gt_boxes.shape[0])
-        self.num_gt += num_gt
-        if num_gt == 0 or pred_boxes.shape[0] == 0:
-            return
-
-        order = torch.argsort(
-            pred_scores,
-            descending=True,
-            stable=True,
-        )
-        iou_matrix = box_iou_xyxy(
-            pred_boxes[order],
-            gt_boxes,
-        )
-
-        for top_k in self.ks:
-            matched_gt = torch.zeros(
-                (num_gt,),
-                dtype=torch.bool,
-            )
-            hit_count = 0
-            for prediction_index in range(
-                min(top_k, iou_matrix.shape[0])
-            ):
-                candidate = iou_matrix[
-                    prediction_index
-                ].masked_fill(matched_gt, -1.0)
-                best_iou, best_gt = candidate.max(dim=0)
-                if float(best_iou.item()) >= self.iou_threshold:
-                    matched_gt[best_gt] = True
-                    hit_count += 1
-            self.hits[top_k] += hit_count
-
-    def compute(self, prefix: str) -> Dict[str, float]:
-        denominator = max(1, self.num_gt)
-        return {
-            f"{prefix}_recall_iou": self.iou_threshold,
-            **{
-                f"{prefix}_recall50_at_{top_k}": (
-                    self.hits[top_k] / denominator
-                )
-                for top_k in self.ks
-            },
-        }
-
-
-class RawOracleRecallAccumulator:
-    """Raw-box coverage upper bound for each phrase GT set."""
-
-    def __init__(
-        self,
-        iou_thresholds: Sequence[float] = (
-            0.25,
-            0.50,
-            0.75,
-        ),
-    ) -> None:
-        self.iou_thresholds = torch.as_tensor(
-            list(iou_thresholds),
-            dtype=torch.float32,
-        )
-        if self.iou_thresholds.numel() == 0:
-            raise ValueError(
-                "raw_oracle_iou_thresholds must not be empty"
-            )
-        self.best_iou_chunks: List[torch.Tensor] = []
-        self.num_gt = 0
-        self.num_samples = 0
-        self.num_positive_samples = 0
-        self.num_raw_pred = 0
-        self.num_raw_pred_positive = 0
-
-    @staticmethod
-    def threshold_key(threshold: float) -> str:
-        return (
-            "raw_oracle_recall"
-            f"{int(round(float(threshold) * 100)):02d}"
-        )
-
-    def update(
-        self,
-        pred_boxes: torch.Tensor,
-        gt_boxes: torch.Tensor,
-    ) -> None:
-        pred_boxes = (
-            pred_boxes.detach()
-            .to(device="cpu", dtype=torch.float32)
-            .reshape(-1, 4)
-            .contiguous()
-        )
-        gt_boxes = (
-            gt_boxes.detach()
-            .to(device="cpu", dtype=torch.float32)
-            .reshape(-1, 4)
-            .contiguous()
-        )
-
-        num_pred = int(pred_boxes.shape[0])
-        num_gt = int(gt_boxes.shape[0])
-        self.num_samples += 1
-        self.num_raw_pred += num_pred
-        self.num_gt += num_gt
-
-        if num_gt == 0:
-            return
-
-        self.num_positive_samples += 1
-        self.num_raw_pred_positive += num_pred
-
-        if num_pred == 0:
-            best_iou = torch.zeros(
-                num_gt,
-                dtype=torch.float32,
-            )
-        else:
-            best_iou = box_iou_xyxy(
-                pred_boxes,
-                gt_boxes,
-            ).max(dim=0).values
-        self.best_iou_chunks.append(best_iou)
-
-    def compute(self) -> Dict[str, float]:
-        result: Dict[str, float] = {
-            "raw_oracle_num_gt": int(self.num_gt),
-            "raw_oracle_num_samples": int(self.num_samples),
-            "raw_oracle_positive_samples": int(
-                self.num_positive_samples
-            ),
-            "raw_oracle_num_pred": int(self.num_raw_pred),
-            "raw_oracle_avg_pred_per_sample": (
-                self.num_raw_pred / max(1, self.num_samples)
-            ),
-            "raw_oracle_avg_pred_per_positive_sample": (
-                self.num_raw_pred_positive
-                / max(1, self.num_positive_samples)
-            ),
-        }
-
-        if self.num_gt == 0 or not self.best_iou_chunks:
-            result.update({
-                "raw_best_iou_mean": 0.0,
-                "raw_best_iou_median": 0.0,
-                "raw_best_iou_p25": 0.0,
-                "raw_best_iou_p75": 0.0,
-            })
-            for threshold in self.iou_thresholds.tolist():
-                result[self.threshold_key(threshold)] = 0.0
-            return result
-
-        best_iou = torch.cat(
-            self.best_iou_chunks,
-            dim=0,
-        )
-        result.update({
-            "raw_best_iou_mean": float(best_iou.mean().item()),
-            "raw_best_iou_median": float(
-                best_iou.median().item()
-            ),
-            "raw_best_iou_p25": float(
-                torch.quantile(best_iou, 0.25).item()
-            ),
-            "raw_best_iou_p75": float(
-                torch.quantile(best_iou, 0.75).item()
-            ),
-        })
-        for threshold in self.iou_thresholds.tolist():
-            result[self.threshold_key(threshold)] = float(
-                (best_iou >= float(threshold))
-                .to(torch.float32)
-                .mean()
-                .item()
-            )
-        return result
-
-
 @dataclass
 class PhraseEvaluationRow:
     image_index: int
@@ -546,6 +144,7 @@ class PhraseEvaluationRow:
     alignment_scores: torch.Tensor
     final_scores: torch.Tensor
     gt_boxes: torch.Tensor
+    ignored_boxes: torch.Tensor
 
 
 def _normalize_target_indices(
@@ -577,24 +176,7 @@ def _normalize_target_indices(
     return result
 
 
-def _flatten_target_spans(
-    target: Mapping[str, Any],
-) -> List[List[int]]:
-    result: List[List[int]] = []
-    for target_spans in target.get(
-        "positive_char_spans",
-        [],
-    ):
-        for span in target_spans:
-            if len(span) == 2:
-                result.append(
-                    [int(span[0]), int(span[1])]
-                )
-    return result
-
-
 def build_phrase_evaluation_rows(
-    *,
     batch: Mapping[str, Any],
     outputs: Mapping[str, Any],
     pred_bbox: torch.Tensor,
@@ -710,10 +292,7 @@ def build_phrase_evaluation_rows(
                     target_indices = []
 
                 if image_mapping is None:
-                    # Structural fallback for older ODVG collates.
-                    target_indices = list(
-                        range(target_boxes.shape[0])
-                    )
+                    raise ValueError("Phrase evaluation requires explicit object mapping")
 
                 gt_boxes = target_boxes[
                     target_indices
@@ -755,54 +334,15 @@ def build_phrase_evaluation_rows(
                             "final_score"
                         ],
                         gt_boxes=gt_boxes,
+                        ignored_boxes=target_boxes[
+                            torch.as_tensor(target["phrase_relations"])[region_index] < 0
+                        ],
                     )
                 )
                 region_rows_created += 1
 
-        if region_rows_created > 0:
-            continue
-
-        # Fallback: one union-phrase row per image.
-        spans = _flatten_target_spans(target)
-        if spans:
-            scores = score_queries_for_char_spans(
-                quality_logit=quality_logit[
-                    image_index
-                ],
-                token_alignment_logits=token_logits[
-                    image_index
-                ],
-                token_offsets=token_offsets[
-                    image_index
-                ],
-                char_spans=spans,
-                valid_token_mask=alignment_text_mask[
-                    image_index
-                ],
-                token_reduction=token_reduction,
-                score_fusion=score_fusion,
-                strict=True,
-            )
-            rows.append(
-                PhraseEvaluationRow(
-                    image_index=image_index,
-                    phrase=str(
-                        target.get("caption", "")
-                    ),
-                    char_spans=spans,
-                    pred_boxes=pred_bbox[image_index],
-                    quality_scores=scores[
-                        "quality_score"
-                    ],
-                    alignment_scores=scores[
-                        "phrase_alignment_score"
-                    ],
-                    final_scores=scores[
-                        "final_score"
-                    ],
-                    gt_boxes=target_boxes,
-                )
-            )
+        if region_rows_created == 0:
+            raise ValueError("Phrase evaluation requires annotated phrase rows")
 
     return rows
 
@@ -829,16 +369,9 @@ def validate_one_epoch(
     rank_start_epoch: int = 15,
     rank_warmup_epoch: int = 30,
     rank_alpha_min: float = 1e-4,
-    score_thr: float = 0.001,
-    top_k: int = 20,
+    score_thr: float = 0.5,
     nms_iou_thr: float = 0.5,
-    use_topk_fallback: bool = False,
-    use_nms: bool = True,
-    iou_thresholds: Optional[Sequence[float]] = None,
-    compute_raw_oracle: bool = True,
-    raw_oracle_iou_thresholds: Optional[
-        Sequence[float]
-    ] = (0.25, 0.50, 0.75),
+    use_nms: bool = False,
     max_val_batches: Optional[int] = None,
     log_interval: int = 50,
     progress_leave: bool = True,
@@ -858,44 +391,11 @@ def validate_one_epoch(
     loss_sums: Dict[str, torch.Tensor] = {}
     processed_batches = 0
 
-    metric = (
-        BinaryDetectionAPAccumulator(
-            iou_thresholds=iou_thresholds
-        )
-        if compute_metrics
-        else None
-    )
-    raw_oracle_metric = (
-        RawOracleRecallAccumulator(
-            iou_thresholds=(
-                raw_oracle_iou_thresholds
-                if raw_oracle_iou_thresholds is not None
-                else (0.25, 0.50, 0.75)
-            )
-        )
-        if compute_metrics and compute_raw_oracle
-        else None
-    )
-    quality_recall_metric = (
-        RankedRecallAtKAccumulator()
-        if compute_metrics
-        else None
-    )
-    alignment_recall_metric = (
-        RankedRecallAtKAccumulator()
-        if compute_metrics
-        else None
-    )
-    final_recall_metric = (
-        RankedRecallAtKAccumulator()
-        if compute_metrics
-        else None
-    )
+    metric = GroundingMetrics() if compute_metrics else None
 
     phrase_count = 0
     image_count = 0
     total_text_negative_queries = 0
-    skipped_empty_gt = 0
     total_selected = 0
 
     pbar_total = (
@@ -1124,11 +624,9 @@ def validate_one_epoch(
                     boxes=phrase_boxes,
                     scores=final_scores,
                     score_thr=score_thr,
-                    top_k=top_k,
+                    top_k=phrase_boxes.shape[1],
                     nms_iou_thr=nms_iou_thr,
-                    use_topk_fallback=(
-                        use_topk_fallback
-                    ),
+                    use_topk_fallback=False,
                     use_nms=use_nms,
                 )
 
@@ -1136,52 +634,16 @@ def validate_one_epoch(
                     selected_boxes,
                     selected_scores,
                 ) in zip(rows, selected_rows):
-                    gt_boxes = (
-                        row.gt_boxes.detach()
-                        .to(
-                            device="cpu",
-                            dtype=torch.float32,
-                        )
-                        .reshape(-1, 4)
-                    )
-                    if gt_boxes.numel() == 0:
-                        skipped_empty_gt += 1
-
-                    total_selected += int(
-                        selected_boxes.shape[0]
-                    )
-
+                    total_selected += int(selected_boxes.shape[0])
                     metric.update(
-                        pred_boxes=selected_boxes,
-                        pred_scores=selected_scores,
-                        gt_boxes=gt_boxes,
-                    )
-
-                    quality_recall_metric.update(
                         pred_boxes=row.pred_boxes,
-                        pred_scores=(
-                            row.quality_scores
-                        ),
-                        gt_boxes=gt_boxes,
+                        final_scores=row.final_scores,
+                        quality_scores=row.quality_scores,
+                        alignment_scores=row.alignment_scores,
+                        gt_boxes=row.gt_boxes,
+                        ignored_boxes=row.ignored_boxes,
+                        selected_boxes=selected_boxes,
                     )
-                    alignment_recall_metric.update(
-                        pred_boxes=row.pred_boxes,
-                        pred_scores=(
-                            row.alignment_scores
-                        ),
-                        gt_boxes=gt_boxes,
-                    )
-                    final_recall_metric.update(
-                        pred_boxes=row.pred_boxes,
-                        pred_scores=row.final_scores,
-                        gt_boxes=gt_boxes,
-                    )
-
-                    if raw_oracle_metric is not None:
-                        raw_oracle_metric.update(
-                            pred_boxes=row.pred_boxes,
-                            gt_boxes=gt_boxes,
-                        )
 
         should_log = (
             (step + 1)
@@ -1309,60 +771,13 @@ def validate_one_epoch(
     eval_metrics: Dict[str, float] = {}
     if compute_metrics and metric is not None:
         eval_metrics.update(metric.compute())
-        eval_metrics.update(
-            quality_recall_metric.compute(
-                "quality"
-            )
-        )
-        eval_metrics.update(
-            alignment_recall_metric.compute(
-                "text"
-            )
-        )
-        final_recall = (
-            final_recall_metric.compute("final")
-        )
-        eval_metrics.update(final_recall)
-
-        for top_k in final_recall_metric.ks:
-            eval_metrics[f"recall50_at_{top_k}"] = (
-                final_recall[
-                    f"final_recall50_at_{top_k}"
-                ]
-            )
-
-        if raw_oracle_metric is not None:
-            raw_metrics = raw_oracle_metric.compute()
-            eval_metrics.update(raw_metrics)
-            raw_recall50 = float(
-                raw_metrics.get(
-                    "raw_oracle_recall50",
-                    0.0,
-                )
-            )
-            final_recall50 = float(
-                eval_metrics.get(
-                    "recall",
-                    0.0,
-                )
-            )
-            eval_metrics["raw_oracle_gap50"] = (
-                raw_recall50 - final_recall50
-            )
-            eval_metrics[
-                "raw_oracle_retention50"
-            ] = (
-                final_recall50
-                / max(raw_recall50, 1e-12)
-            )
-
         eval_metrics.update({
             "valid_samples": int(phrase_count),
             "valid_images": int(image_count),
             "odvg_phrase_rows": int(phrase_count),
-            "skipped_empty_gt": int(
-                skipped_empty_gt
-            ),
+            "set_score_threshold": float(score_thr),
+            "set_use_nms": bool(use_nms),
+            "set_nms_iou_threshold": float(nms_iou_thr),
             "avg_selected_per_sample": (
                 total_selected
                 / max(1, phrase_count)
@@ -1385,10 +800,7 @@ def validate_one_epoch(
 
 
 __all__ = [
-    "BinaryDetectionAPAccumulator",
     "PhraseEvaluationRow",
-    "RankedRecallAtKAccumulator",
-    "RawOracleRecallAccumulator",
     "build_phrase_evaluation_rows",
     "get_amp_enabled",
     "select_predictions_batch",

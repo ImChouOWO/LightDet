@@ -97,11 +97,11 @@ loss:
     loss_weight: 1.0
     negative_weight: 0.25
     unmatched_weight: 0.10
-    negative_text_weight: 1.0
     focal_gamma: 2.0
     ranking_weight: 0.25
+    aux_ranking_weight: 0.0
     ranking_margin: 0.15
-    start_epoch: 3
+    start_epoch: 1
     warmup_epoch: 7
   matcher_schedule:
     start_epoch: 10
@@ -118,7 +118,7 @@ loss:
     expand_cost_bbox: 5.0
     expand_cost_giou: 2.0
   hybrid:
-    aux_loss_weight: 0.50
+    aux_loss_weight: 0.25
     matcher_cost_score: 2.0
     matcher_cost_alignment: 2.0
     warmup_epoch: 5
@@ -168,20 +168,15 @@ eval:
   val_loss_interval: 5
   eval_interval: 1
   max_val_batches: null
-  score_thr: 0.001
-  top_k: 20
+  score_thr: 0.5
   nms_iou_thr: 0.5
   use_nms: false
-  use_topk_fallback: false
-  iou_thresholds: null
-  compute_raw_oracle: true
-  raw_oracle_iou_thresholds: [0.25, 0.50, 0.75]
-  best_metric: map50
+  best_metric: hit_at_1
 
 log:
-  save_dir: units/model/runs/train/lightdet_relations_100ep
-  weights_path: null
-  resume_path: units/model/runs/train/lightdet_relations_100ep/latest.pt
+  save_dir: units/model/runs/train/lightdet_grounding_roi5_100ep
+  weights_path: units/model/runs/train/lightdet_grounding_v2_main_aux_split_100ep/best_hit_at_1.pt
+  resume_path: null
   prefer_ema: true
   save_latest_interval: 1
   save_epoch_interval: 10

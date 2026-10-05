@@ -934,6 +934,7 @@ class ShipGroundingDataset(Dataset):
         return {
             "boxes": boxes,
             "object_ids": [unique_targets[i]["id"] for i in kept_indices],
+            "objects_complete": record["metadata"].get("objects_complete", False) is True,
             "phrase_char_spans": [p["tokens_positive"] for p in record["regions"]],
             "phrase_relations": torch.tensor(record["phrase_relations"], dtype=torch.int8)[:, kept_indices],
             "boxes_pixel": boxes_pixel,
@@ -1084,8 +1085,12 @@ class QueryBudgetBatchSampler(Sampler[List[int]]):
         shuffle: bool = True,
         drop_last: bool = False,
         seed: int = 0,
+        max_images_per_batch: int = 6,
     ) -> None:
         self.dataset = dataset
+        if int(max_images_per_batch) < 1:
+            raise ValueError("max_images_per_batch must be positive")
+        self.max_images_per_batch = int(max_images_per_batch)
         self.query_budget = max(1, int(query_budget))
         self.shuffle = bool(shuffle)
         self.drop_last = bool(drop_last)
@@ -1116,7 +1121,9 @@ class QueryBudgetBatchSampler(Sampler[List[int]]):
             dataset_index = self.indices[position]
             item_cost = self.query_counts[position]
 
-            if batch and budget_sum + item_cost > self.query_budget:
+            # Few descriptions do not make a 1024px image cheaper to encode.
+            if batch and (budget_sum + item_cost > self.query_budget
+                          or len(batch) >= self.max_images_per_batch):
                 batches.append(batch)
                 batch = []
                 budget_sum = 0

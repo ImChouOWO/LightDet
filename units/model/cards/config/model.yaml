@@ -66,6 +66,7 @@ model:
   score_num_layers: 2
   score_mlp_ratio: 3.0
   score_dropout: 0.1
+  score_roi_size: 5
   score_bbox_conditioning: true
   score_bbox_detach: true
   score_fusion: geometric_mean

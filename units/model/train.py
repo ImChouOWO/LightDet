@@ -1210,6 +1210,9 @@ def train_one_epoch(
         "loss_text_alignment_contrib",
         "loss_text_alignment_rank",
         "loss_text_alignment_rank_contrib",
+        "text_alignment_extra_query_count",
+        "text_alignment_background_query_count",
+        "text_alignment_margin",
     )
     totals = {
         name: torch.zeros(
@@ -1529,7 +1532,7 @@ def train_one_epoch(
                     "matcher_cost_alignment_effective",
                     "text_alignment_positive_score_mean",
                     "text_alignment_negative_score_mean",
-                    "text_alignment_positive_negative_margin",
+                    "text_alignment_margin",
                 ):
                     value = loss_dict.get(
                         name
@@ -1604,6 +1607,9 @@ def train_one_epoch(
         "loss_text_alignment_rank_contrib": (
             "train_loss_text_alignment_rank_contrib"
         ),
+        "text_alignment_extra_query_count": "train_text_alignment_extra_query_count",
+        "text_alignment_background_query_count": "train_text_alignment_background_query_count",
+        "text_alignment_margin": "train_text_alignment_margin",
     }
 
     for source_name, output_name in (
@@ -1997,6 +2003,7 @@ def load_checkpoint(
     scaler: GradScaler,
     scheduler: WarmupCosineScheduler,
     device: torch.device,
+    best_metric_name: str,
 ) -> Tuple[int, float]:
     try:
         checkpoint = torch.load(
@@ -2070,6 +2077,9 @@ def load_checkpoint(
     start_epoch = int(checkpoint.get("epoch", 0)) + 1
     best_metric = float(checkpoint.get("best_metric", -1.0))
 
+    if checkpoint.get("best_metric_name") != best_metric_name:
+        best_metric = -1.0
+        print("[Checkpoint] Selection metric changed; best score reset.")
     return start_epoch, best_metric
 
 
@@ -2579,6 +2589,7 @@ def train(args: SimpleNamespace) -> None:
         score_num_layers=args.score_num_layers,
         score_mlp_ratio=args.score_mlp_ratio,
         score_dropout=args.score_dropout,
+        score_roi_size=args.score_roi_size,
         score_bbox_conditioning=args.score_bbox_conditioning,
         score_bbox_detach=args.score_bbox_detach,
         freeze_img_projection=args.freeze_img_projection,
@@ -2999,6 +3010,7 @@ def train(args: SimpleNamespace) -> None:
             scaler=scaler,
             scheduler=scheduler,
             device=device,
+            best_metric_name=best_metric_name,
         )
 
         print(f"[Info] Resume from: {args.resume_path}")
@@ -3119,15 +3131,8 @@ def train(args: SimpleNamespace) -> None:
             rank_warmup_epoch=args.rank_warmup_epoch,
             rank_alpha_min=args.rank_alpha_min,
             score_thr=args.score_thr,
-            top_k=args.top_k,
             nms_iou_thr=args.nms_iou_thr,
-            use_topk_fallback=args.use_topk_fallback,
             use_nms=args.use_nms,
-            iou_thresholds=args.iou_thresholds,
-            compute_raw_oracle=args.compute_raw_oracle,
-            raw_oracle_iou_thresholds=(
-                args.raw_oracle_iou_thresholds
-            ),
             max_val_batches=args.max_val_batches,
             log_interval=args.log_interval,
             progress_leave=args.progress_leave,
@@ -3295,7 +3300,7 @@ def train(args: SimpleNamespace) -> None:
         append_csv(csv_metrics_path, metric_row)
         write_latest_json(latest_metrics_path, metric_row)
 
-        has_eval_metric = best_metric_name in eval_metrics
+        has_eval_metric = eval_metrics.get(best_metric_name) is not None
         save_metric = (
             float(eval_metrics[best_metric_name])
             if has_eval_metric
@@ -3379,15 +3384,16 @@ def train(args: SimpleNamespace) -> None:
             f"Epoch [{epoch}/{args.epochs}] "
             f"train={train_metrics.get('train_loss', -1):.4f} "
             f"val={val_loss_text} "
-            f"mAP50={eval_metrics.get('map50', -1):.4f} "
-            f"mAP50-95={eval_metrics.get('map50_95', -1):.4f} "
-            f"P={eval_metrics.get('precision', -1):.4f} "
-            f"R={eval_metrics.get('recall', -1):.4f} "
-            f"R@1={eval_metrics.get('recall50_at_1', -1):.4f} "
-            f"R@5={eval_metrics.get('recall50_at_5', -1):.4f} "
-            f"R@10={eval_metrics.get('recall50_at_10', -1):.4f} "
-            f"Oracle50="
-            f"{eval_metrics.get('raw_oracle_recall50', -1):.4f} "
+            + " ".join(
+                f"{label}={eval_metrics[key]:.4f}" if eval_metrics.get(key) is not None
+                else f"{label}=N/A"
+                for label, key in (
+                    ("Hit@1", "hit_at_1"), ("Hit@5", "hit_at_5"), ("Hit@10", "hit_at_10"),
+                    ("ObjR@5", "object_recall_at_5"), ("ObjR@10", "object_recall_at_10"),
+                    ("Set50", "set_success50"), ("N-acc", "no_target_accuracy"),
+                    ("Oracle50", "oracle50"),
+                )
+            ) + " " +
             f"time={epoch_time:.1f}s"
         )
 
@@ -3406,7 +3412,7 @@ class LightDet:
 
     def __init__(
         self,
-        model: str = str(DEFAULT_MODEL_CONFIG_PATH),
+        model: str = "/PATH/TO/model.yaml",
     ) -> None:
         self.model_cfg_path = model
         self.model_cfg = load_model_config(
@@ -3423,7 +3429,7 @@ class LightDet:
 
     def train(
         self,
-        cfg: str = str(DEFAULT_TRAIN_CONFIG_PATH),
+        cfg: str = "/PATH/TO/train.yaml",
         data: Optional[str] = None,
         epochs: Optional[int] = None,
         imgsz: Optional[int] = None,
@@ -3706,6 +3712,6 @@ def main(model_cfg:str, train_cfg:str) -> None:
 
 if __name__ == "__main__":
     main(
-        model_cfg="path/to/your/model_config.yaml",
-        train_cfg="path/to/your/train_config.yaml"
+        model_cfg="/PATH/TO/model.yaml",
+        train_cfg="/PATH/TO/train.yaml",
     )

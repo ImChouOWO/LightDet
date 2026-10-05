@@ -257,7 +257,7 @@ def compact_grounding_collate_fn(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     batch = grounding_collate_fn(items)
     targets = batch.pop("targets", [])
     batch["relation_targets"] = [
-        {k: t[k] for k in ("object_ids", "phrase_char_spans", "phrase_relations")}
+        {k: t[k] for k in ("object_ids", "phrase_char_spans", "phrase_relations", "objects_complete")}
         for t in targets
     ]
 

@@ -729,6 +729,13 @@ def cfg_to_args(
             )
         ),
 
+        score_roi_size=int(
+            model_cfg.get(
+                "score_roi_size",
+                5,
+            )
+        ),
+
         score_bbox_conditioning=bool(
             model_cfg.get(
                 "score_bbox_conditioning",
@@ -1032,19 +1039,9 @@ def cfg_to_args(
         eval_interval=eval_cfg["eval_interval"],
         max_val_batches=eval_cfg.get("max_val_batches"),
         score_thr=eval_cfg["score_thr"],
-        top_k=eval_cfg["top_k"],
         nms_iou_thr=eval_cfg["nms_iou_thr"],
-        use_nms=eval_cfg.get("use_nms", True),
-        iou_thresholds=eval_cfg.get("iou_thresholds"),
-        compute_raw_oracle=bool(
-            eval_cfg.get("compute_raw_oracle", True)
-        ),
-        raw_oracle_iou_thresholds=eval_cfg.get(
-            "raw_oracle_iou_thresholds",
-            [0.25, 0.50, 0.75],
-        ),
+        use_nms=eval_cfg.get("use_nms", False),
         best_metric=eval_cfg["best_metric"],
-        use_topk_fallback=eval_cfg.get("use_topk_fallback", False),
 
         # log
         save_dir=log_cfg["save_dir"],
@@ -1257,13 +1254,7 @@ def print_config_summary(
     print(
         f"  eval         : metric={evaluation['best_metric']}, "
         f"score_thr={evaluation['score_thr']}, "
-        f"top_k={evaluation['top_k']}, "
         f"use_nms={evaluation.get('use_nms', True)}, "
         f"max_batches={evaluation.get('max_val_batches')}"
-    )
-    print(
-        f"  raw oracle   : enabled="
-        f"{evaluation.get('compute_raw_oracle', True)}, "
-        f"iou={evaluation.get('raw_oracle_iou_thresholds', [0.25, 0.5, 0.75])}"
     )
     print("")
