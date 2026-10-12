@@ -43,11 +43,11 @@ ResNet 實驗使用 `lightdet_grounding_resnet50_roi8_hardneg_log_100ep`；既�
 
 使用相同驗證集（2,683 張影像、17,395 段描述）及 GREC 官方參考評估規則重新計算；Acc@0.5 僅計入 11,392 段單目標描述。
 
-| 階段 | epoch | GREC Pr@(F1=1) | 單目標 Acc@0.5
+| 階段 | epoch | GREC Pr@(F1=1) | 單目標 Acc@0.5 |
 |---|---:|---:|---:|
-| Baseline | 61 | 13.11% | 43.11% | 
-| Baseline + ROI  | 45 | 0.79% | 43.07% | 
-| ResNe + ROI | 55 | 0.59% | 49.45% | 
+| Baseline | 61 | 8.81% | 43.11% |
+| Baseline + ROI | 45 | 1.79% | 43.07% |
+| ResNet + ROI | 55 | 3.46% | 49.45% |
 
 
 
