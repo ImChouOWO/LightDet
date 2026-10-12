@@ -1,0 +1,83 @@
+{
+  "date": "2026-10-12",
+  "reference": "https://github.com/henghuiding/gRefCOCO/blob/main/mdetr/datasets/refexp.py",
+  "checkpoint_selection": "historical hit_at_1; not selected by GREC",
+  "runs": [
+    {
+      "run": "lightdet_grounding_v2_main_aux_split_100ep_val_20261005_083845",
+      "checkpoint": {
+        "path": "/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_grounding_v2_main_aux_split_100ep/best_hit_at_1.pt",
+        "source": "ema",
+        "source_epoch": 61,
+        "source_best_metric": 0.4524288588674907
+      },
+      "images": 2683,
+      "partial": false,
+      "phrases": 17395,
+      "metrics": {
+        "grec_precision_f1": 0.13107214716872664,
+        "grec_n_acc": null,
+        "grec_t_acc": 0.5416498993963783,
+        "rec_acc50": 0.43109199438202245,
+        "single_target_query_count": 11392,
+        "positive_query_count": 17395,
+        "evaluated_query_count": 17395,
+        "gt_object_phrase_pairs": 29689,
+        "metric_schema": "lightdet.grounding.v3",
+        "benchmark_protocol": "grefcoco_grec_reference_giou_greedy_score0.7_no_nms",
+        "benchmark_score_threshold": 0.7
+      }
+    },
+    {
+      "run": "lightdet_grounding_roi5_background_100ep_val_20261007_081914",
+      "checkpoint": {
+        "path": "/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_grounding_roi5_background_100ep/best_hit_at_1.pt",
+        "source": "ema",
+        "source_epoch": 45,
+        "source_best_metric": 0.45881000287438917
+      },
+      "images": 2683,
+      "partial": false,
+      "phrases": 17395,
+      "metrics": {
+        "grec_precision_f1": 0.007875826386892786,
+        "grec_n_acc": null,
+        "grec_t_acc": 0.6949123311296349,
+        "rec_acc50": 0.43065308988764045,
+        "single_target_query_count": 11392,
+        "positive_query_count": 17395,
+        "evaluated_query_count": 17395,
+        "gt_object_phrase_pairs": 29689,
+        "metric_schema": "lightdet.grounding.v3",
+        "benchmark_protocol": "grefcoco_grec_reference_giou_greedy_score0.7_no_nms",
+        "benchmark_score_threshold": 0.7
+      }
+    },
+    {
+      "run": "lightdet_resnet50_grec_reference_val",
+      "checkpoint": {
+        "path": "/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_grounding_resnet50_roi8_hardneg_log_100ep/best_hit_at_1.pt",
+        "source": "ema",
+        "source_epoch": 55,
+        "source_best_metric": 0.5227939062949123,
+        "excluded_prefixes": [],
+        "preserved_image_entries": 0
+      },
+      "images": 2683,
+      "partial": false,
+      "metrics": {
+        "grec_precision_f1": 0.005921241736131072,
+        "grec_n_acc": null,
+        "grec_t_acc": 0.7732681805116413,
+        "rec_acc50": 0.4944698033707865,
+        "single_target_query_count": 11392,
+        "positive_query_count": 17395,
+        "evaluated_query_count": 17395,
+        "gt_object_phrase_pairs": 29689,
+        "metric_schema": "lightdet.grounding.v3",
+        "benchmark_protocol": "grefcoco_grec_reference_giou_greedy_score0.7_no_nms",
+        "benchmark_score_threshold": 0.7
+      }
+    }
+  ]
+}

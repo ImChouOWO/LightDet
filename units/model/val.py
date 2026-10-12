@@ -77,7 +77,7 @@ def main():
     cfg = load_train_config(args.config)
     data, train, evaluation = cfg['data'], cfg['train'], cfg['eval']
     run = resolve(cfg['log']['save_dir'])
-    weights = resolve(args.weights) if args.weights else run / 'best_hit_at_1.pt'
+    weights = resolve(args.weights) if args.weights else run / ('best_' + evaluation['best_metric'] + '.pt')
     output = resolve(args.output_dir) if args.output_dir else run.parent / (run.name + '_val_' + datetime.now().strftime('%Y%m%d_%H%M%S'))
     device = torch.device(args.device or ('cuda:' + str(train['device']) if torch.cuda.is_available() else 'cpu'))
     torch.set_num_threads(4)

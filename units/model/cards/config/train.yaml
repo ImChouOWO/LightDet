@@ -181,7 +181,7 @@ eval:
   score_thr: 0.5
   nms_iou_thr: 0.5
   use_nms: true
-  best_metric: hit_at_1
+  best_metric: grec_precision_f1
 
 log:
   save_dir: units/model/runs/train/lightdet_grounding_roi8_hardneg_log_100ep

@@ -27,25 +27,25 @@ class GroundingMetricTests(unittest.TestCase):
         self.assertEqual(result['hit_at_1'], 1.)
         self.assertEqual(result['object_recall_at_5'], .5)
         self.assertEqual(result['oracle50'], .5)
-        self.assertEqual(result['set_success50'], 0.)
-        self.assertIsNone(result['no_target_accuracy'])
+        self.assertEqual(result['grec_precision_f1'], 0.)
+        self.assertIsNone(result['grec_n_acc'])
 
     def test_duplicates_fail_exact_set(self):
         metric = GroundingMetrics()
         update(metric, [A, A, B], [A, B])
         self.assertEqual(metric.compute()['object_recall_at_5'], 1.)
-        self.assertEqual(metric.compute()['set_success50'], 0.)
+        self.assertEqual(metric.compute()['grec_precision_f1'], 0.)
 
     def test_maximum_matching_avoids_greedy_failure(self):
         self.assertEqual(matched_count(torch.tensor([[True, True], [True, False]])), 2)
 
     def test_empty_query_success_and_false_positive(self):
         metric = GroundingMetrics()
-        update(metric, [A], [], selected=[])
+        update(metric, [A], [], scores=[.6], selected=[])
         update(metric, [A], [])
         result = metric.compute()
-        self.assertEqual(result['no_target_accuracy'], .5)
-        self.assertEqual(result['set_success50'], .5)
+        self.assertEqual(result['grec_n_acc'], .5)
+        self.assertEqual(result['grec_precision_f1'], .5)
         self.assertIsNone(result['hit_at_1'])
         self.assertEqual(result['no_target_query_count'], 2)
 
@@ -55,9 +55,9 @@ class GroundingMetricTests(unittest.TestCase):
         update(metric, [B], [], ignored=[B])
         result = metric.compute()
         self.assertEqual(result['hit_at_1'], 1.)
-        self.assertEqual(result['set_success50'], 1.)
+        self.assertEqual(result['grec_precision_f1'], 1.)
         self.assertEqual(result['ignored_query_count'], 1)
-        self.assertIsNone(result['no_target_accuracy'])
+        self.assertIsNone(result['grec_n_acc'])
 
     def test_iou_boundary_and_no_detections(self):
         metric = GroundingMetrics()
@@ -73,6 +73,28 @@ class GroundingMetricTests(unittest.TestCase):
         self.assertEqual(result['hit_at_1'], 0.)
         self.assertEqual(result['hit_at_5'], 1.)
         self.assertEqual(result['oracle50'], 1.)
+
+    def test_benchmark_uses_raw_threshold_without_nms(self):
+        metric = GroundingMetrics()
+        update(metric, [A, A], [A], [.9, .8], selected=[A])
+        self.assertEqual(metric.compute()['grec_precision_f1'], 0.)
+        metric = GroundingMetrics()
+        update(metric, [A], [A], [.7], selected=[])
+        self.assertEqual(metric.compute()['grec_precision_f1'], 1.)
+
+    def test_single_target_acc_excludes_multiple_targets(self):
+        metric = GroundingMetrics()
+        update(metric, [A], [A], [.6])
+        update(metric, [A], [A, B])
+        result = metric.compute()
+        self.assertEqual(result['rec_acc50'], 1.)
+        self.assertEqual(result['single_target_query_count'], 1)
+        self.assertEqual(result['grec_precision_f1'], 0.)
+
+    def test_reference_giou_differs_from_iou(self):
+        from units.model.tool.grounding_metrics import grec_correct_set
+        # IoU=0.5319, GIoU=0.4919: the reference implementation rejects it.
+        self.assertFalse(grec_correct_set(torch.tensor([[.2, .2, 1.2, 1.2]]), torch.tensor([A])))
 
     def test_nonfinite_predictions_fail(self):
         with self.assertRaises(ValueError):

@@ -3446,10 +3446,8 @@ def train(args: SimpleNamespace) -> None:
                 f"{label}={eval_metrics[key]:.4f}" if eval_metrics.get(key) is not None
                 else f"{label}=N/A"
                 for label, key in (
-                    ("Hit@1", "hit_at_1"), ("Hit@5", "hit_at_5"), ("Hit@10", "hit_at_10"),
-                    ("ObjR@5", "object_recall_at_5"), ("ObjR@10", "object_recall_at_10"),
-                    ("Set50", "set_success50"), ("N-acc", "no_target_accuracy"),
-                    ("Oracle50", "oracle50"),
+                    ("GREC-P", "grec_precision_f1"), ("REC-Acc50", "rec_acc50"),
+                    ("N-acc", "grec_n_acc"), ("T-acc", "grec_t_acc"),
                 )
             ) + " " +
             f"time={epoch_time:.1f}s"

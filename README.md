@@ -18,11 +18,11 @@ Image + Text Phrases -> Object Queries -> Boxes + Quality + Phrase Alignment
 <details>
 <summary><em>當前限制 / Current Limitations</em></summary>
 
-ResNet 實驗已完成 100 epoch，最佳 Hit@1 為 52.28%（epoch 55）；後期訓練 loss 下降而驗證語意 loss 上升，排序泛化仍有改善空間。Hit@10 與 Oracle50 是候選診斷，不能當成保證可達的 Hit@1。實際端到端推論延遲尚未量測。
+ResNet 實驗已完成 100 epoch；既有 epoch 55 權重重新驗證後，單目標 Acc@0.5 為 49.45%，GREC 集合成功率為 0.59%。後期語意泛化與多報控制仍有改善空間；實際端到端推論延遲尚未量測。
 
 ---
 
-The ResNet experiment completed 100 epochs, with the best Hit@1 of 52.28% at epoch 55. Validation semantic loss rises during late training despite decreasing training loss. Hit@10 and Oracle50 diagnose candidate coverage and do not guarantee achievable Hit@1. End-to-end inference latency has not been measured.
+The ResNet experiment completed 100 epochs. Re-evaluation of the existing epoch-55 checkpoint gives 49.45% single-target Acc@0.5 and 0.59% GREC exact-set success. Semantic generalization and extra detections remain limitations. End-to-end inference latency has not been measured.
 
 </details>
 
@@ -37,23 +37,21 @@ The ResNet experiment completed 100 epochs, with the best Hit@1 of 52.28% at epo
 模型可使用多種文字條件查詢同一張影像，例如「單色紅色的船」與「含紅色的船」。同一個物件只保留一份定位框，描述關係由物件 ID 建立。
 
 目前資料集包含 10,733 張訓練影像與 2,683 張驗證影像。
-ResNet 實驗使用 `lightdet_grounding_resnet50_roi8_hardneg_log_100ep`，最佳 EMA checkpoint 位於 epoch 55：Hit@1 **52.28%**、Hit@5 **61.72%**、Hit@10 **68.50%**、Object Recall@10 **46.08%**、Set Success50 **3.61%**。
+ResNet 實驗使用 `lightdet_grounding_resnet50_roi8_hardneg_log_100ep`；既有 epoch 55 EMA checkpoint 已依 GREC 規則重新驗證，結果見下表。
 
 **模組演進與績效比較**
 
-依主要架構變化分成三個階段。下表採各階段代表性實驗中、Hit@1 最佳 epoch 的同次驗證結果，均使用 `lightdet.grounding.v2`。
+使用相同驗證集（2,683 張影像、17,395 段描述）及 GREC 官方參考評估規則重新計算；Acc@0.5 僅計入 11,392 段單目標描述。
 
-| 階段 |  最佳 epoch | Hit@1 | TextHit@1 | Oracle50 |
-|---|---:|---:|---:|---:|
-| BottleNet＋FPN |  61 | 45.24% | 27.93% | 72.85% |
-| BottleNet＋FPN＋ROI |  45 | 45.88% | 42.06% | 73.99% |
-| ResNet＋FPN＋ROI |  55 | 52.28% | 38.43% | 75.62% |
-
+| 階段 | 主要模組變化 | checkpoint epoch | GREC Pr@(F1=1) | 單目標 Acc@0.5 | N-acc |
+|---|---|---:|---:|---:|---:|
+| 原始版本 | BottleNet＋FPN，全域特徵評分 | 61 | 13.11% | 43.11% | N/A |
+| 加入 ROI | FPN 局部 ROI、Quality／Alignment 解耦與背景監督 | 45 | 0.79% | 43.07% | N/A |
+| 使用 ResNet | ResNet-50、ROI8、描述匹配與困難負例 log Ranking | 55 | 0.59% | 49.45% | N/A |
 
 > [!NOTE]
-> ResNet版本下 Hit@1 達 52.28%，但TextHit@1 為 38.43%，表示語意排序仍有改善空間。
-
-ResNet 在 epoch 45 已達 Hit@1 52.14%，epoch 55 最佳為 52.28%，epoch 100 為 50.96%；50 epoch 後候選定位仍改善，但語意排序沒有持續提升，因此使用最佳 checkpoint。
+> 以上使用過去依 Hit@1 選出的 EMA checkpoint，並非各實驗的最佳 GREC checkpoint；原始版與 ROI 版由完整預測重算，ResNet 版重新驗證。這些是累積版本比較，初始化與排程未完全控制，不能歸因於單一模組。驗證集沒有無目標描述，因此 N-acc 為 N/A。
+> GREC 要求全部物件正確且沒有多報；重複候選也算多報，不能與過去的 Hit@1 數值直接比較。詳細規則及來源見「驗證與後處理」；[重算結果與權重來源](./docs/grounding_comparison.json)。
 
 ### 模型資料流
 
@@ -82,7 +80,7 @@ Main／Aux 分別採一對一／一對多定位配對，Aux 僅用於訓練。�
 | `Text-Alignment Transformer` | ROI pooled feature＋BBox embedding 經每個 ROI 自己的 64 個 tokens 做局部 refinement，產生 Score Query；不讀取文字，也不讓不同 bbox queries 互相 attention |
 | `Alignment Head` | ROI／文字各自 LayerNorm＋Linear 256→256；文字依描述 span 加權池化，與 ROI 做正規化相似度及配對 MLP，輸出 `[Q,P]` logits |
 | `Quality Head` | ROI 平均池化後走獨立視覺投影及 Quality Head，輸出 `[Q,1]` logits，經 sigmoid 預測最大 GT IoU；不接收文字或 Score Query |
-| `Phrase Ranking` | 融合 `sqrt(Quality × Alignment)`，依描述分別排序；輸出使用閾值與 NMS，原始候選評估則不使用後處理 |
+| `Phrase Ranking` | 融合 `sqrt(Quality × Alignment)`，依描述分別排序；輸出使用閾值與 NMS，GREC 評估另使用 0.7 閾值且不使用 NMS |
 
 前段 FPN、BERT 投影與 ROI refinement 由 Main／Aux 共用，各自有獨立的 BBox、Quality 與 Alignment Head。描述匹配採 `cosine(v,t) + 0.25 × tanh(MLP([v*t, |v-t|]))`，MLP 為 512→64→1，再用可學習 scale／bias 轉成 logits。每個 ROI 只做一次 refinement，所有描述共用其視覺摘要；描述不會重新引導 ROI 空間注意力。
 
@@ -396,27 +394,30 @@ eval:
   score_thr: 0.5
   nms_iou_thr: 0.5
   use_nms: true
-  best_metric: hit_at_1
+  best_metric: grec_precision_f1
 ```
 
-IoU 命中條件為 ≥0.5，指標以 0–1 記錄，表格以百分比呈現：
+正式評估採用 [GREC／gRefCOCO 官方參考程式](https://github.com/henghuiding/gRefCOCO/blob/main/mdetr/datasets/refexp.py)，指標以 0–1 記錄：
 
-| 指標 | 分母與定義 |
+| 指標 | 定義 |
 |---|---|
-| `hit_at_1/5/10` | 有正例的描述查詢數；該描述前 K 個候選是否至少命中一個符合描述的 GT 物件 |
-| `object_recall_at_5/10` | 正確描述–物件配對總數；前 K 候選經一對一最大匹配後召回的 GT 比例，重複框不重複召回 |
-| `set_success50` | 有效描述查詢數；後處理輸出必須找齊全部正例且沒有多報，透過一對一匹配確認；重複框算多報 |
-| `no_target_accuracy` | 已確認沒有目標的描述查詢數；是否輸出零個框，沒有此類查詢時為 `null`／N/A |
-| `oracle50` | 正確描述–物件配對總數；任一原始候選能否覆蓋每個 GT，忽略分數；是物件層級定位覆蓋，並非 Hit@1 上限 |
-| `quality_hit_at_1` / `text_hit_at_1` | 有正例的描述查詢數；分別只用 Quality／Alignment 排序的 Top-1 命中率，用於分析融合前的分支能力 |
-| `avg_selected_per_query` | 有效描述查詢數；閾值與 NMS 後平均輸出框數，用於觀察輸出校準 |
+| `grec_precision_f1` | Pr@(F1=1)：描述對應的全部物件都正確且沒有多報，才算成功；作為主要指標 |
+| `grec_n_acc` | 無目標描述是否輸出空集合；沒有此類描述時為 N/A |
+| `grec_t_acc` | 有目標描述是否至少輸出一個框；不代表框的位置或語意正確 |
+| `rec_acc50` | 僅對單目標描述，最高分框與 GT 的 IoU >0.5 是否命中 |
 
-Hit@K、Object Recall@K、Oracle50 與單分支 Hit@1 使用未經分數閾值及 NMS 的原始 Main 候選。Set Success50 與 N-acc 使用設定的閾值與 NMS，不強制保留 Top-20、不在空輸出時補框。ignore 物件重疊候選若未同時命中正例，會排除；沒有正例但含未知關係的查詢不計為確認無目標。
+GREC 使用融合分數 ≥0.7 的原始 Main 候選，不使用 NMS 或 Top-K 補框，逐次選取最高重疊的一對框配對。**官方程式實際使用 GIoU ≥0.5**，此處如實重現並記錄為 `lightdet.grounding.v3`，不將舊 `Set Success50` 直接改名。自有資料的未知關係仍忽略；官方資料沒有這種額外關係標籤。
 
-> [!NOTE]
-> Hit@10=68.50% 表示前十候選包含正確答案的查詢比例；若能將它們完美重排序，才可轉為至少相同的 Hit@1。這是候選提供的可達空間，不是模型經過訓練就保證達到的準確率。Oracle50 分母不同，不能直接拿 75.62% 當作 Hit@1 的理論上限。
+Hit@K、TextHit@1、QualityHit@1、Object Recall 與 Oracle50 僅保留為候選／排序診斷，不列為正式績效或最佳 checkpoint 依據。自有資料使用公認評估規則，不代表數值可直接與 gRefCOCO 資料集上的論文結果比較。
 
-本驗證集沒有確認無目標的描述，因此 N-acc 為 N/A，不以 0 取代。公平比較固定相同閾值、NMS、資料與 `metric_schema: lightdet.grounding.v2`。舊 mAP、P/R、`recall50_at_*` 不能換算成新版 Hit@K，歷史權重需要重新驗證。
+推論仍使用 `score_thr=0.5` 與 NMS IoU=0.5；此後處理與 GREC 評估分開。新訓練依 `grec_precision_f1` 保存 `best_grec_precision_f1.pt`。
+
+已有完整預測時，可不執行模型、直接重新評估：
+
+```bash
+python3 units/model/rescore_grounding.py /PATH/TO/predictions.jsonl.gz \
+  --output /PATH/TO/metrics_grec.json
+```
 
 ---
 
@@ -425,7 +426,7 @@ Hit@K、Object Recall@K、Oracle50 與單分支 Hit@1 使用未經分數閾值�
 | 檔案 | 說明 |
 |---|---|
 | `latest.pt` | 最近一次完整 checkpoint |
-| `best_hit_at_1.pt` | `hit_at_1` 最佳 checkpoint |
+| `best_grec_precision_f1.pt` | GREC 集合成功率最佳 checkpoint |
 | `epoch_XXX.pt` | 每 10 epoch 保存的 checkpoint |
 | `metrics_epoch.jsonl` | Epoch-level 訓練與驗證指標 |
 | `latest_metrics.json` | 最近一次摘要 |
