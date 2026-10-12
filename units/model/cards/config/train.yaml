@@ -18,6 +18,7 @@ data:
 
 train:
   epochs: 100
+  localization_freeze_epochs: 10
   batch_size: 48
   warmup_epochs: 5
   num_workers: 16
@@ -40,23 +41,39 @@ train:
 
 optim:
   components:
-    vision: [cosine, 0.0001, 0.000005, 0.0, 1.0]
+    vision: [cosine, 0.00001, 0.000001, 0.0, 1.0]
     text: [cosine, 0.00001, 0.0000005, 0.0, 1.0]
-    transformer: [cosine, 0.0001, 0.000005, 0.0, 1.0]
+    transformer: [cosine, 0.00001, 0.000001, 0.0, 1.0]
     head: [cosine, 0.0001, 0.000005, 0.0, 1.0]
   weight_decay: 0.0001
   max_warmup_steps: 3000
   fused: true
 
 loss:
+  gt_roi:
+    weight: 0.5
+    hold_epochs: 5
+    end_epoch: 15
+  background:
+    enabled: true
+    max_iou: 0.2
+    max_ioa: 0.2
+    top_k: 10
+    negative_ratio: 3.0
+    empty_top_k: 5
+    start_epoch: 6
+    warmup_epochs: 5
+    quality_weight: 0.25
+    alignment_weight: 0.25
+    ranking_weight: 1.0
   matcher:
     cost_bbox: 5.0
     cost_giou: 2.0
-    cost_score: 2.0
+    cost_score: 0.0
     score_cost_type: focal
     focal_alpha: 0.25
     focal_gamma: 2.0
-    cost_alignment: 2.0
+    cost_alignment: 0.0
     alignment_negative_weight: 0.25
   weight:
     dynamic: true
@@ -96,11 +113,16 @@ loss:
     enabled: true
     loss_weight: 1.0
     negative_weight: 0.25
-    unmatched_weight: 0.10
     focal_gamma: 2.0
     ranking_weight: 0.25
+    # Ranking = warmup * (ranking_weight * order + ranking_contrast_weight * contrast).
+    ranking_contrast_weight: 0.01
+    ranking_contrast_temperature: 0.1
     aux_ranking_weight: 0.0
-    ranking_margin: 0.15
+    # Log margin ln(2): positive score must be at least twice the negative score.
+    ranking_margin: 0.6931471805599453
+    ranking_negative_top_k: 5
+    ranking_hard_negative_quota: 3
     start_epoch: 1
     warmup_epoch: 7
   matcher_schedule:
@@ -119,8 +141,8 @@ loss:
     expand_cost_giou: 2.0
   hybrid:
     aux_loss_weight: 0.25
-    matcher_cost_score: 2.0
-    matcher_cost_alignment: 2.0
+    matcher_cost_score: 0.0
+    matcher_cost_alignment: 0.0
     warmup_epoch: 5
     decay_start_ratio: 0.75
     min_factor: 0.25
@@ -138,21 +160,9 @@ loss:
     start_epoch: 10
     warmup_epoch: 10
   duplicate_suppression:
-    enabled: true
-    loss_weight: 0.10
-    margin: 0.25
-    background_weight: 0.05
-    classification_weight: 0.25
-    max_pairs: 128
-    start_epoch: 8
-    warmup_epoch: 7
+    enabled: false
   hard_negative:
-    enabled: true
-    loss_weight: 0.05
-    topk: 10
-    max_iou: 0.30
-    start_epoch: 20
-    warmup_epoch: 10
+    enabled: false
   ranking:
     enabled: false
     lambda_rank: 0.0
@@ -170,12 +180,12 @@ eval:
   max_val_batches: null
   score_thr: 0.5
   nms_iou_thr: 0.5
-  use_nms: false
+  use_nms: true
   best_metric: hit_at_1
 
 log:
-  save_dir: units/model/runs/train/lightdet_grounding_roi5_100ep
-  weights_path: units/model/runs/train/lightdet_grounding_v2_main_aux_split_100ep/best_hit_at_1.pt
+  save_dir: units/model/runs/train/lightdet_grounding_roi8_hardneg_log_100ep
+  weights_path: units/model/runs/train/lightdet_grounding_roi8_phrase_pair_100ep/best_hit_at_1.pt
   resume_path: null
   prefer_ema: true
   save_latest_interval: 1

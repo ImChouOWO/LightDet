@@ -37,27 +37,37 @@ class RelationTrainingTests(unittest.TestCase):
 
     def test_masked_loss_and_bidirectional_ranking(self):
         target = {"phrase_relations": torch.tensor([[1, 0], [1, -1], [0, 1]])}
+        boxes = torch.tensor([[[0., 0., .3, .3], [.6, .6, .9, .9]]])
+        target["boxes"] = boxes[0]
         assignment = AssignmentResult.from_per_batch([(torch.tensor([0, 1]), torch.tensor([0, 1]))],
                                                      device=torch.device("cpu"), mode="test")
         logits = torch.tensor([[-3., -3., 3.], [3., 50., -3.]], requires_grad=True)
-        loss, rank, _ = relation_loss([logits], [target], assignment, 2., .15, .25)
+        loss, rank, _ = relation_loss([logits], [target], assignment, 2., .15, .25, pred_boxes=boxes)
         self.assertGreater(rank.item(), 0)
         (loss + rank).backward()
         self.assertEqual(logits.grad[1, 1].item(), 0)
         self.assertLess(logits.grad[0, 0].item(), 0)
         self.assertGreater(logits.grad[1, 0].item(), 0)
         correct = torch.tensor([[4., 4., -4.], [-4., 0., 4.]])
-        _, good_rank, _ = relation_loss([correct], [target], assignment, 2., .15, .25)
+        _, good_rank, _ = relation_loss([correct], [target], assignment, 2., .15, .25, pred_boxes=boxes)
         self.assertEqual(good_rank.item(), 0)
 
     def test_phrase_pooling_and_truncation(self):
-        logits = torch.tensor([[[0., 2.]]], requires_grad=True)
+        from units.model.cards.phrase_matching import PhraseMatchingHead
+        visual = torch.tensor([[[1., 0.]]], requires_grad=True)
+        text = torch.tensor([[[1., 0.], [0., 1.]]], requires_grad=True)
+        head = PhraseMatchingHead(2)
+        with torch.no_grad():
+            head.pair_head[-1].weight.zero_()
+            head.pair_head[-1].bias.zero_()
+        matching = head(visual, text, torch.tensor(0.))
         offsets = torch.tensor([[[0, 1], [1, 2]]])
         target = {"phrase_char_spans": [[[0, 2]]]}
-        p = phrase_predictions(logits, offsets, torch.ones(1, 2, dtype=torch.bool), [target])[0]
-        torch.testing.assert_close(p.sigmoid(), logits[0].sigmoid().mean(-1, keepdim=True))
+        p = phrase_predictions(matching, offsets, torch.ones(1, 2, dtype=torch.bool), [target])[0]
+        expected = torch.nn.functional.normalize(text.mean(1), dim=-1)[0,0]
+        torch.testing.assert_close(p[0,0], expected)
         with self.assertRaises(ValueError):
-            phrase_predictions(logits, offsets, torch.ones(1, 2, dtype=torch.bool),
+            phrase_predictions(matching, offsets, torch.ones(1, 2, dtype=torch.bool),
                                [{"phrase_char_spans": [[[0, 3]]]}])
 
     def test_aux_cost_order_and_geometry(self):

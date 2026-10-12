@@ -8,6 +8,7 @@ import torch
 from tqdm import tqdm
 
 from units.model.pipeline.data import grounding_collate_fn
+from units.model.cards.phrase_matching import phrase_matrices
 
 
 def move_images_to_device(
@@ -102,8 +103,7 @@ def prepare_model_batch(
 def _attach_odvg_metadata(outputs: Dict[str, Any]) -> Dict[str, Any]:
     """Preserve scalar compatibility and expose ODVG tensors to the loss."""
     token_logits = outputs.get(
-        "token_alignment_logits",
-        outputs.get("main_token_alignment_logits"),
+        "phrase_matching",
     )
     token_offsets = outputs.get("token_offsets")
     alignment_mask = outputs.get("alignment_text_mask")
@@ -136,7 +136,7 @@ def _attach_odvg_metadata(outputs: Dict[str, Any]) -> Dict[str, Any]:
 
     if score is not None and torch.is_tensor(score):
         score._quality_logit = quality if quality is not None else score
-        score._token_alignment_logits = token_logits
+        score._phrase_matching = token_logits
         score._token_offsets = token_offsets
         score._alignment_text_mask = alignment_mask
         score._query_stage_separated = bool(
@@ -151,18 +151,17 @@ def _attach_odvg_metadata(outputs: Dict[str, Any]) -> Dict[str, Any]:
                 setattr(score, metadata_name, value)
 
     aux_score = outputs.get("aux_score_logit")
-    aux_token = outputs.get("aux_token_alignment_logits")
+    aux_token = outputs.get("aux_phrase_matching")
     aux_quality = outputs.get("aux_quality_logit")
     if aux_score is not None and torch.is_tensor(aux_score):
         aux_score._quality_logit = (
             aux_quality if aux_quality is not None else aux_score
         )
-        aux_score._token_alignment_logits = aux_token
+        aux_score._phrase_matching = aux_token
         aux_score._token_offsets = token_offsets
         aux_score._alignment_text_mask = alignment_mask
 
-    # Keep text_alignment_logit token-level. Phrase-specific scalar scores are
-    # produced only after selecting a phrase character span.
+    # Description scores are computed after selecting character spans.
     return outputs
 
 
@@ -257,7 +256,8 @@ def compact_grounding_collate_fn(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     batch = grounding_collate_fn(items)
     targets = batch.pop("targets", [])
     batch["relation_targets"] = [
-        {k: t[k] for k in ("object_ids", "phrase_char_spans", "phrase_relations", "objects_complete")}
+        {k: t[k] for k in ("object_ids", "phrase_char_spans", "phrase_relations", "objects_complete",
+                          "ranking_object_preferences", "ranking_phrase_preferences") if k in t}
         for t in targets
     ]
 
@@ -480,62 +480,6 @@ def char_spans_to_token_mask(
     return mask
 
 
-def pool_phrase_alignment_logits(
-    token_alignment_logits: torch.Tensor,
-    phrase_token_mask: torch.Tensor,
-    *,
-    reduction: str = "mean",
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    """
-    Reduce query-to-token logits [Q,L] into one phrase logit per query [Q].
-
-    ``mean`` averages token probabilities. ``geometric_mean`` requires all
-    phrase tokens to be confident and is therefore stricter.
-    """
-    logits = torch.as_tensor(token_alignment_logits)
-    if logits.ndim != 2:
-        raise ValueError(
-            "token_alignment_logits must have shape [Q,L], got "
-            f"{tuple(logits.shape)}"
-        )
-
-    mask = torch.as_tensor(
-        phrase_token_mask,
-        device=logits.device,
-        dtype=torch.bool,
-    ).reshape(-1)
-    if mask.numel() != logits.shape[-1]:
-        raise ValueError(
-            "phrase token mask length mismatch: "
-            f"{mask.numel()} != {logits.shape[-1]}"
-        )
-    if not bool(mask.any()):
-        raise ValueError("phrase_token_mask contains no positive token")
-
-    probability = logits.float().sigmoid()[:, mask]
-    reduction = str(reduction).strip().lower()
-    if reduction in {"mean", "arithmetic_mean", "avg", "average"}:
-        pooled_probability = probability.mean(dim=-1)
-    elif reduction in {"geometric", "geometric_mean", "gmean"}:
-        pooled_probability = torch.exp(
-            torch.log(probability.clamp_min(eps)).mean(dim=-1)
-        )
-    elif reduction == "min":
-        pooled_probability = probability.min(dim=-1).values
-    else:
-        raise ValueError(
-            "reduction must be mean, geometric_mean, or min, got "
-            f"{reduction!r}"
-        )
-
-    pooled_probability = pooled_probability.clamp(
-        min=float(eps),
-        max=1.0 - float(eps),
-    )
-    return torch.logit(pooled_probability)
-
-
 def fuse_quality_and_phrase_logits(
     quality_logit: torch.Tensor,
     phrase_alignment_logit: torch.Tensor,
@@ -590,7 +534,7 @@ def fuse_quality_and_phrase_logits(
 def score_queries_for_char_spans(
     *,
     quality_logit: torch.Tensor,
-    token_alignment_logits: torch.Tensor,
+    phrase_matching: Mapping[str, Any],
     token_offsets: torch.Tensor,
     char_spans: Sequence[Sequence[int]],
     valid_token_mask: Optional[torch.Tensor] = None,
@@ -605,11 +549,9 @@ def score_queries_for_char_spans(
         valid_token_mask,
         strict=strict,
     )
-    phrase_alignment_logit = pool_phrase_alignment_logits(
-        token_alignment_logits,
-        phrase_token_mask,
-        reduction=token_reduction,
-    )
+    phrase_logits, similarities = phrase_matrices(
+        phrase_matching, token_offsets[None], phrase_token_mask[None], [[char_spans]])
+    phrase_alignment_logit = phrase_logits[0][:,0]
     final_logit = fuse_quality_and_phrase_logits(
         quality_logit,
         phrase_alignment_logit,
@@ -621,6 +563,7 @@ def score_queries_for_char_spans(
         quality = quality.squeeze(-1)
 
     return {
+        "phrase_similarity": similarities[0][:,0],
         "token_mask": phrase_token_mask,
         "quality_logit": quality,
         "quality_score": quality.sigmoid(),
@@ -636,7 +579,6 @@ __all__ = [
     "box_iou_xyxy",
     "char_spans_to_token_mask",
     "fuse_quality_and_phrase_logits",
-    "pool_phrase_alignment_logits",
     "score_queries_for_char_spans",
     "build_text_conditioning_probe",
     "compact_grounding_collate_fn",

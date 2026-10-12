@@ -1,0 +1,14 @@
+{
+  "created_utc": "2026-10-09T10:05:28.422743+00:00",
+  "model_config": "units/model/cards/config/model_resnet50.yaml",
+  "train_config": "units/model/cards/config/train_resnet50.yaml",
+  "initial_weights": "units/model/runs/train/lightdet_grounding_roi8_phrase_pair_100ep/best_hit_at_1.pt",
+  "image_initialization": "ResNet50 ImageNet1K V2, new FPN and image projector",
+  "weights_exclude_prefixes": [
+    "img_model."
+  ],
+  "localization_freeze_epochs": 0,
+  "baseline_run": "/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_grounding_roi8_hardneg_log_100ep",
+  "baseline_source_backup": "/home/soic/Desktop/.lightdet_backups/resnet50_20261009_100024",
+  "comparison_note": "Same task weights and loss; image initialization, ImageNet normalization, frozen BN statistics and localization freeze differ."
+}

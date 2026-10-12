@@ -1,0 +1,732 @@
+{
+  "train": {
+    "files": 10733,
+    "total_files": 10733,
+    "partial": false,
+    "counts": {
+      "objects": 54796,
+      "phrases": 69776,
+      "positive_pairs": 119824,
+      "negative_pairs": 347270,
+      "ignore_pairs": 82,
+      "phrases_with_positive": 69776,
+      "phrases_without_positive": 0,
+      "phrases_with_positive_and_negative": 63531,
+      "different_color_object_pairs": 516686,
+      "same_predicate_different_colors_object_contrasts": 307977,
+      "same_color_object_pairs": 60554,
+      "single_vs_contains_object_contrasts": 6542
+    },
+    "phrase_types": {
+      "single_color": 25943,
+      "contains_color": 35458,
+      "colors_exact": 8368,
+      "raw_query": 7
+    },
+    "images_by_contrast": {
+      "same_predicate_different_colors": 8087,
+      "single_vs_contains": 3438,
+      "same_color_objects": 3602
+    },
+    "examples": {
+      "same_predicate_different_colors": [
+        {
+          "filename": "1695792451082856.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "單色灰色的船",
+            "單色白色的船"
+          ],
+          "object_ids": [
+            "object_0000",
+            "object_0001",
+            "object_0002"
+          ]
+        },
+        {
+          "filename": "1695792451082856.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "單色灰色的船",
+            "單色藍色的船"
+          ],
+          "object_ids": [
+            "object_0000",
+            "object_0003"
+          ]
+        },
+        {
+          "filename": "1695792451082856.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "單色灰色的船",
+            "單色黃色的船"
+          ],
+          "object_ids": [
+            "object_0000",
+            "object_0004",
+            "object_0005"
+          ]
+        },
+        {
+          "filename": "1695792451082856.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "單色白色的船",
+            "單色藍色的船"
+          ],
+          "object_ids": [
+            "object_0001",
+            "object_0002",
+            "object_0003"
+          ]
+        },
+        {
+          "filename": "1695792451082856.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "單色白色的船",
+            "單色黃色的船"
+          ],
+          "object_ids": [
+            "object_0001",
+            "object_0002",
+            "object_0004",
+            "object_0005"
+          ]
+        },
+        {
+          "filename": "1695792451082856.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "單色藍色的船",
+            "單色黃色的船"
+          ],
+          "object_ids": [
+            "object_0003",
+            "object_0004",
+            "object_0005"
+          ]
+        },
+        {
+          "filename": "1695792451082856.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "含灰色的船",
+            "含白色的船"
+          ],
+          "object_ids": [
+            "object_0000",
+            "object_0001",
+            "object_0002"
+          ]
+        },
+        {
+          "filename": "1695792451082856.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "含灰色的船",
+            "含藍色的船"
+          ],
+          "object_ids": [
+            "object_0000",
+            "object_0003"
+          ]
+        },
+        {
+          "filename": "1695792451082856.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "含灰色的船",
+            "含黃色的船"
+          ],
+          "object_ids": [
+            "object_0000",
+            "object_0004",
+            "object_0005"
+          ]
+        },
+        {
+          "filename": "1695792451082856.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "含白色的船",
+            "含藍色的船"
+          ],
+          "object_ids": [
+            "object_0001",
+            "object_0002",
+            "object_0003"
+          ]
+        }
+      ],
+      "same_color_objects": [
+        {
+          "filename": "16957924894605358.jpg",
+          "kind": "same_color_objects",
+          "phrase": "黑色紅色相間的船",
+          "object_ids": [
+            "object_0000",
+            "object_0004"
+          ]
+        },
+        {
+          "filename": "16957924894605358.jpg",
+          "kind": "same_color_objects",
+          "phrase": "單色黑色的船",
+          "object_ids": [
+            "object_0004",
+            "object_0000"
+          ]
+        },
+        {
+          "filename": "16957924894605358.jpg",
+          "kind": "same_color_objects",
+          "phrase": "含紅色的船",
+          "object_ids": [
+            "object_0000",
+            "object_0004"
+          ]
+        },
+        {
+          "filename": "16957925912213001.jpg",
+          "kind": "same_color_objects",
+          "phrase": "藍色白色相間的船",
+          "object_ids": [
+            "object_0000",
+            "object_0001"
+          ]
+        },
+        {
+          "filename": "16957925912213001.jpg",
+          "kind": "same_color_objects",
+          "phrase": "單色藍色的船",
+          "object_ids": [
+            "object_0001",
+            "object_0000"
+          ]
+        },
+        {
+          "filename": "16957925912213001.jpg",
+          "kind": "same_color_objects",
+          "phrase": "含白色的船",
+          "object_ids": [
+            "object_0000",
+            "object_0001"
+          ]
+        },
+        {
+          "filename": "16957927103131218.jpg",
+          "kind": "same_color_objects",
+          "phrase": "橙色黑色相間的船",
+          "object_ids": [
+            "object_0001",
+            "object_0002"
+          ]
+        },
+        {
+          "filename": "16957927103131218.jpg",
+          "kind": "same_color_objects",
+          "phrase": "黑色紅色相間的船",
+          "object_ids": [
+            "object_0002",
+            "object_0001"
+          ]
+        },
+        {
+          "filename": "16957927103131218.jpg",
+          "kind": "same_color_objects",
+          "phrase": "含橘色的船",
+          "object_ids": [
+            "object_0001",
+            "object_0002"
+          ]
+        },
+        {
+          "filename": "16957927103131218.jpg",
+          "kind": "same_color_objects",
+          "phrase": "含紅色的船",
+          "object_ids": [
+            "object_0002",
+            "object_0001"
+          ]
+        }
+      ],
+      "single_vs_contains": [
+        {
+          "filename": "16957924894605358.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色黑色的船",
+            "含黑色的船"
+          ],
+          "object_ids": [
+            "object_0000"
+          ]
+        },
+        {
+          "filename": "16957925912213001.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色藍色的船",
+            "含藍色的船"
+          ],
+          "object_ids": [
+            "object_0000"
+          ]
+        },
+        {
+          "filename": "16957927134130414.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色黑色的船",
+            "含黑色的船"
+          ],
+          "object_ids": [
+            "object_0001"
+          ]
+        },
+        {
+          "filename": "16957927165206938.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色白色的船",
+            "含白色的船"
+          ],
+          "object_ids": [
+            "object_0001"
+          ]
+        },
+        {
+          "filename": "16957927180817223.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色白色的船",
+            "含白色的船"
+          ],
+          "object_ids": [
+            "object_0000"
+          ]
+        },
+        {
+          "filename": "16957927219628947.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色白色的船",
+            "含白色的船"
+          ],
+          "object_ids": [
+            "object_0000"
+          ]
+        },
+        {
+          "filename": "16957927523200004.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色白色的船",
+            "含白色的船"
+          ],
+          "object_ids": [
+            "object_0000"
+          ]
+        },
+        {
+          "filename": "16957929180425532.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色白色的船",
+            "含白色的船"
+          ],
+          "object_ids": [
+            "object_0000"
+          ]
+        },
+        {
+          "filename": "16957930022588327.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色黑色的船",
+            "含黑色的船"
+          ],
+          "object_ids": [
+            "object_0001"
+          ]
+        },
+        {
+          "filename": "1695793024061015.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色灰色的船",
+            "含灰色的船"
+          ],
+          "object_ids": [
+            "object_0000"
+          ]
+        }
+      ]
+    }
+  },
+  "val": {
+    "files": 2683,
+    "total_files": 2683,
+    "partial": false,
+    "counts": {
+      "objects": 13574,
+      "phrases": 17395,
+      "positive_pairs": 29689,
+      "negative_pairs": 85466,
+      "ignore_pairs": 0,
+      "phrases_with_positive": 17395,
+      "phrases_without_positive": 0,
+      "phrases_with_positive_and_negative": 15872,
+      "different_color_object_pairs": 127357,
+      "same_predicate_different_colors_object_contrasts": 75913,
+      "same_color_object_pairs": 14746,
+      "single_vs_contains_object_contrasts": 1615
+    },
+    "phrase_types": {
+      "single_color": 6455,
+      "contains_color": 8847,
+      "colors_exact": 2093
+    },
+    "images_by_contrast": {
+      "same_predicate_different_colors": 2032,
+      "single_vs_contains": 843,
+      "same_color_objects": 890
+    },
+    "examples": {
+      "same_predicate_different_colors": [
+        {
+          "filename": "169579252186097.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "單色灰色的船",
+            "單色白色的船"
+          ],
+          "object_ids": [
+            "object_0000",
+            "object_0001",
+            "object_0002",
+            "object_0003"
+          ]
+        },
+        {
+          "filename": "169579252186097.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "含灰色的船",
+            "含白色的船"
+          ],
+          "object_ids": [
+            "object_0000",
+            "object_0001",
+            "object_0002",
+            "object_0003"
+          ]
+        },
+        {
+          "filename": "1695792590452578.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "單色白色的船",
+            "單色藍色的船"
+          ],
+          "object_ids": [
+            "object_0001",
+            "object_0002"
+          ]
+        },
+        {
+          "filename": "1695792590452578.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "含白色的船",
+            "含紅色的船"
+          ],
+          "object_ids": [
+            "object_0000",
+            "object_0001"
+          ]
+        },
+        {
+          "filename": "1695792590452578.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "含白色的船",
+            "含藍色的船"
+          ],
+          "object_ids": [
+            "object_0001",
+            "object_0002"
+          ]
+        },
+        {
+          "filename": "1695792590452578.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "含白色的船",
+            "含黑色的船"
+          ],
+          "object_ids": [
+            "object_0000",
+            "object_0001"
+          ]
+        },
+        {
+          "filename": "1695792590452578.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "含紅色的船",
+            "含藍色的船"
+          ],
+          "object_ids": [
+            "object_0000",
+            "object_0002"
+          ]
+        },
+        {
+          "filename": "1695792590452578.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "含藍色的船",
+            "含黑色的船"
+          ],
+          "object_ids": [
+            "object_0000",
+            "object_0002"
+          ]
+        },
+        {
+          "filename": "16957926134172726.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "藍色白色相間的船",
+            "黑色紅色相間的船"
+          ],
+          "object_ids": [
+            "object_0000",
+            "object_0001"
+          ]
+        },
+        {
+          "filename": "16957926134172726.jpg",
+          "kind": "same_predicate_different_colors",
+          "phrases": [
+            "單色灰色的船",
+            "單色藍色的船"
+          ],
+          "object_ids": [
+            "object_0002",
+            "object_0003"
+          ]
+        }
+      ],
+      "same_color_objects": [
+        {
+          "filename": "16957926134172726.jpg",
+          "kind": "same_color_objects",
+          "phrase": "藍色白色相間的船",
+          "object_ids": [
+            "object_0000",
+            "object_0003"
+          ]
+        },
+        {
+          "filename": "16957926134172726.jpg",
+          "kind": "same_color_objects",
+          "phrase": "單色藍色的船",
+          "object_ids": [
+            "object_0003",
+            "object_0000"
+          ]
+        },
+        {
+          "filename": "16957926134172726.jpg",
+          "kind": "same_color_objects",
+          "phrase": "含白色的船",
+          "object_ids": [
+            "object_0000",
+            "object_0003"
+          ]
+        },
+        {
+          "filename": "16957927110914488.jpg",
+          "kind": "same_color_objects",
+          "phrase": "黑色橙色白色相間的船",
+          "object_ids": [
+            "object_0000",
+            "object_0002"
+          ]
+        },
+        {
+          "filename": "16957927110914488.jpg",
+          "kind": "same_color_objects",
+          "phrase": "黑色紅色相間的船",
+          "object_ids": [
+            "object_0002",
+            "object_0000"
+          ]
+        },
+        {
+          "filename": "16957927110914488.jpg",
+          "kind": "same_color_objects",
+          "phrase": "單色紅色的船",
+          "object_ids": [
+            "object_0003",
+            "object_0002"
+          ]
+        },
+        {
+          "filename": "16957927110914488.jpg",
+          "kind": "same_color_objects",
+          "phrase": "含橘色的船",
+          "object_ids": [
+            "object_0000",
+            "object_0002"
+          ]
+        },
+        {
+          "filename": "16957927110914488.jpg",
+          "kind": "same_color_objects",
+          "phrase": "含白色的船",
+          "object_ids": [
+            "object_0000",
+            "object_0002"
+          ]
+        },
+        {
+          "filename": "16957927110914488.jpg",
+          "kind": "same_color_objects",
+          "phrase": "含紅色的船",
+          "object_ids": [
+            "object_0002",
+            "object_0000"
+          ]
+        },
+        {
+          "filename": "16957927110914488.jpg",
+          "kind": "same_color_objects",
+          "phrase": "含黑色的船",
+          "object_ids": [
+            "object_0002",
+            "object_0003"
+          ]
+        }
+      ],
+      "single_vs_contains": [
+        {
+          "filename": "16957926134172726.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色藍色的船",
+            "含藍色的船"
+          ],
+          "object_ids": [
+            "object_0000"
+          ]
+        },
+        {
+          "filename": "16957927110914488.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色紅色的船",
+            "含紅色的船"
+          ],
+          "object_ids": [
+            "object_0002"
+          ]
+        },
+        {
+          "filename": "16957927149694746.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色白色的船",
+            "含白色的船"
+          ],
+          "object_ids": [
+            "object_0000"
+          ]
+        },
+        {
+          "filename": "16957927484177783.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色白色的船",
+            "含白色的船"
+          ],
+          "object_ids": [
+            "object_0000"
+          ]
+        },
+        {
+          "filename": "16957930007132468.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色黑色的船",
+            "含黑色的船"
+          ],
+          "object_ids": [
+            "object_0001"
+          ]
+        },
+        {
+          "filename": "16957931320612624.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色白色的船",
+            "含白色的船"
+          ],
+          "object_ids": [
+            "object_0000",
+            "object_0001"
+          ]
+        },
+        {
+          "filename": "16957931320612624.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色黑色的船",
+            "含黑色的船"
+          ],
+          "object_ids": [
+            "object_0003"
+          ]
+        },
+        {
+          "filename": "16957931564262269.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色紅色的船",
+            "含紅色的船"
+          ],
+          "object_ids": [
+            "object_0000",
+            "object_0001"
+          ]
+        },
+        {
+          "filename": "1695793511044075.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色黑色的船",
+            "含黑色的船"
+          ],
+          "object_ids": [
+            "object_0001"
+          ]
+        },
+        {
+          "filename": "16957935408005848.jpg",
+          "kind": "single_vs_contains",
+          "phrases": [
+            "單色紅色的船",
+            "含紅色的船"
+          ],
+          "object_ids": [
+            "object_0000"
+          ]
+        }
+      ]
+    }
+  }
+}

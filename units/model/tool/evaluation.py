@@ -9,6 +9,7 @@ from torch.amp import autocast
 from torchvision.ops import batched_nms
 
 from units.model.tool.grounding_metrics import GroundingMetrics
+from units.model.cards.phrase_matching import matching_for_image
 
 from units.model.tool.runtime import (
     forward_model_batch,
@@ -193,8 +194,8 @@ def build_phrase_evaluation_rows(
         outputs.get("main_quality_logit"),
     )
     token_logits = outputs.get(
-        "token_alignment_logits",
-        outputs.get("main_token_alignment_logits"),
+        "phrase_matching",
+        outputs.get("phrase_matching"),
     )
     token_offsets = outputs.get("token_offsets")
     alignment_text_mask = outputs.get(
@@ -205,9 +206,9 @@ def build_phrase_evaluation_rows(
         raise RuntimeError(
             "Model output does not contain quality_logit"
         )
-    if not torch.is_tensor(token_logits):
+    if not isinstance(token_logits, dict):
         raise RuntimeError(
-            "Model output does not contain token_alignment_logits"
+            "Model output does not contain phrase_matching"
         )
     if not torch.is_tensor(token_offsets):
         raise RuntimeError(
@@ -221,16 +222,16 @@ def build_phrase_evaluation_rows(
     batch_size = int(pred_bbox.shape[0])
     if quality_logit.shape[:2] != pred_bbox.shape[:2]:
         raise ValueError("quality/bbox shape mismatch")
-    if token_logits.shape[:2] != pred_bbox.shape[:2]:
+    if token_logits["visual"].shape[:2] != pred_bbox.shape[:2]:
         raise ValueError("token alignment/bbox shape mismatch")
     if token_offsets.shape[:2] != (
         batch_size,
-        token_logits.shape[-1],
+        token_logits["text"].shape[1],
     ):
         raise ValueError("token offset shape mismatch")
     if alignment_text_mask.shape != (
         batch_size,
-        token_logits.shape[-1],
+        token_logits["text"].shape[1],
     ):
         raise ValueError("alignment text mask shape mismatch")
 
@@ -297,13 +298,12 @@ def build_phrase_evaluation_rows(
                 gt_boxes = target_boxes[
                     target_indices
                 ]
+                phrase_tokens = matching_for_image(token_logits, image_index)
                 scores = score_queries_for_char_spans(
                     quality_logit=quality_logit[
                         image_index
                     ],
-                    token_alignment_logits=token_logits[
-                        image_index
-                    ],
+                    phrase_matching=phrase_tokens,
                     token_offsets=token_offsets[
                         image_index
                     ],
@@ -474,9 +474,9 @@ def validate_one_epoch(
                 outputs.get("main_quality_logit"),
             )
             token_logits = outputs.get(
-                "token_alignment_logits",
+                "phrase_matching",
                 outputs.get(
-                    "main_token_alignment_logits"
+                    "phrase_matching"
                 ),
             )
 
@@ -484,19 +484,20 @@ def validate_one_epoch(
                 raise RuntimeError(
                     "Model output does not contain quality_logit"
                 )
-            if not torch.is_tensor(token_logits):
+            if not isinstance(token_logits, dict):
                 raise RuntimeError(
                     "Model output does not contain "
-                    "token_alignment_logits"
+                    "phrase_matching"
                 )
 
             if compute_loss:
                 loss, loss_dict = criterion(
+                    ranking_visual_features=outputs.get("ranking_visual_features"),
+                    ranking_text_features=outputs.get("ranking_text_features"),
                     pred_bbox=pred_bbox,
                     pred_score_logit=quality_logit,
                     pred_quality_logit=quality_logit,
-                    pred_text_alignment_logit=token_logits,
-                    pred_token_alignment_logit=token_logits,
+                    pred_phrase_matching=token_logits,
                     positive_token_maps=None,
                     alignment_text_mask=outputs[
                         "alignment_text_mask"
@@ -529,7 +530,14 @@ def validate_one_epoch(
 
         if compute_loss:
             values = {
+                **{key: loss_dict.get(key, 0) for key in (
+                    "background_scale", "background_complete_images", "background_candidate_count",
+                    "background_pair_count", "background_rank_pair_count", "quality_background_query_count",
+                    "loss_quality_background", "loss_background_alignment", "loss_background_rank")},
                 "loss": loss,
+                **{key: loss_dict[key] for key in (
+                    "loss_ranking_order", "loss_ranking_contrast",
+                    "loss_ranking_order_contrib", "loss_ranking_contrast_contrib")},
                 "loss_bbox": loss_dict.get(
                     "loss_bbox",
                     pred_bbox.new_zeros(()),
@@ -685,7 +693,14 @@ def validate_one_epoch(
             )
 
         val_loss_metrics = {
+            **{"val_" + key: average(key) for key in (
+                "background_scale", "background_complete_images", "background_candidate_count",
+                "background_pair_count", "background_rank_pair_count", "quality_background_query_count",
+                "loss_quality_background", "loss_background_alignment", "loss_background_rank")},
             "val_loss": average("loss"),
+            **{"val_" + key: average(key) for key in (
+                "loss_ranking_order", "loss_ranking_contrast",
+                "loss_ranking_order_contrib", "loss_ranking_contrast_contrib")},
             "val_loss_bbox": average("loss_bbox"),
             "val_loss_giou": average("loss_giou"),
             "val_loss_score": average("loss_score"),
@@ -785,9 +800,7 @@ def validate_one_epoch(
             "eval_loop_time": float(
                 validation_loop_time
             ),
-            "phrase_token_reduction": str(
-                phrase_token_reduction
-            ),
+            "phrase_token_reduction": "learned_phrase_attention",
             "phrase_score_fusion": str(
                 phrase_score_fusion
             ),

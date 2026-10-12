@@ -41,3 +41,6 @@ units/model/resnet/
 .vscode/
 .idea/
 .relation_update_backup/
+
+# Compressed generated reports
+*.gz

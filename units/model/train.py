@@ -6,6 +6,7 @@ from collections import defaultdict
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import argparse
 import copy
 import csv
 import inspect
@@ -40,6 +41,7 @@ from units.model.pipeline.data import (
     build_dataloaders,
 )
 from units.model.cards.loss import GroundingLoss
+from units.model.cards.gt_roi import gt_roi_loss
 from units.model.cards.ranking_loss import (
     build_grounding_loss_from_config,
 )
@@ -460,15 +462,17 @@ def run_startup_smoke_test(
                 required = (
                     "bbox",
                     "quality_logit",
-                    "token_alignment_logits",
+                    "phrase_matching",
                     "token_offsets",
                     "alignment_text_mask",
                 )
                 missing = [
                     key
                     for key in required
-                    if not torch.is_tensor(
-                        outputs.get(key)
+                    if not (
+                        isinstance(outputs.get(key), dict)
+                        if key == "phrase_matching"
+                        else torch.is_tensor(outputs.get(key))
                     )
                 ]
                 if missing:
@@ -482,7 +486,7 @@ def run_startup_smoke_test(
                     "quality_logit"
                 ]
                 token_logits = outputs[
-                    "token_alignment_logits"
+                    "phrase_matching"
                 ]
                 token_offsets = outputs[
                     "token_offsets"
@@ -498,7 +502,7 @@ def run_startup_smoke_test(
                     "aux_quality_logit"
                 )
                 aux_token_logits = outputs.get(
-                    "aux_token_alignment_logits"
+                    "aux_phrase_matching"
                 )
 
                 if (
@@ -513,7 +517,7 @@ def run_startup_smoke_test(
 
                 batch_size = len(captions)
                 query_count = pred_bbox.shape[1]
-                token_count = token_logits.shape[-1]
+                token_count = token_logits["text"].shape[1]
 
                 expected_shapes = {
                     "bbox": (
@@ -529,7 +533,7 @@ def run_startup_smoke_test(
                     "token_logits": (
                         batch_size,
                         query_count,
-                        token_count,
+                        token_logits["visual"].shape[-1],
                     ),
                     "token_offsets": (
                         batch_size,
@@ -549,7 +553,7 @@ def run_startup_smoke_test(
                         quality_logit.shape
                     ),
                     "token_logits": tuple(
-                        token_logits.shape
+                        token_logits["visual"].shape
                     ),
                     "token_offsets": tuple(
                         token_offsets.shape
@@ -570,13 +574,12 @@ def run_startup_smoke_test(
                         )
 
                 loss, loss_dict = criterion(
+                    ranking_visual_features=outputs.get("ranking_visual_features"),
+                    ranking_text_features=outputs.get("ranking_text_features"),
                     pred_bbox=pred_bbox,
                     pred_score_logit=quality_logit,
                     pred_quality_logit=quality_logit,
-                    pred_text_alignment_logit=(
-                        token_logits
-                    ),
-                    pred_token_alignment_logit=(
+                    pred_phrase_matching=(
                         token_logits
                     ),
                     targets=targets,
@@ -592,10 +595,7 @@ def run_startup_smoke_test(
                     aux_pred_bbox=aux_pred_bbox,
                     aux_pred_score_logit=aux_quality,
                     aux_pred_quality_logit=aux_quality,
-                    aux_pred_text_alignment_logit=(
-                        aux_token_logits
-                    ),
-                    aux_pred_token_alignment_logit=(
+                    aux_pred_phrase_matching=(
                         aux_token_logits
                     ),
                     pos_weight=float(
@@ -617,6 +617,11 @@ def run_startup_smoke_test(
         }
 
         for name, tensor in finite_tensors.items():
+            if isinstance(tensor, dict):
+                for key in ('visual', 'text', 'token_weights', 'scale', 'bias'):
+                    if not torch.isfinite(tensor[key]).all().item():
+                        raise FloatingPointError(f"Startup {name}.{key} contains NaN/Inf")
+                continue
             if not bool(
                 torch.isfinite(tensor).all().item()
             ):
@@ -645,7 +650,7 @@ def run_startup_smoke_test(
             f"captions={len(captions)}, "
             f"bbox={tuple(pred_bbox.shape)}, "
             f"quality={tuple(quality_logit.shape)}, "
-            f"tokens={tuple(token_logits.shape)}, "
+            f"semantic_queries={tuple(token_logits['visual'].shape)}, "
             f"negative_phrases="
             f"{int(batch.get('odvg_negative_phrase_count', 0))}, "
             f"loss={loss.item():.6f}, "
@@ -770,6 +775,10 @@ class ModelEMA:
 
 
 def _parameter_group_name(name: str) -> str:
+    if name.startswith("score_transformer.") or name.startswith("bbox_query_encoder."):
+        return "head"
+    if "bbox_head" in name or "object_queries" in name or "image_position_embeddings" in name:
+        return "transformer"
     if "text_model.model" in name or "text_model.proj" in name:
         return "text"
     if "bottle_net" in name or "img_model" in name:
@@ -1206,6 +1215,20 @@ def train_one_epoch(
         "loss_score",
         "loss_rank",
         "loss_rank_raw",
+        "gt_roi_scale",
+        "gt_roi_objects",
+        "loss_gt_roi_alignment",
+        "loss_gt_roi_order",
+        "loss_gt_roi_contrast",
+        "loss_gt_roi_contrib",
+        "loss_ranking_order",
+        "loss_ranking_contrast",
+        "loss_ranking_order_contrib",
+        "loss_ranking_contrast_contrib",
+        "ranking_negative_candidates",
+        "ranking_hard_negative_candidates",
+        "ranking_selected_negatives",
+        "ranking_selected_hard_negatives",
         "loss_text_alignment",
         "loss_text_alignment_contrib",
         "loss_text_alignment_rank",
@@ -1213,6 +1236,15 @@ def train_one_epoch(
         "text_alignment_extra_query_count",
         "text_alignment_background_query_count",
         "text_alignment_margin",
+        "background_scale",
+        "background_complete_images",
+        "background_candidate_count",
+        "background_pair_count",
+        "background_rank_pair_count",
+        "quality_background_query_count",
+        "loss_quality_background",
+        "loss_background_alignment",
+        "loss_background_rank",
     )
     totals = {
         name: torch.zeros(
@@ -1312,7 +1344,7 @@ def train_one_epoch(
                 "quality_logit"
             ]
             token_logits = outputs[
-                "token_alignment_logits"
+                "phrase_matching"
             ]
             token_offsets = outputs[
                 "token_offsets"
@@ -1328,7 +1360,7 @@ def train_one_epoch(
                 "aux_quality_logit"
             )
             aux_token_logits = outputs.get(
-                "aux_token_alignment_logits"
+                "aux_phrase_matching"
             )
 
             if (
@@ -1339,17 +1371,16 @@ def train_one_epoch(
                 raise RuntimeError(
                     "ODVG hybrid training requires "
                     "aux_bbox, aux_quality_logit and "
-                    "aux_token_alignment_logits"
+                    "aux_phrase_matching"
                 )
 
             loss, loss_dict = criterion(
+                ranking_visual_features=outputs.get("ranking_visual_features"),
+                ranking_text_features=outputs.get("ranking_text_features"),
                 pred_bbox=pred_bbox,
                 pred_score_logit=quality_logit,
                 pred_quality_logit=quality_logit,
-                pred_text_alignment_logit=(
-                    token_logits
-                ),
-                pred_token_alignment_logit=(
+                pred_phrase_matching=(
                     token_logits
                 ),
                 targets=targets,
@@ -1386,13 +1417,17 @@ def train_one_epoch(
                 aux_pred_bbox=aux_pred_bbox,
                 aux_pred_score_logit=aux_quality,
                 aux_pred_quality_logit=aux_quality,
-                aux_pred_text_alignment_logit=(
-                    aux_token_logits
-                ),
-                aux_pred_token_alignment_logit=(
+                aux_pred_phrase_matching=(
                     aux_token_logits
                 ),
             )
+
+            gt_loss, gt_metrics = gt_roi_loss(
+                unwrap_model(model), outputs, targets, criterion, epoch, criterion.gt_roi_config)
+            loss = loss + gt_loss
+            loss_dict.update(gt_metrics)
+            loss_dict["loss"] = loss.detach()
+            loss_dict["loss_main_total"] = loss_dict["loss_main_total"] + gt_loss.detach()
 
         if not torch.isfinite(loss):
             raise FloatingPointError(
@@ -1595,6 +1630,16 @@ def train_one_epoch(
         "loss_rank_raw": (
             "train_loss_rank_raw"
         ),
+        "loss_ranking_order": "train_loss_ranking_order",
+        **{key: "train_" + key for key in (
+            "gt_roi_scale", "gt_roi_objects", "loss_gt_roi_alignment",
+            "loss_gt_roi_order", "loss_gt_roi_contrast", "loss_gt_roi_contrib")},
+        "loss_ranking_contrast": "train_loss_ranking_contrast",
+        "loss_ranking_order_contrib": "train_loss_ranking_order_contrib",
+        "loss_ranking_contrast_contrib": "train_loss_ranking_contrast_contrib",
+        **{key: "train_" + key for key in (
+            "ranking_negative_candidates", "ranking_hard_negative_candidates",
+            "ranking_selected_negatives", "ranking_selected_hard_negatives")},
         "loss_text_alignment": (
             "train_loss_text_alignment"
         ),
@@ -1610,6 +1655,15 @@ def train_one_epoch(
         "text_alignment_extra_query_count": "train_text_alignment_extra_query_count",
         "text_alignment_background_query_count": "train_text_alignment_background_query_count",
         "text_alignment_margin": "train_text_alignment_margin",
+        "background_scale": "train_background_scale",
+        "background_complete_images": "train_background_complete_images",
+        "background_candidate_count": "train_background_candidate_count",
+        "background_pair_count": "train_background_pair_count",
+        "background_rank_pair_count": "train_background_rank_pair_count",
+        "quality_background_query_count": "train_quality_background_query_count",
+        "loss_quality_background": "train_loss_quality_background",
+        "loss_background_alignment": "train_loss_background_alignment",
+        "loss_background_rank": "train_loss_background_rank",
     }
 
     for source_name, output_name in (
@@ -1909,6 +1963,7 @@ def load_weights_only(
     ema: Optional[ModelEMA],
     device: torch.device,
     prefer_ema: bool = True,
+    exclude_prefixes: Sequence[str] = (),
 ) -> Dict[str, Any]:
     """
     Load only network weights.
@@ -1949,6 +2004,20 @@ def load_weights_only(
     )
 
     target_model = unwrap_model(model)
+    prefixes = tuple(exclude_prefixes)
+    if any(not isinstance(prefix, str) or not prefix or not prefix.endswith(".") for prefix in prefixes):
+        raise ValueError("Weight exclusion prefixes must be nonempty module paths ending in '.'")
+    retained_image_keys = 0
+    if prefixes:
+        current_state = target_model.state_dict()
+        for prefix in prefixes:
+            if not any(key.startswith(prefix) for key in current_state):
+                raise ValueError(f"Weight exclusion prefix matches no model parameters: {prefix}")
+        kept_state = {key: value for key, value in state_dict.items() if not key.startswith(prefixes)}
+        fresh_state = {key: value for key, value in current_state.items() if key.startswith(prefixes)}
+        retained_image_keys = len(fresh_state)
+        state_dict = {**kept_state, **fresh_state}
+    initialized_keys = [key for key in target_model.state_dict() if key not in state_dict]
     load_result = target_model.load_state_dict(
         state_dict,
         strict=True,
@@ -1982,6 +2051,11 @@ def load_weights_only(
     print(f"  prefer EMA   : {bool(prefer_ema)}")
     print(f"  missing keys : {len(load_result.missing_keys)}")
     print(f"  unexpected   : {len(load_result.unexpected_keys)}")
+    if prefixes:
+        print(f"  exclude      : {', '.join(prefixes)}")
+        print(f"  image branch : preserved newly constructed weights ({retained_image_keys} entries)")
+    if initialized_keys:
+        print(f"  initialized  : {', '.join(initialized_keys)}")
     print("  optimizer    : reset")
     print("  scheduler    : reset")
     print("  scaler       : reset")
@@ -1992,6 +2066,8 @@ def load_weights_only(
         "source": source_name,
         "source_epoch": checkpoint_epoch,
         "source_best_metric": checkpoint_best_metric,
+        "excluded_prefixes": list(prefixes),
+        "preserved_image_entries": retained_image_keys,
     }
 
 
@@ -2653,6 +2729,7 @@ def train(args: SimpleNamespace) -> None:
             prefer_ema=bool(
                 getattr(args, "prefer_ema", True)
             ),
+            exclude_prefixes=getattr(args, "weights_exclude_prefixes", ()),
         )
 
     # Build once from the complete YAML so every DETR-native parameter is
@@ -2660,6 +2737,9 @@ def train(args: SimpleNamespace) -> None:
     criterion = build_grounding_loss_from_config(
         args.train_cfg
     ).to(device)
+    records = train_loader.dataset.records
+    criterion.gt_roi_config = args.train_cfg["loss"].get("gt_roi", {})
+    print(f"[Background] Enabled for all {len(records)} training images")
 
     expected_classification = str(args.classification_type).strip().lower()
     if criterion.classification_type != expected_classification:
@@ -2674,11 +2754,6 @@ def train(args: SimpleNamespace) -> None:
             "GroundingLoss matcher score-cost mismatch: "
             f"requested={args.cost_score}, "
             f"effective={criterion.main_matcher.cost_score}"
-        )
-    if float(criterion.main_matcher.cost_score) <= 0.0:
-        raise ValueError(
-            "loss.matcher.cost_score must be > 0 for text-aware DETR "
-            "matching. Use the official-style value 2.0."
         )
 
     if bool(criterion.negative_text_as_empty_target) != bool(
@@ -2922,57 +2997,15 @@ def train(args: SimpleNamespace) -> None:
         f"aux=one-to-many, aux_weight={args.aux_loss_weight:.3f}, "
         f"aux_eval={args.auxiliary_in_eval}"
     )
+    print(f"[Info] Hungarian matcher: bbox={args.cost_bbox}, giou={args.cost_giou}, score={args.cost_score}")
+    print("[Info] Quality Head: ROI visual features, max-IoU target; unknown background ignored")
+    print(f"[Info] Background supervision: {criterion.background_policy}; all annotated images")
     print(
-        f"[Info] DETR classification: type={args.classification_type}, "
-        f"ia_alpha={args.ia_bce_alpha:.3f}, "
-        f"focal_alpha={args.classification_focal_alpha:.3f}, "
-        f"focal_gamma={args.classification_focal_gamma:.3f}, "
-        f"normalize_by_num_gt={args.normalize_classification_by_num_gt}"
-    )
-    print(
-        f"[Info] Hungarian matcher: score:bbox:giou="
-        f"{args.cost_score:.2f}:{args.cost_bbox:.2f}:{args.cost_giou:.2f}, "
-        f"score_cost={args.matcher_score_cost_type}"
-    )
-    print(
-        f"[Info] Matcher score schedule: start_epoch="
-        f"{args.rank_start_epoch}, warmup_epochs={args.rank_warmup_epoch}, "
-        f"alpha_min={args.rank_alpha_min:.4f}"
-    )
-    print(
-        "[Info] Text negative: "
-        f"as_empty_target={args.negative_text_as_empty_target}, "
-        f"lambda={args.lambda_text_negative:.4f}, "
-        f"topk={args.text_negative_topk}, "
-        f"hard_mix={args.text_negative_hard_mix:.3f}"
-    )
-    print(
-        "[Info] Duplicate suppression: "
-        f"enabled={args.duplicate_suppression_enabled}, "
-        f"ignore_iou={args.score_negative_iou_ignore_thr:.3f}, "
-        f"weight={args.duplicate_loss_weight:.4f}, "
-        f"margin={args.duplicate_margin:.3f}, "
-        f"background_weight={args.duplicate_background_weight:.4f}, "
-        f"classification_weight="
-        f"{args.duplicate_classification_weight:.4f}, "
-        f"max_pairs={args.duplicate_max_pairs}, "
-        f"start_epoch={args.duplicate_start_epoch}"
-    )
-    print(
-        "[Info] Hard-negative mining: "
-        f"enabled={args.hard_negative_mining_enabled}, "
-        f"weight={args.hard_negative_loss_weight:.4f}, "
-        f"topk={args.hard_negative_topk}, "
-        f"max_iou={args.hard_negative_max_iou:.3f}, "
-        f"ratio={args.hard_negative_ratio}, "
-        f"start_epoch={args.hard_negative_start_epoch}"
-    )
-    print(
-        "[Info] Pairwise ranking: "
-        f"enabled={args.ranking_enabled}, "
-        f"lambda={args.lambda_rank:.4f}, "
-        f"start={criterion.rank_start_epoch}, "
-        f"warmup={criterion.rank_warmup_epoch}"
+        f"[Info] Alignment Head: weight={criterion.text_alignment_loss_weight}, "
+        f"ranking={criterion.text_alignment_ranking_weight}, "
+        f"ranking_contrast={criterion.ranking_contrast_weight}, "
+        f"contrast_temperature={criterion.ranking_contrast_temperature}, "
+        f"margin={criterion.text_alignment_ranking_margin}, top_k_negatives=5, quality_detached=True"
     )
 
     if args.resume_path is not None:
@@ -3042,8 +3075,23 @@ def train(args: SimpleNamespace) -> None:
         "weights_info": weights_info,
     })
 
+    localization_parameters = [
+        parameter for name, parameter in unwrap_model(model).named_parameters()
+        if parameter.requires_grad and (
+            name.startswith(("img_model.", "transformer.", "main_object_queries.",
+                             "aux_object_queries.", "image_position_embeddings", "text_model.proj."))
+            or "bbox_head" in name
+        )
+    ]
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.perf_counter()
+        source = unwrap_model(model)
+        freeze_location = epoch <= args.localization_freeze_epochs
+        for parameter in localization_parameters:
+            parameter.requires_grad_(not freeze_location)
+        source.freeze_localization = freeze_location
+        if epoch in (start_epoch, args.localization_freeze_epochs + 1):
+            print(f"[Schedule] Localization Transformer frozen={freeze_location}")
 
         loss_forward_kwargs = resolve_loss_forward_kwargs(
             args=args,
@@ -3255,6 +3303,10 @@ def train(args: SimpleNamespace) -> None:
             ),
         }
         default_val_loss_metrics = {
+            **{"val_" + key: None for key in (
+                "background_scale", "background_complete_images", "background_candidate_count",
+                "background_pair_count", "background_rank_pair_count", "quality_background_query_count",
+                "loss_quality_background", "loss_background_alignment", "loss_background_rank")},
             "val_loss": None,
             "val_loss_bbox": None,
             "val_loss_giou": None,
@@ -3264,6 +3316,10 @@ def train(args: SimpleNamespace) -> None:
             "val_loss_text_alignment_rank": None,
             "val_loss_text_alignment_rank_contrib": None,
             "val_loss_rank_raw": None,
+            "val_loss_ranking_order": None,
+            "val_loss_ranking_contrast": None,
+            "val_loss_ranking_order_contrib": None,
+            "val_loss_ranking_contrast_contrib": None,
             "val_loss_rank": None,
             "val_loss_text_negative": None,
             "val_loss_text_negative_contrib": None,
@@ -3273,6 +3329,8 @@ def train(args: SimpleNamespace) -> None:
             "val_hard_negative_mining_enabled": None,
             "val_matcher_score_alpha": None,
             "val_matcher_cost_score_effective": None,
+            "val_matcher_alignment_alpha": None,
+            "val_matcher_cost_alignment_effective": None,
         }
 
         epoch_time = time.perf_counter() - epoch_start
@@ -3711,7 +3769,11 @@ def main(model_cfg:str, train_cfg:str) -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train LightDet from YAML configs")
+    parser.add_argument("--model-config", default="/PATH/TO/model.yaml")
+    parser.add_argument("--train-config", default="/PATH/TO/train.yaml")
+    options = parser.parse_args()
     main(
-        model_cfg="/PATH/TO/model.yaml",
-        train_cfg="/PATH/TO/train.yaml",
+        model_cfg=options.model_config,
+        train_cfg=options.train_config,
     )

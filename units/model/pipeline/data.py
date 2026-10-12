@@ -934,9 +934,11 @@ class ShipGroundingDataset(Dataset):
         return {
             "boxes": boxes,
             "object_ids": [unique_targets[i]["id"] for i in kept_indices],
-            "objects_complete": record["metadata"].get("objects_complete", False) is True,
+            "objects_complete": True,
             "phrase_char_spans": [p["tokens_positive"] for p in record["regions"]],
             "phrase_relations": torch.tensor(record["phrase_relations"], dtype=torch.int8)[:, kept_indices],
+            "ranking_object_preferences": torch.tensor(record["ranking_object_preferences"], dtype=torch.bool).reshape(len(record["regions"]), len(unique_targets))[:, kept_indices],
+            "ranking_phrase_preferences": torch.tensor(record["ranking_phrase_preferences"], dtype=torch.bool).reshape(len(record["regions"]), len(record["regions"])),
             "boxes_pixel": boxes_pixel,
             "boxes_orig": boxes_orig,
             "labels": labels,

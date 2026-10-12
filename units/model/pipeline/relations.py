@@ -60,8 +60,18 @@ def rebuild_targets(record):
         mapping.append(indices)
     if any(not t["positive_char_spans"] for t in targets):
         raise ValueError("Every localization object must retain a positive description")
+    phrase_colors = []
+    for phrase in phrases:
+        kind, _, colors = phrase["semantic_key"].partition(":")
+        phrase_colors.append(set(colors.split("|")) if colors and kind in
+                             ("single_color", "contains_color", "colors_exact") else set())
+    object_colors = [set(o.get("attributes", {}).get("colors", [])) for o in objects]
     record.update(unique_targets=targets, region_to_target_indices=mapping,
-                  phrase_relations=relations)
+                  phrase_relations=relations,
+                  ranking_object_preferences=[[bool(colors & other) for other in object_colors]
+                                              for colors in phrase_colors],
+                  ranking_phrase_preferences=[[bool(colors & other) for other in phrase_colors]
+                                              for colors in phrase_colors])
     return record
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import math
+from units.model.cards.phrase_matching import PhraseMatchingHead
 from typing import Any, Dict, Optional, Sequence, Mapping
 import yaml
 
@@ -23,7 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import ResNet50_Weights, resnet50
 from torchvision.models.feature_extraction import create_feature_extractor
-from torchvision.ops import FeaturePyramidNetwork
+from torchvision.ops import FeaturePyramidNetwork, MultiScaleRoIAlign
 from transformers import BertModel, BertTokenizerFast
 from transformers.utils import logging as transformers_logging
 from huggingface_hub import logging as hub_logging
@@ -487,6 +488,132 @@ class TransformerBlock(nn.Module):
         main_out = grouped_out[:batch_size]
         aux_out = grouped_out[batch_size:]
 
+        return main_out, aux_out
+
+
+class TextAlignmentTransformerLayer(nn.Module):
+    """Refine each bbox-conditioned query using only its own FPN ROI tokens; text enters the later phrase-pair head."""
+
+    def __init__(self, hidden_dim, num_heads, mlp_ratio, dropout):
+        super().__init__()
+        self.roi_norm = nn.LayerNorm(hidden_dim)
+        self.roi_attention = nn.MultiheadAttention(
+            hidden_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.ffn_norm = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, int(hidden_dim * mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(hidden_dim * mlp_ratio), hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, queries, roi_tokens):
+        batch_size, query_count, hidden_dim = queries.shape
+        roi_query = self.roi_norm(queries).reshape(batch_size * query_count, 1, hidden_dim)
+        roi_context = roi_tokens.reshape(batch_size * query_count, roi_tokens.shape[2], hidden_dim)
+        roi_update = self.roi_attention(
+            roi_query, roi_context, roi_context, need_weights=False
+        )[0]
+        queries = queries + roi_update.reshape(batch_size, query_count, hidden_dim)
+        return queries + self.ffn(self.ffn_norm(queries))
+
+
+class TextAlignmentTransformer(nn.Module):
+    """Text-Alignment Transformer: refine ROI-pooled features plus bbox embeddings using local FPN ROI attention; description matching follows in the head."""
+
+    MAIN_GROUP = 0
+    AUX_GROUP = 1
+
+    def __init__(self, hidden_dim, fpn_channels, level_names, roi_size,
+                 num_heads, num_layers, mlp_ratio, dropout, query_group_init_std):
+        super().__init__()
+        self.roi_size = int(roi_size)
+        self.roi_align = MultiScaleRoIAlign(
+            featmap_names=list(level_names),
+            output_size=self.roi_size,
+            sampling_ratio=2,
+        )
+        self.roi_projection = nn.Linear(fpn_channels, hidden_dim)
+        self.quality_projection = nn.Sequential(
+            nn.LayerNorm(fpn_channels),
+            nn.Linear(fpn_channels, hidden_dim),
+            nn.GELU(),
+        )
+        self.roi_position_embeddings = nn.Parameter(
+            torch.zeros(1, 1, self.roi_size * self.roi_size, hidden_dim)
+        )
+        nn.init.normal_(self.roi_position_embeddings, mean=0.0, std=0.02)
+        self.query_group_embeddings = nn.Parameter(torch.zeros(2, 1, hidden_dim))
+        if float(query_group_init_std) > 0.0:
+            nn.init.normal_(
+                self.query_group_embeddings.data[self.AUX_GROUP],
+                mean=0.0,
+                std=float(query_group_init_std),
+            )
+        self.layers = nn.ModuleList([
+            TextAlignmentTransformerLayer(hidden_dim, num_heads, mlp_ratio, dropout)
+            for _ in range(num_layers)
+        ])
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def _roi_tokens(self, fpn_features, boxes, image_size, quality_only=False, return_quality=False):
+        batch_size, query_count = boxes.shape[:2]
+        height, width = int(image_size[0]), int(image_size[1])
+        scale = boxes.new_tensor([width, height, width, height])
+        pixel_boxes = [
+            item.float().clamp(0.0, 1.0) * scale.float()
+            for item in boxes
+        ]
+        feature_dtype = next(iter(fpn_features.values())).dtype
+        with torch.autocast(device_type=boxes.device.type, enabled=False):
+            roi = self.roi_align(
+                {name: getattr(feature, '_roi_fp32', feature).float()
+                 for name, feature in fpn_features.items()},
+                pixel_boxes,
+                [(height, width)] * batch_size,
+            )
+        if quality_only:
+            return self.quality_projection(roi.mean(dim=(-2, -1))).reshape(batch_size, query_count, -1)
+        quality = (self.quality_projection(roi.mean(dim=(-2, -1))).reshape(batch_size, query_count, -1)
+                   if return_quality else None)
+        roi = roi.to(feature_dtype).flatten(2).transpose(1, 2)
+        roi = self.roi_projection(roi).reshape(
+            batch_size, query_count, self.roi_size * self.roi_size, -1
+        )
+        tokens = roi + self.roi_position_embeddings.to(roi)
+        return (tokens, quality) if return_quality else tokens
+
+    def _forward_group(self, fpn_features, queries, boxes, image_size,
+                       group_index, include_quality=False):
+        roi_result = self._roi_tokens(fpn_features, boxes, image_size, return_quality=include_quality)
+        roi_tokens, quality = roi_result if include_quality else (roi_result, None)
+        pooled = (roi_tokens - self.roi_position_embeddings.to(roi_tokens)).mean(dim=2)
+        queries = pooled + queries + self.query_group_embeddings[group_index].to(pooled)
+        for layer in self.layers:
+            queries = layer(queries, roi_tokens)
+        refined = self.norm(queries)
+        refined._roi_quality = quality
+        return refined, roi_tokens.mean(dim=2)
+
+    def forward(self, *, fpn_features, image_size,
+                main_queries, main_bbox, aux_queries=None, aux_bbox=None,
+                return_aux=False, return_roi=False):
+        main_out, main_roi = self._forward_group(
+            fpn_features, main_queries, main_bbox,
+            image_size, self.MAIN_GROUP, include_quality=True
+        )
+        aux_out = None
+        if return_aux:
+            if aux_queries is None or aux_bbox is None:
+                raise ValueError("Auxiliary queries and boxes are required")
+            aux_out, _ = self._forward_group(
+                fpn_features, aux_queries, aux_bbox,
+                image_size, self.AUX_GROUP, include_quality=True
+            )
+        if return_roi:
+            return main_out, aux_out, main_roi
         return main_out, aux_out
 
 
@@ -1558,6 +1685,78 @@ class ImgProjector(nn.Module):
         return image_tokens
 
 
+class ResNet50Backbone(nn.Module):
+    """將 [0, 1] RGB 正規化，輸出 stride 8/16/32 的 c3/c4/c5；可固定 BN 統計。"""
+
+    output_channels = (512, 1024, 2048)
+
+    def __init__(
+        self,
+        weights: Optional[str] = "IMAGENET1K_V2",
+        norm_eval: bool = True,
+    ) -> None:
+        super().__init__()
+        pretrained_weights = (
+            ResNet50_Weights[weights]
+            if weights is not None
+            else None
+        )
+        model = resnet50(weights=None)
+        if pretrained_weights is not None:
+            checkpoint_dir = (
+                Path(__file__).resolve().parents[1]
+                / "model" / "resnet" / "checkpoints"
+            )
+            state_dict = torch.hub.load_state_dict_from_url(
+                pretrained_weights.url,
+                model_dir=str(checkpoint_dir),
+                map_location="cpu",
+                check_hash=True,
+                weights_only=True,
+            )
+            model.load_state_dict(state_dict, strict=True)
+        self.stem = nn.Sequential(
+            model.conv1,
+            model.bn1,
+            model.relu,
+            model.maxpool,
+        )
+        self.layer1 = model.layer1
+        self.layer2 = model.layer2
+        self.layer3 = model.layer3
+        self.layer4 = model.layer4
+        self.norm_eval = bool(norm_eval)
+        self.register_buffer(
+            "input_mean",
+            torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "input_std",
+            torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.train(self.training)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.norm_eval:
+            for module in self.modules():
+                if isinstance(module, nn.BatchNorm2d):
+                    module.eval()
+        return self
+
+    def forward(self, image: torch.Tensor):
+        image = (
+            image - self.input_mean.to(dtype=image.dtype)
+        ) / self.input_std.to(dtype=image.dtype)
+        features = self.layer1(self.stem(image))
+        c3 = self.layer2(features)
+        c4 = self.layer3(c3)
+        c5 = self.layer4(c4)
+        return OrderedDict(c3=c3, c4=c4, c5=c5)
+
+
 class BackBone(nn.Module):
     def __init__(
         self,
@@ -1592,21 +1791,37 @@ class BackBone(nn.Module):
             (8, 8),
             (4, 4),
         ),
+        backbone_name: str = "bottlenet",
+        weights: Optional[str] = "IMAGENET1K_V2",
+        norm_eval: bool = True,
     ) -> None:
         super().__init__()
 
-        self.bottle_net = BottleNet(
-            in_channels=int(in_channels),
-            base_channels=tuple(int(value) for value in base_channels),
-            base_depths=tuple(int(value) for value in base_depths),
-            width_multiple=float(width_multiple),
-            depth_multiple=float(depth_multiple),
-            max_channels=int(max_channels),
-            channel_divisor=int(channel_divisor),
-        )
+        self.backbone_name = str(backbone_name).lower()
+        if self.backbone_name == "bottlenet":
+            self.bottle_net = BottleNet(
+                in_channels=int(in_channels),
+                base_channels=tuple(int(value) for value in base_channels),
+                base_depths=tuple(int(value) for value in base_depths),
+                width_multiple=float(width_multiple),
+                depth_multiple=float(depth_multiple),
+                max_channels=int(max_channels),
+                channel_divisor=int(channel_divisor),
+            )
+            self.output_channels = self.bottle_net.output_channels
+        elif self.backbone_name == "resnet50":
+            if int(in_channels) != 3:
+                raise ValueError("ResNet50 requires 3-channel RGB images")
+            self.resnet = ResNet50Backbone(
+                weights=weights,
+                norm_eval=norm_eval,
+            )
+            self.output_channels = self.resnet.output_channels
+        else:
+            raise ValueError(f"Unsupported backbone: {self.backbone_name}")
 
         self.fpn = FeaturePyramidNetwork(
-            in_channels_list=list(self.bottle_net.output_channels),
+            in_channels_list=list(self.output_channels),
             out_channels=int(fpn_channels),
             norm_layer=None,
         )
@@ -1623,7 +1838,6 @@ class BackBone(nn.Module):
             ),
         )
 
-        self.output_channels = self.bottle_net.output_channels
         self.fpn_channels = int(fpn_channels)
         self.hidden_dim = int(hidden_dim)
         self.tokens_per_level = dict(
@@ -1636,7 +1850,8 @@ class BackBone(nn.Module):
     def forward(
         self,
         image: torch.Tensor,
-    ) -> torch.Tensor:
+        return_fpn: bool = False,
+    ):
         if not torch.is_tensor(image):
             raise TypeError(
                 "BackBone input must be torch.Tensor, "
@@ -1649,7 +1864,10 @@ class BackBone(nn.Module):
                 f"got {tuple(image.shape)}"
             )
 
-        features = self.bottle_net(image)
+        if self.backbone_name == "resnet50":
+            features = self.resnet(image)
+        else:
+            features = self.bottle_net(image)
         fpn_features = self.fpn(features)
         image_tokens = self.img_projector(
             fpn_features
@@ -1673,6 +1891,8 @@ class BackBone(nn.Module):
                 f"{image_tokens.shape[2]} != {self.hidden_dim}"
             )
 
+        if return_fpn:
+            return image_tokens, fpn_features
         return image_tokens
 
 
@@ -1937,7 +2157,7 @@ class BottleNet(nn.Module):
         })
 
 class QueryHead(nn.Module):
-    """BBox, localization-quality and token-level text-alignment head."""
+    """BBox and localization-quality heads; phrase matching pools description tokens to score semantic queries."""
 
     SUPPORTED_FUSIONS = {"geometric_mean", "product"}
 
@@ -1968,8 +2188,7 @@ class QueryHead(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-        # Phrase Grounding alignment projections:
-        # object query [B,Q,C] x text token [B,L,C] -> [B,Q,L].
+        # Project ROI queries and caption tokens for description-level scoring.
         self.query_alignment_proj = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim, bias=False),
@@ -1978,6 +2197,7 @@ class QueryHead(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim, bias=False),
         )
+        self.phrase_matching_head = PhraseMatchingHead(hidden_dim)
 
         nn.init.eye_(self.query_alignment_proj[-1].weight)
         nn.init.eye_(self.token_alignment_proj[-1].weight)
@@ -2046,14 +2266,14 @@ class QueryHead(nn.Module):
         self._validate_query_tokens(query_tokens)
         return self.score_head(query_tokens)
 
-    def predict_token_alignment(
+    def predict_phrase_matching(
         self,
         query_tokens: torch.Tensor,
         text_tokens: torch.Tensor,
         text_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Dict[str, Any]:
         """
-        Return token-level alignment logits with shape [B, Q, L].
+        Return projected ROI/text features for description-level matching.
 
         text_mask must be true only for real caption tokens. Special tokens
         and padding are masked before returning.
@@ -2092,37 +2312,10 @@ class QueryHead(nn.Module):
                 f"{text_tokens.shape[-1]} != {self.hidden_dim}"
             )
 
-        query_features = F.normalize(
-            self.query_alignment_proj(query_tokens).float(),
-            dim=-1,
-        )
-        token_features = F.normalize(
-            self.token_alignment_proj(text_tokens).float(),
-            dim=-1,
-        )
-
-        logit_scale = self.alignment_logit_scale.exp().clamp(
-            min=1.0,
-            max=100.0,
-        )
-
-        alignment_logits = torch.einsum(
-            "bqc,blc->bql",
-            query_features,
-            token_features,
-        )
-        alignment_logits = alignment_logits * logit_scale
-
-        valid_mask = text_mask.to(
-            device=alignment_logits.device,
-            dtype=torch.bool,
-        )
-        alignment_logits = alignment_logits.masked_fill(
-            ~valid_mask[:, None, :],
-            -1.0e4,
-        )
-
-        return alignment_logits
+        visual = self.query_alignment_proj(query_tokens)
+        text = self.token_alignment_proj(text_tokens)
+        matching = self.phrase_matching_head(visual, text, self.alignment_logit_scale)
+        return matching
 
     def predict_scores(
         self,
@@ -2136,13 +2329,13 @@ class QueryHead(nn.Module):
     ]:
         quality_logit = self.predict_quality(query_tokens)
 
-        token_alignment_logits = None
+        phrase_matching = None
         if text_tokens is not None or text_mask is not None:
             if text_tokens is None or text_mask is None:
                 raise ValueError(
                     "text_tokens and text_mask must be provided together"
                 )
-            token_alignment_logits = self.predict_token_alignment(
+            phrase_matching = self.predict_phrase_matching(
                 query_tokens,
                 text_tokens,
                 text_mask,
@@ -2153,13 +2346,13 @@ class QueryHead(nn.Module):
         # localization-quality logit.
         final_score_logit = quality_logit
         final_score_logit._quality_logit = quality_logit
-        final_score_logit._token_alignment_logits = (
-            token_alignment_logits
+        final_score_logit._phrase_matching = (
+            phrase_matching
         )
 
         return (
             quality_logit,
-            token_alignment_logits,
+            phrase_matching,
             final_score_logit,
         )
 
@@ -2380,22 +2573,28 @@ class _BaseVisionTextModel(nn.Module):
                 "must have the same length"
             )
 
+        backbone_name = str(backbone_config.get("name", "bottlenet")).lower()
+        backbone_kwargs = {}
+        if backbone_name == "bottlenet":
+            backbone_kwargs = {
+                "base_channels": tuple(
+                    int(value) for value in backbone_config["base_channels"]
+                ),
+                "base_depths": tuple(
+                    int(value) for value in backbone_config["base_depths"]
+                ),
+                "width_multiple": float(backbone_config["width_multiple"]),
+                "depth_multiple": float(backbone_config["depth_multiple"]),
+                "max_channels": int(backbone_config["max_channels"]),
+                "channel_divisor": int(backbone_config.get("channel_divisor", 8)),
+            }
+
         self.img_model = BackBone(
             in_channels=int(backbone_config["in_channels"]),
-            base_channels=tuple(
-                int(value)
-                for value in backbone_config["base_channels"]
-            ),
-            base_depths=tuple(
-                int(value)
-                for value in backbone_config["base_depths"]
-            ),
-            width_multiple=float(backbone_config["width_multiple"]),
-            depth_multiple=float(backbone_config["depth_multiple"]),
-            max_channels=int(backbone_config["max_channels"]),
-            channel_divisor=int(
-                backbone_config.get("channel_divisor", 8)
-            ),
+            backbone_name=backbone_name,
+            weights=backbone_config.get("weights", "IMAGENET1K_V2"),
+            norm_eval=bool(backbone_config.get("norm_eval", True)),
+            **backbone_kwargs,
             fpn_channels=fpn_channels,
             hidden_dim=self.hidden_dim,
             projector_layers=int(
@@ -2690,7 +2889,10 @@ class _BaseVisionTextModel(nn.Module):
         image_indices=None,
         return_aux=None,
     ):
-        img_token = self.img_model(img)
+        img_token, fpn_features = self.img_model(
+            img,
+            return_fpn=True,
+        )
 
         if int(img_token.shape[1]) != self.num_image:
             raise RuntimeError(
@@ -2751,6 +2953,10 @@ class _BaseVisionTextModel(nn.Module):
                 0,
                 image_indices,
             )
+            fpn_features = OrderedDict(
+                (name, feature.index_select(0, image_indices))
+                for name, feature in fpn_features.items()
+            )
 
         text_out = self.text_model(texts)
         text_token = text_out["text_tokens"]
@@ -2810,10 +3016,11 @@ class _BaseVisionTextModel(nn.Module):
             :,
         ]
 
-        (
-            main_bbox,
-            main_score_logit,
-        ) = self.head(main_query_out)
+        if getattr(self, 'staged_query_refinement', False):
+            main_bbox = self.head.predict_bbox(main_query_out)
+            main_score_logit = None
+        else:
+            main_bbox, main_score_logit = self.head(main_query_out)
 
         aux_bbox = None
         aux_score_logit = None
@@ -2832,10 +3039,10 @@ class _BaseVisionTextModel(nn.Module):
                 :,
             ]
 
-            (
-                aux_bbox,
-                aux_score_logit,
-            ) = self.aux_head(aux_query_out)
+            if getattr(self, 'staged_query_refinement', False):
+                aux_bbox = self.aux_head.predict_bbox(aux_query_out)
+            else:
+                aux_bbox, aux_score_logit = self.aux_head(aux_query_out)
 
         return {
             # Backward-compatible Main aliases.
@@ -2868,6 +3075,10 @@ class _BaseVisionTextModel(nn.Module):
             "decoder_only": True,
 
             "img_token": img_token,
+            "fpn_features": fpn_features,
+            "input_image_size": tuple(
+                int(value) for value in img.shape[-2:]
+            ),
             "text_token": text_token,
             "text_mask": text_mask,
         }
@@ -2912,6 +3123,7 @@ class VisionTextModel(_BaseVisionTextModel):
         score_num_layers: Optional[int] = None,
         score_mlp_ratio: Optional[float] = None,
         score_dropout: Optional[float] = None,
+        score_roi_size: Optional[int] = None,
         score_bbox_conditioning: Optional[bool] = None,
         score_bbox_detach: Optional[bool] = None,
         freeze_img_projection: Optional[bool] = None,
@@ -3045,6 +3257,10 @@ class VisionTextModel(_BaseVisionTextModel):
             )
         )
 
+        resolved_score_roi_size = int(
+            resolve("score_roi_size", score_roi_size, 5)
+        )
+
         if resolved_score_num_heads <= 0:
             raise ValueError("score_num_heads must be > 0")
 
@@ -3062,6 +3278,9 @@ class VisionTextModel(_BaseVisionTextModel):
 
         if not 0.0 <= resolved_score_dropout < 1.0:
             raise ValueError("score_dropout must be in [0, 1)")
+
+        if resolved_score_roi_size <= 0:
+            raise ValueError("score_roi_size must be > 0")
 
         if resolved_score_fusion_eps <= 0:
             raise ValueError("score_fusion_eps must be > 0")
@@ -3087,14 +3306,11 @@ class VisionTextModel(_BaseVisionTextModel):
         self.score_fusion = self.head.score_fusion
         self.score_fusion_eps = self.head.fusion_eps
 
-        self.score_transformer = TransformerBlock(
+        self.score_transformer = TextAlignmentTransformer(
             hidden_dim=self.hidden_dim,
-            fusion_token_num=int(
-                defaults.get(
-                    "fusion_token_num",
-                    self.fusion_token_num,
-                )
-            ),
+            fpn_channels=self.img_model.fpn_channels,
+            level_names=self.img_model.img_projector.level_names,
+            roi_size=resolved_score_roi_size,
             num_heads=resolved_score_num_heads,
             num_layers=resolved_score_num_layers,
             mlp_ratio=resolved_score_mlp_ratio,
@@ -3113,6 +3329,7 @@ class VisionTextModel(_BaseVisionTextModel):
             nn.GELU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
+        self.score_roi_size = resolved_score_roi_size
 
         for parameter in self.img_model.parameters():
             parameter.requires_grad_(
@@ -3123,6 +3340,15 @@ class VisionTextModel(_BaseVisionTextModel):
     def _prepare_legacy_state_dict(self, state_dict):
         prepared = super()._prepare_legacy_state_dict(state_dict)
         current_state = self.state_dict()
+        key = "score_transformer.roi_position_embeddings"
+        value = prepared.get(key)
+        if value is not None and value.shape != current_state[key].shape:
+            side = math.isqrt(value.shape[2])
+            if side * side != value.shape[2]:
+                raise ValueError("ROI position embeddings must form a square grid")
+            grid = value.float().reshape(1, side, side, value.shape[-1]).permute(0, 3, 1, 2)
+            grid = F.interpolate(grid, size=(self.score_roi_size, self.score_roi_size), mode="bicubic", align_corners=False)
+            prepared[key] = grid.permute(0, 2, 3, 1).reshape_as(current_state[key]).to(value.dtype)
 
      
         prepared = {
@@ -3147,15 +3373,12 @@ class VisionTextModel(_BaseVisionTextModel):
 
     def _condition_score_queries(
         self,
-        localization_query: torch.Tensor,
         bbox: torch.Tensor,
     ) -> torch.Tensor:
         if not self.score_bbox_conditioning:
-            return localization_query
+            return bbox.new_zeros(*bbox.shape[:2], self.hidden_dim)
         bbox_input = bbox.detach() if self.score_bbox_detach else bbox
-        return localization_query + self.bbox_query_encoder(
-            bbox_input.to(localization_query.dtype)
-        )
+        return self.bbox_query_encoder(bbox_input)
 
     @staticmethod
     def _attach_stage_metadata(
@@ -3172,9 +3395,8 @@ class VisionTextModel(_BaseVisionTextModel):
     def _score_stage(
         self,
         *,
-        img_token: torch.Tensor,
-        text_token: torch.Tensor,
-        text_mask: torch.Tensor,
+        fpn_features: Mapping[str, torch.Tensor],
+        image_size: Sequence[int],
         localization_query: torch.Tensor,
         bbox: torch.Tensor,
         aux_localization_query: Optional[torch.Tensor],
@@ -3182,35 +3404,40 @@ class VisionTextModel(_BaseVisionTextModel):
         compute_auxiliary: bool,
     ):
         main_score_input = self._condition_score_queries(
-            localization_query,
             bbox,
         )
+        main_score_bbox = bbox.detach() if self.score_bbox_detach else bbox
         aux_score_input = None
+        aux_score_bbox = None
         if compute_auxiliary:
             if aux_localization_query is None or aux_bbox is None:
                 raise RuntimeError(
                     "Auxiliary localization output is required for score refinement"
                 )
             aux_score_input = self._condition_score_queries(
-                aux_localization_query,
                 aux_bbox,
             )
+            aux_score_bbox = (
+                aux_bbox.detach() if self.score_bbox_detach else aux_bbox
+            )
 
-        main_score_out, aux_score_out = self.score_transformer(
-            img_token=img_token,
-            text_token=text_token,
-            text_mask=text_mask,
+        main_score_out, aux_score_out, main_roi = self.score_transformer(
+            fpn_features=fpn_features,
+            image_size=image_size,
             main_queries=main_score_input,
+            main_bbox=main_score_bbox,
             aux_queries=aux_score_input,
+            aux_bbox=aux_score_bbox,
             return_aux=compute_auxiliary,
+            return_roi=True,
         )
-        main_score_query = main_score_out[:, -self.num_object_queries:, :]
+        main_score_query = main_score_out
         aux_score_query = (
-            aux_score_out[:, -self.num_object_queries:, :]
+            aux_score_out
             if aux_score_out is not None
             else None
         )
-        return main_score_query, aux_score_query
+        return main_score_query, aux_score_query, main_roi
 
 
     def forward(
@@ -3220,6 +3447,9 @@ class VisionTextModel(_BaseVisionTextModel):
         image_indices=None,
         return_aux=None,
     ) -> Dict[str, Any]:
+        if self.training and getattr(self, "freeze_localization", False):
+            self.img_model.eval()
+            self.transformer.eval()
         outputs = super().forward(
             img,
             texts,
@@ -3268,8 +3498,8 @@ class VisionTextModel(_BaseVisionTextModel):
         if not self.staged_query_refinement:
             main_query = outputs["main_object_query_out"]
             main_quality = self.head.predict_quality(main_query)
-            main_token_alignment = (
-                self.head.predict_token_alignment(
+            main_matching = (
+                self.head.predict_phrase_matching(
                     main_query,
                     outputs["text_token"],
                     alignment_text_mask,
@@ -3279,7 +3509,6 @@ class VisionTextModel(_BaseVisionTextModel):
 
             for tensor in (
                 main_quality,
-                main_token_alignment,
                 main_final,
             ):
                 self._attach_stage_metadata(
@@ -3292,16 +3521,13 @@ class VisionTextModel(_BaseVisionTextModel):
                 "score_logit": main_final,
                 "main_score_logit": main_final,
                 "quality_logit": main_quality,
-                "text_alignment_logit": main_token_alignment,
-                "token_alignment_logits": main_token_alignment,
                 "final_score_logit": main_final,
                 "main_quality_logit": main_quality,
-                "main_text_alignment_logit": main_token_alignment,
-                "main_token_alignment_logits": main_token_alignment,
                 "main_final_score_logit": main_final,
                 "score_decoupled": True,
                 "query_stage_separated": False,
                 "phrase_score_fusion_deferred": True,
+                "phrase_matching": main_matching,
             })
             return outputs
 
@@ -3313,10 +3539,11 @@ class VisionTextModel(_BaseVisionTextModel):
             outputs.get("aux_computed", False)
         )
 
-        main_score_query, aux_score_query = self._score_stage(
-            img_token=outputs["img_token"],
-            text_token=outputs["text_token"],
-            text_mask=outputs["text_mask"],
+        for feature in outputs['fpn_features'].values():
+            feature._roi_fp32 = feature.float()
+        main_score_query, aux_score_query, main_roi = self._score_stage(
+            fpn_features=outputs["fpn_features"],
+            image_size=outputs["input_image_size"],
             localization_query=main_local_query,
             bbox=main_bbox,
             aux_localization_query=aux_local_query,
@@ -3324,11 +3551,9 @@ class VisionTextModel(_BaseVisionTextModel):
             compute_auxiliary=compute_auxiliary,
         )
 
-        main_quality = self.head.predict_quality(
-            main_score_query
-        )
-        main_token_alignment = (
-            self.head.predict_token_alignment(
+        main_quality = self.head.predict_quality(main_score_query._roi_quality)
+        main_matching = (
+            self.head.predict_phrase_matching(
                 main_score_query,
                 outputs["text_token"],
                 alignment_text_mask,
@@ -3337,15 +3562,13 @@ class VisionTextModel(_BaseVisionTextModel):
         main_final = main_quality
 
         aux_quality = None
-        aux_token_alignment = None
+        aux_matching = None
         aux_final = None
 
         if compute_auxiliary and self.aux_head is not None:
-            aux_quality = self.aux_head.predict_quality(
-                aux_score_query
-            )
-            aux_token_alignment = (
-                self.aux_head.predict_token_alignment(
+            aux_quality = self.aux_head.predict_quality(aux_score_query._roi_quality)
+            aux_matching = (
+                self.aux_head.predict_phrase_matching(
                     aux_score_query,
                     outputs["text_token"],
                     alignment_text_mask,
@@ -3355,7 +3578,6 @@ class VisionTextModel(_BaseVisionTextModel):
 
         for tensor in (
             main_quality,
-            main_token_alignment,
             main_final,
         ):
             self._attach_stage_metadata(
@@ -3366,7 +3588,6 @@ class VisionTextModel(_BaseVisionTextModel):
 
         for tensor in (
             aux_quality,
-            aux_token_alignment,
             aux_final,
         ):
             self._attach_stage_metadata(
@@ -3383,22 +3604,20 @@ class VisionTextModel(_BaseVisionTextModel):
 
             # ODVG token-level alignment interface.
             "quality_logit": main_quality,
-            "text_alignment_logit": main_token_alignment,
-            "token_alignment_logits": main_token_alignment,
             "final_score_logit": main_final,
 
             "main_quality_logit": main_quality,
-            "main_text_alignment_logit": main_token_alignment,
-            "main_token_alignment_logits": main_token_alignment,
             "main_final_score_logit": main_final,
 
             "aux_quality_logit": aux_quality,
-            "aux_text_alignment_logit": aux_token_alignment,
-            "aux_token_alignment_logits": aux_token_alignment,
             "aux_final_score_logit": aux_final,
 
             "main_localization_query_out": main_local_query,
             "main_score_query_out": main_score_query,
+            "phrase_matching": main_matching,
+            "aux_phrase_matching": aux_matching if aux_matching is not None else None,
+            "ranking_visual_features": main_matching["visual"],
+            "ranking_text_features": main_matching["text"],
             "aux_localization_query_out": aux_local_query,
             "aux_score_query_out": aux_score_query,
             "score_transformer_out": main_score_query,
@@ -3407,6 +3626,7 @@ class VisionTextModel(_BaseVisionTextModel):
             "query_stage_separated": True,
             "score_bbox_conditioning": self.score_bbox_conditioning,
             "score_bbox_detach": self.score_bbox_detach,
+            "score_roi_size": self.score_roi_size,
             "score_fusion": self.score_fusion,
             "phrase_score_fusion_deferred": True,
         })

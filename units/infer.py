@@ -76,6 +76,7 @@ print(f"Project Root : {PROJECT_ROOT}")
 print(f"Units Root   : {UNITS_ROOT}")
 
 from units.tool.card import VisionTextModel
+from units.model.cards.phrase_matching import matching_for_image
 from units.model.tool.runtime import (
     forward_model_batch,
     score_queries_for_char_spans,
@@ -94,9 +95,9 @@ class PhraseRequest:
 @dataclass(frozen=True)
 class InferenceSettings:
     image_size: Tuple[int, int]
-    score_threshold: float = 0.05
-    top_k: int = 20
-    use_nms: bool = False
+    score_threshold: float = 0.5
+    top_k: int = 0
+    use_nms: bool = True
     nms_iou_threshold: float = 0.5
     token_reduction: str = "mean"
     score_fusion: str = "geometric_mean"
@@ -336,6 +337,9 @@ class LightDetODVGInferencer:
             score_dropout=float(
                 config.get("score_dropout", 0.1)
             ),
+            score_roi_size=int(
+                config.get("score_roi_size", 5)
+            ),
             score_bbox_conditioning=bool(
                 config.get("score_bbox_conditioning", True)
             ),
@@ -549,8 +553,8 @@ class LightDetODVGInferencer:
             outputs.get("main_quality_logit"),
         )
         token_logits = outputs.get(
-            "token_alignment_logits",
-            outputs.get("main_token_alignment_logits"),
+            "phrase_matching",
+            outputs.get("phrase_matching"),
         )
         token_offsets = outputs.get("token_offsets")
         text_mask = outputs.get("alignment_text_mask")
@@ -558,13 +562,13 @@ class LightDetODVGInferencer:
         values = {
             "bbox/main_bbox": boxes,
             "quality_logit": quality,
-            "token_alignment_logits": token_logits,
+            "phrase_matching": token_logits,
             "token_offsets": token_offsets,
             "alignment_text_mask": text_mask,
         }
         missing = [
             name for name, value in values.items()
-            if not torch.is_tensor(value)
+            if not (isinstance(value, dict) if name == "phrase_matching" else torch.is_tensor(value))
         ]
         if missing:
             raise RuntimeError(
@@ -578,10 +582,10 @@ class LightDetODVGInferencer:
             raise ValueError(
                 f"quality_logit must be [B,Q,1], got {tuple(quality.shape)}"
             )
-        if token_logits.ndim != 3:
+        if not isinstance(token_logits, dict):
             raise ValueError(
-                "token_alignment_logits must be [B,Q,L], got "
-                f"{tuple(token_logits.shape)}"
+                "phrase_matching must contain ROI/text features, got "
+                f"{type(token_logits).__name__}"
             )
         if token_offsets.ndim != 3 or token_offsets.shape[-1] != 2:
             raise ValueError(
@@ -648,9 +652,9 @@ class LightDetODVGInferencer:
         caption: str,
         phrases: Optional[Sequence[str]] = None,
         *,
-        score_threshold: float = 0.05,
-        top_k: int = 20,
-        use_nms: bool = False,
+        score_threshold: float = 0.5,
+        top_k: int = 0,
+        use_nms: bool = True,
         nms_iou_threshold: float = 0.5,
         token_reduction: str = "mean",
         score_fusion: str = "geometric_mean",
@@ -698,7 +702,7 @@ class LightDetODVGInferencer:
 
         boxes = boxes_batch[0].detach().float().clamp(0.0, 1.0)
         quality = quality_batch[0].detach().float()
-        token_logits = token_logits_batch[0].detach().float()
+        token_logits = matching_for_image(token_logits_batch, 0)
         token_offsets = token_offsets_batch[0].detach()
         text_mask = text_mask_batch[0].detach()
 
@@ -706,7 +710,7 @@ class LightDetODVGInferencer:
         for phrase_request in phrase_requests:
             score_components = score_queries_for_char_spans(
                 quality_logit=quality,
-                token_alignment_logits=token_logits,
+                phrase_matching=token_logits,
                 token_offsets=token_offsets,
                 char_spans=phrase_request.char_spans,
                 valid_token_mask=text_mask,
@@ -863,8 +867,8 @@ class LightDet:
             conf=0.30,
             quality_thr=0.0,
             alignment_thr=0.0,
-            top_k=20,
-            use_nms=False,
+            top_k=0,
+            use_nms=True,
             nms_iou_threshold=0.5,
             token_reduction="mean",
             score_fusion="geometric_mean",
@@ -1029,11 +1033,11 @@ class LightDet:
         phrases: Union[str, Sequence[str]],
         imgsz: int = 1024,
         device: Optional[Any] = None,
-        conf: float = 0.05,
+        conf: float = 0.5,
         quality_thr: float = 0.0,
         alignment_thr: float = 0.0,
-        top_k: int = 20,
-        use_nms: bool = False,
+        top_k: int = 0,
+        use_nms: bool = True,
         nms_iou_threshold: float = 0.5,
         token_reduction: str = "mean",
         score_fusion: str = "geometric_mean",
@@ -1069,9 +1073,9 @@ class LightDet:
                 f"got {alignment_thr}"
             )
 
-        if int(top_k) <= 0:
+        if int(top_k) < 0:
             raise ValueError(
-                f"top_k must be > 0, got {top_k}"
+                f"top_k must be >= 0 (0 keeps all passing boxes), got {top_k}"
             )
 
         if int(imgsz) <= 0:
@@ -1229,8 +1233,8 @@ def main() -> None:
         conf=0.60,
         quality_thr=0.3,
         alignment_thr=0.3,
-        top_k=20,
-        use_nms=False,
+        top_k=0,
+        use_nms=True,
         nms_iou_threshold=0.5,
         token_reduction="mean",
         score_fusion="geometric_mean",

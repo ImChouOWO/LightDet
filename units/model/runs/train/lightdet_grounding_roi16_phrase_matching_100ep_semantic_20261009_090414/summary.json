@@ -1,0 +1,36 @@
+{
+  "checkpoint": {
+    "path": "/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_grounding_roi16_phrase_matching_100ep/best_hit_at_1.pt",
+    "source": "ema",
+    "source_epoch": 8,
+    "source_best_metric": 0.4537510778959471
+  },
+  "validation_dir": "/home/soic/Desktop/LightDet/units/model/runs/train/lightdet_grounding_roi16_phrase_matching_100ep_val_20261009_084648",
+  "requested": 20,
+  "eligible_records": 4530,
+  "completed": 20,
+  "skipped": 0,
+  "seed": 49,
+  "roi_size": 8,
+  "mask_fraction": 0.25,
+  "random_trials": 5,
+  "dtype": "float32",
+  "image_size": 1024,
+  "weights_override": false,
+  "notes": [
+    "Attention and gradients are diagnostics, not proof of causality.",
+    "Heatmaps are normalized separately; raw maps and scores are in JSON.",
+    "Ablation removes projected ROI features, not image pixels. Boxes and text are fixed.",
+    "Color substitution keeps ROI/boxes fixed and updates text; no counterfactual GT is assumed.",
+    "FP32 replay can differ from BF16 validation; changed error categories are skipped.",
+    "Phrase pooling weights are shared across candidate ROIs."
+  ],
+  "wrong": {
+    "mean_salient_drop": 0.1949554905295372,
+    "mean_random_drop": 0.07933308392763137
+  },
+  "positive": {
+    "mean_salient_drop": 0.1164993952959776,
+    "mean_random_drop": 0.08046010315418244
+  }
+}

@@ -7,17 +7,13 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from units.model.cards.relation_loss import phrase_predictions, relation_cost, relation_loss
+from units.model.cards.relation_loss import phrase_predictions, relation_cost, relation_loss, ranking_contrast_loss
+from units.model.cards.background import BackgroundPolicy, background_candidates, mine_background
 
 try:
     from scipy.optimize import linear_sum_assignment
 except ImportError:
     linear_sum_assignment = None
-
-try:
-    from units.model.tool.odvg_token_alignment import build_positive_token_maps
-except ImportError:
-    build_positive_token_maps = None
 
 
 def clamp01(value: float) -> float:
@@ -351,7 +347,7 @@ class HungarianOneToOneMatcher:
         packed_targets: Optional[PackedTargets] = None,
         *,
         score_cost_alpha: float = 1.0,
-        pred_token_alignment_logit: Optional[torch.Tensor] = None,
+        pred_phrase_matching: Optional[torch.Tensor] = None,
         positive_token_maps: Optional[Sequence[torch.Tensor]] = None,
         alignment_text_mask: Optional[torch.Tensor] = None,
         alignment_cost_alpha: float = 1.0,
@@ -379,20 +375,20 @@ class HungarianOneToOneMatcher:
         use_alignment = bool(
             self.cost_alignment != 0.0
             and float(alignment_cost_alpha) > 0.0
-            and pred_token_alignment_logit is not None
+            and pred_phrase_matching is not None
             and positive_token_maps is not None
             and alignment_text_mask is not None
         )
         if use_alignment:
-            if pred_token_alignment_logit.ndim != 3:
-                raise ValueError("pred_token_alignment_logit must be [B,Q,L]")
-            if pred_token_alignment_logit.shape[:2] != (batch_size, num_queries):
+            if pred_phrase_matching.ndim != 3:
+                raise ValueError("pred_phrase_matching must be [B,Q,L]")
+            if pred_phrase_matching.shape[:2] != (batch_size, num_queries):
                 raise ValueError("bbox/token alignment shape mismatch")
             if len(positive_token_maps) != batch_size:
                 raise ValueError("positive_token_maps batch mismatch")
             if tuple(alignment_text_mask.shape) != (
                 batch_size,
-                pred_token_alignment_logit.shape[-1],
+                pred_phrase_matching.shape[-1],
             ):
                 raise ValueError("alignment_text_mask must be [B,L]")
         score_cost_alpha = clamp01(score_cost_alpha)
@@ -425,7 +421,7 @@ class HungarianOneToOneMatcher:
                 cost = cost + self.cost_alignment * alignment_cost_alpha * phrase_costs[batch_index].detach()
             elif use_alignment:
                 token_cost = _balanced_token_cost(
-                    pred_token_alignment_logit[batch_index],
+                    pred_phrase_matching[batch_index],
                     positive_token_maps[batch_index],
                     alignment_text_mask[batch_index],
                     negative_weight=self.alignment_negative_weight,
@@ -628,11 +624,14 @@ class GroundingLoss(nn.Module):
         text_alignment_enabled: bool = True,
         text_alignment_loss_weight: float = 1.0,
         text_alignment_negative_weight: float = 0.25,
-        text_alignment_unmatched_weight: float = 0.10,
         text_alignment_focal_gamma: float = 2.0,
         text_alignment_ranking_weight: float = 0.25,
+        ranking_contrast_weight: float = 0.0,
+        ranking_contrast_temperature: float = 0.1,
         aux_text_alignment_ranking_weight: float = 0.0,
-        text_alignment_ranking_margin: float = 0.15,
+        text_alignment_ranking_margin: float = 0.6931471805599453,
+        ranking_negative_top_k: int = 5,
+        ranking_hard_negative_quota: int = 3,
         text_alignment_start_epoch: int = 1,
         text_alignment_warmup_epoch: int = 5,
         aux_loss_weight: float = 0.50,
@@ -668,6 +667,7 @@ class GroundingLoss(nn.Module):
         **legacy_parameters: Any,
     ) -> None:
         super().__init__()
+        self.background_policy = BackgroundPolicy()
         aliases = {
             "ia_bce": "ia_bce",
             "iabce": "ia_bce",
@@ -730,11 +730,18 @@ class GroundingLoss(nn.Module):
         self.text_alignment_enabled = bool(text_alignment_enabled)
         self.text_alignment_loss_weight = max(0.0, float(text_alignment_loss_weight))
         self.text_alignment_negative_weight = max(0.0, float(text_alignment_negative_weight))
-        self.text_alignment_unmatched_weight = max(0.0, float(text_alignment_unmatched_weight))
         self.text_alignment_focal_gamma = max(0.0, float(text_alignment_focal_gamma))
         self.text_alignment_ranking_weight = max(0.0, float(text_alignment_ranking_weight))
+        self.ranking_contrast_weight = float(ranking_contrast_weight)
+        self.ranking_contrast_temperature = float(ranking_contrast_temperature)
+        if self.ranking_contrast_weight < 0 or self.ranking_contrast_temperature <= 0:
+            raise ValueError("Ranking contrast requires nonnegative weight and positive temperature")
         self.aux_text_alignment_ranking_weight = max(0.0, float(aux_text_alignment_ranking_weight))
         self.text_alignment_ranking_margin = max(0.0, float(text_alignment_ranking_margin))
+        self.ranking_negative_top_k = int(ranking_negative_top_k)
+        self.ranking_hard_negative_quota = int(ranking_hard_negative_quota)
+        if self.ranking_negative_top_k < 1 or not 0 <= self.ranking_hard_negative_quota <= self.ranking_negative_top_k:
+            raise ValueError("Ranking requires top_k >= 1 and 0 <= hard_negative_quota <= top_k")
         self.text_alignment_start_epoch = max(1, int(text_alignment_start_epoch))
         self.text_alignment_warmup_epoch = max(1, int(text_alignment_warmup_epoch))
 
@@ -863,11 +870,14 @@ class GroundingLoss(nn.Module):
             text_alignment_enabled=alignment.get("enabled", True),
             text_alignment_loss_weight=alignment.get("loss_weight", 1.0),
             text_alignment_negative_weight=alignment.get("negative_weight", 0.25),
-            text_alignment_unmatched_weight=alignment.get("unmatched_weight", 0.10),
             text_alignment_focal_gamma=alignment.get("focal_gamma", 2.0),
             text_alignment_ranking_weight=alignment.get("ranking_weight", 0.25),
+            ranking_contrast_weight=alignment.get("ranking_contrast_weight", 0.0),
+            ranking_contrast_temperature=alignment.get("ranking_contrast_temperature", 0.1),
             aux_text_alignment_ranking_weight=alignment.get("aux_ranking_weight", 0.0),
-            text_alignment_ranking_margin=alignment.get("ranking_margin", 0.15),
+            text_alignment_ranking_margin=alignment.get("ranking_margin", 0.6931471805599453),
+            ranking_negative_top_k=alignment.get("ranking_negative_top_k", 5),
+            ranking_hard_negative_quota=alignment.get("ranking_hard_negative_quota", 3),
             text_alignment_start_epoch=alignment.get("start_epoch", 1),
             text_alignment_warmup_epoch=alignment.get("warmup_epoch", 5),
             aux_loss_weight=hybrid.get("aux_loss_weight", weight.get("aux", 0.50)),
@@ -903,6 +913,7 @@ class GroundingLoss(nn.Module):
         )
         instance.alignment_match_start = int(matcher_schedule.get("alignment_start_epoch", 10))
         instance.alignment_match_warmup = int(matcher_schedule.get("alignment_warmup_epoch", 15))
+        instance.background_policy = BackgroundPolicy(**loss_cfg.get("background", {}))
         return instance
 
     def resolve_epoch_alpha(
@@ -1044,11 +1055,11 @@ class GroundingLoss(nn.Module):
             return explicit
         return getattr(tensor, name, None)
 
-    def _resolve_token_supervision(
+    def _resolve_phrase_supervision(
         self,
         pred_score_logit: torch.Tensor,
         targets: Sequence[Mapping[str, Any]],
-        pred_token_alignment_logit: Optional[torch.Tensor],
+        pred_phrase_matching: Optional[torch.Tensor],
         positive_token_maps: Optional[Sequence[torch.Tensor]],
         alignment_text_mask: Optional[torch.Tensor],
         token_offsets: Optional[torch.Tensor],
@@ -1060,8 +1071,8 @@ class GroundingLoss(nn.Module):
     ]:
         token_logits = self._extract_metadata(
             pred_score_logit,
-            pred_token_alignment_logit,
-            "_token_alignment_logits",
+            pred_phrase_matching,
+            "_phrase_matching",
         )
         mask = self._extract_metadata(
             pred_score_logit,
@@ -1075,52 +1086,11 @@ class GroundingLoss(nn.Module):
         )
         if token_logits is None:
             return None, None, None
-        if mask is None:
-            mask = torch.ones(
-                token_logits.shape[0],
-                token_logits.shape[-1],
-                dtype=torch.bool,
-                device=token_logits.device,
-            )
-        else:
-            mask = mask.to(device=token_logits.device, dtype=torch.bool)
-        maps: Optional[List[torch.Tensor]] = None
-        if positive_token_maps is not None:
-            maps = [
-                value.to(device=token_logits.device, dtype=torch.float32)
-                if torch.is_tensor(value)
-                else torch.as_tensor(value, device=token_logits.device, dtype=torch.float32)
-                for value in positive_token_maps
-            ]
-        else:
-            target_maps = [target.get("positive_token_maps") for target in targets]
-            if all(value is not None for value in target_maps):
-                maps = [
-                    value.to(device=token_logits.device, dtype=torch.float32)
-                    if torch.is_tensor(value)
-                    else torch.as_tensor(value, device=token_logits.device, dtype=torch.float32)
-                    for value in target_maps
-                ]
-            elif offsets is not None and build_positive_token_maps is not None:
-                char_spans = [target.get("positive_char_spans", []) for target in targets]
-                if captions is None:
-                    captions = [str(target.get("caption", "")) for target in targets]
-                    if not any(captions):
-                        captions = None
-                built = build_positive_token_maps(
-                    token_offsets=offsets,
-                    positive_char_spans=char_spans,
-                    attention_mask=mask,
-                    captions=captions,
-                    strict=True,
-                    normalize=True,
-                )
-                maps = built["positive_token_maps"]
-        if maps is None:
-            return token_logits, None, mask
-        if len(maps) != token_logits.shape[0]:
-            raise ValueError("positive token map batch mismatch")
-        return token_logits, maps, mask
+        if isinstance(token_logits, dict):
+            if mask is None:
+                raise ValueError("Phrase matching requires the caption token mask")
+            return token_logits, None, mask.to(dtype=torch.bool)
+        raise TypeError("Semantic supervision requires a phrase matching feature bundle")
 
     @staticmethod
     def _prepare_text_negative_mask(
@@ -1188,149 +1158,66 @@ class GroundingLoss(nn.Module):
         hard_negative_alpha: float,
         negative_iou_ignore_thr: float,
         enable_extra_negative_losses: bool,
+        objects_complete=None,
+        background_scale=1.0,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         logits = pred_score_logit.float()
         if logits.ndim != 3 or logits.shape[-1] != 1:
             raise ValueError("pred_score_logit must be [B,Q,1]")
-        target = torch.zeros_like(logits)
-        positive_mask = torch.zeros_like(logits, dtype=torch.bool)
-        matched_iou = logits.new_zeros((0,))
-        matched_giou = logits.new_zeros((0,))
         if assignments.num_matches:
-            batch_idx = assignments.batch_indices
-            pred_idx = assignments.pred_indices
-            global_gt = packed_targets.global_gt_indices(batch_idx, assignments.gt_indices)
-            pred_boxes = pred_bbox[batch_idx, pred_idx].float()
-            gt_boxes = packed_targets.boxes[global_gt].float()
+            b, q = assignments.batch_indices, assignments.pred_indices
+            g = packed_targets.global_gt_indices(b, assignments.gt_indices)
+            pred_boxes = pred_bbox[b, q].float()
+            gt_boxes = packed_targets.boxes[g].float()
             matched_iou = matched_box_iou(pred_boxes.detach(), gt_boxes).clamp(0, 1)
-            matched_giou = matched_generalized_box_iou(pred_boxes.detach(), gt_boxes).clamp(-1, 1)
-            if self.classification_type == "normalized_giou":
-                final_quality = (matched_giou + 1.0) * 0.5
-            elif self.classification_type == "ia_bce":
-                probability = logits[batch_idx, pred_idx, 0].detach().sigmoid()
-                final_quality = (
-                    probability.pow(self.ia_bce_alpha)
-                    * matched_iou.pow(1.0 - self.ia_bce_alpha)
-                )
-            else:
-                final_quality = matched_iou
-            final_quality = final_quality.clamp(self.quality_min, self.quality_max)
-            warm = torch.full_like(final_quality, self.quality_max)
-            positive_quality = (
-                (1.0 - quality_alpha) * warm + quality_alpha * final_quality
-            )
-            target[batch_idx, pred_idx, 0] = positive_quality
-            positive_mask[batch_idx, pred_idx, 0] = True
-            loss_bbox = F.l1_loss(pred_boxes, gt_boxes, reduction="mean")
-            loss_giou = (1.0 - matched_generalized_box_iou(pred_boxes, gt_boxes)).mean()
+            loss_bbox = F.l1_loss(pred_boxes, gt_boxes)
+            loss_giou = (1 - matched_generalized_box_iou(pred_boxes, gt_boxes)).mean()
         else:
-            positive_quality = logits.new_zeros((0,))
-            loss_bbox = logits.new_zeros(())
-            loss_giou = logits.new_zeros(())
+            matched_iou = logits.new_zeros(0)
+            loss_bbox = loss_giou = logits.sum() * 0
 
+        target = torch.zeros_like(logits)
+        valid = torch.zeros_like(logits, dtype=torch.bool)
+        background_mask = torch.zeros_like(valid)
+        background_candidate_count = 0
+        for b, count in enumerate(packed_targets.counts):
+            complete = bool(objects_complete[b]) if objects_complete is not None else False
+            start, end = int(packed_targets.offsets[b]), int(packed_targets.offsets[b + 1])
+            gt = packed_targets.boxes[start:end].float()
+            if count:
+                overlap = box_iou(pred_bbox[b].detach().float(), gt)
+                target[b, :, 0] = overlap.max(1).values
+                valid[b, :, 0] = target[b, :, 0] >= 0.5
+            candidates = background_candidates(pred_bbox[b], gt, complete, self.background_policy)
+            background_candidate_count += int(candidates.sum())
+            if background_scale > 0:
+                selected = mine_background(candidates, logits[b, :, 0].sigmoid(), count, self.background_policy)
+                background_mask[b, :, 0] = selected
+                valid[b, :, 0] |= selected
+                target[b, selected, 0] = 0
         probability = logits.sigmoid()
-        bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
-        modulation = (target - probability).abs().pow(self.focal_gamma)
-        element = bce * modulation
-        query_weights = self._prepare_query_weights(pred_score_logit, query_loss_weights)
-        negative_weight = torch.full_like(element, self.negative_classification_weight)
-        if bool(text_negative_mask.any()):
-            negative_weight[text_negative_mask] = self.negative_text_classification_weight
-        class_weight = torch.where(positive_mask, torch.ones_like(element), negative_weight)
-        weighted = element * query_weights * class_weight
-        if self.normalize_classification_by_num_gt:
-            positive_loss = (
-                (element * query_weights)[positive_mask].mean()
-                if bool(positive_mask.any())
-                else logits.new_zeros(())
-            )
-            negative_mask = ~positive_mask
-            negative_loss = (
-                weighted[negative_mask].sum()
-                / (query_weights.expand_as(element) * class_weight)[negative_mask].sum().clamp_min(1.0)
-                if bool(negative_mask.any())
-                else logits.new_zeros(())
-            )
-            loss_score = positive_loss + negative_loss
-        else:
-            loss_score = weighted.sum() / (query_weights.expand_as(element) * class_weight).sum().clamp_min(1.0)
-
-        max_iou = logits.new_zeros(logits.shape)
-        nearest_gt = torch.full_like(logits, -1, dtype=torch.long)
-        for batch_index, count in enumerate(packed_targets.counts):
-            if count == 0:
-                continue
-            start = int(packed_targets.offsets[batch_index].item())
-            end = int(packed_targets.offsets[batch_index + 1].item())
-            iou = box_iou(pred_bbox[batch_index].detach().float(), packed_targets.boxes[start:end].float())
-            values, indices = iou.max(dim=-1)
-            max_iou[batch_index, :, 0] = values
-            nearest_gt[batch_index, :, 0] = indices
-        duplicate_mask = (
-            (~positive_mask)
-            & (max_iou >= float(negative_iou_ignore_thr))
-            & (nearest_gt >= 0)
-        )
-        loss_duplicate = logits.new_zeros(())
-        duplicate_pairs = logits.new_zeros(())
-        if (
-            enable_extra_negative_losses
-            and self.duplicate_suppression_enabled
-            and duplicate_alpha > 0.0
-            and bool(duplicate_mask.any())
-            and assignments.num_matches
-        ):
-            pair_losses: List[torch.Tensor] = []
-            for batch_index in range(pred_bbox.shape[0]):
-                matched_for_row = assignments.pred_indices[
-                    assignments.batch_indices == batch_index
-                ]
-                if matched_for_row.numel() == 0:
-                    continue
-                positive_logit = logits[batch_index, matched_for_row, 0].max()
-                duplicate_logits = logits[batch_index, duplicate_mask[batch_index, :, 0], 0]
-                if duplicate_logits.numel():
-                    pair_losses.append(
-                        F.relu(self.duplicate_margin + duplicate_logits - positive_logit)
-                    )
-            if pair_losses:
-                all_pairs = torch.cat(pair_losses)
-                if all_pairs.numel() > self.duplicate_max_pairs:
-                    all_pairs = torch.topk(all_pairs, self.duplicate_max_pairs).values
-                loss_duplicate = all_pairs.mean()
-                duplicate_pairs = logits.new_tensor(float(all_pairs.numel()))
-
-        hard_negative_mask = (
-            (~positive_mask)
-            & (~duplicate_mask)
-            & (max_iou <= self.hard_negative_max_iou)
-        )
-        loss_hard_negative = logits.new_zeros(())
-        hard_count = logits.new_zeros(())
-        if (
-            enable_extra_negative_losses
-            and self.hard_negative_mining_enabled
-            and hard_negative_alpha > 0.0
-            and bool(hard_negative_mask.any())
-        ):
-            hard_values = F.softplus(logits[hard_negative_mask])
-            k = min(self.hard_negative_topk * max(1, pred_bbox.shape[0]), hard_values.numel())
-            hard_values = torch.topk(hard_values, k=k).values
-            loss_hard_negative = hard_values.mean()
-            hard_count = logits.new_tensor(float(k))
-
-        total = (
-            float(lambda_bbox) * loss_bbox
-            + float(lambda_giou) * loss_giou
-            + float(lambda_score) * loss_score
-            + self.duplicate_loss_weight * duplicate_alpha * loss_duplicate
-            + self.hard_negative_loss_weight * hard_negative_alpha * loss_hard_negative
-        )
+        element = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+        element = element * (target - probability).abs().pow(self.focal_gamma)
+        positive_mask = valid & (target >= 0.5)
+        negative_mask = valid & ~positive_mask
+        foreground_loss = element[positive_mask].mean() if positive_mask.any() else logits.sum() * 0
+        background_loss = element[background_mask].mean() if background_mask.any() else logits.sum() * 0
+        loss_score = foreground_loss + background_scale * self.background_policy.quality_weight * background_loss
+        positive_quality = target[positive_mask]
+        max_iou = target
+        duplicate_mask = torch.zeros_like(valid)
+        hard_negative_mask = torch.zeros_like(valid)
+        loss_duplicate = loss_hard_negative = logits.sum() * 0
+        duplicate_pairs = hard_count = logits.new_zeros(())
+        total = lambda_bbox * loss_bbox + lambda_giou * loss_giou + lambda_score * loss_score
         return total, {
             "loss_total": total,
             "loss_bbox": loss_bbox,
             "loss_giou": loss_giou,
             "loss_score": loss_score,
+            "loss_quality_background": background_loss,
+            "quality_background_query_count": float(background_mask.sum()),
+            "quality_background_candidate_count": float(background_candidate_count),
             "loss_duplicate": loss_duplicate,
             "loss_duplicate_contrib": self.duplicate_loss_weight * duplicate_alpha * loss_duplicate,
             "duplicate_pair_count": duplicate_pairs,
@@ -1346,9 +1233,9 @@ class GroundingLoss(nn.Module):
             "hard_negative_loss_mean": loss_hard_negative,
             "matched": float(assignments.num_matches),
             "score_pos_count": float(positive_mask.sum().item()),
-            "negative_count": float((~positive_mask).sum().item()),
-            "ignored_negative_count": float(duplicate_mask.sum().item()),
-            "selected_negative_fraction": 1.0,
+            "negative_count": float(negative_mask.sum().item()),
+            "ignored_negative_count": float((~valid).sum().item()),
+            "selected_negative_fraction": float(negative_mask.sum().item()) / max(1, int((~positive_mask).sum())),
             "ignored_negative_score_mean": probability[duplicate_mask].mean() if bool(duplicate_mask.any()) else logits.new_zeros(()),
             "ignored_negative_iou_mean": max_iou[duplicate_mask].mean() if bool(duplicate_mask.any()) else logits.new_zeros(()),
             "matched_iou_mean": matched_iou.mean() if matched_iou.numel() else logits.new_zeros(()),
@@ -1409,27 +1296,25 @@ class GroundingLoss(nn.Module):
         aux_lambda_score: Optional[float] = None,
         aux_pos_weight: Optional[float] = None,
         pred_quality_logit: Optional[torch.Tensor] = None,
-        pred_text_alignment_logit: Optional[torch.Tensor] = None,
-        pred_token_alignment_logit: Optional[torch.Tensor] = None,
+        pred_phrase_matching: Optional[torch.Tensor] = None,
         positive_token_maps: Optional[Sequence[torch.Tensor]] = None,
         alignment_text_mask: Optional[torch.Tensor] = None,
         token_offsets: Optional[torch.Tensor] = None,
         captions: Optional[Sequence[str]] = None,
         aux_pred_quality_logit: Optional[torch.Tensor] = None,
-        aux_pred_text_alignment_logit: Optional[torch.Tensor] = None,
-        aux_pred_token_alignment_logit: Optional[torch.Tensor] = None,
+        aux_pred_phrase_matching: Optional[torch.Tensor] = None,
         lambda_text_alignment: Optional[float] = None,
+        ranking_visual_features: Optional[torch.Tensor] = None,
+        ranking_text_features: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         del pos_weight, aux_pos_weight, kwargs
+        background_scale = self.background_policy.scale(current_epoch)
         quality_logit = pred_quality_logit if pred_quality_logit is not None else pred_score_logit
         if quality_logit.ndim != 3 or quality_logit.shape[-1] != 1:
             raise ValueError("quality logit must be [B,Q,1]")
-        token_candidate = pred_token_alignment_logit
-        if token_candidate is None and pred_text_alignment_logit is not None:
-            if pred_text_alignment_logit.ndim == 3 and pred_text_alignment_logit.shape[-1] != 1:
-                token_candidate = pred_text_alignment_logit
-        token_logits, token_maps, valid_token_mask = self._resolve_token_supervision(
+        token_candidate = pred_phrase_matching
+        token_logits, token_maps, valid_token_mask = self._resolve_phrase_supervision(
             quality_logit,
             targets,
             token_candidate,
@@ -1469,14 +1354,15 @@ class GroundingLoss(nn.Module):
         if self.text_alignment_enabled and token_logits is not None:
             offsets = self._extract_metadata(quality_logit, token_offsets, "_token_offsets")
             phrase_logits = phrase_predictions(token_logits, offsets, valid_token_mask, effective_targets)
-            phrase_costs = [relation_cost(p, t, self.main_matcher.alignment_negative_weight) for p, t in zip(phrase_logits, effective_targets)]
+            if self.main_matcher.cost_alignment != 0:
+                phrase_costs = [relation_cost(p, t, self.main_matcher.alignment_negative_weight) for p, t in zip(phrase_logits, effective_targets)]
         assignments = self.main_matcher(
             pred_bbox=pred_bbox,
             pred_score_logit=quality_logit,
             targets=effective_targets,
             packed_targets=packed,
             score_cost_alpha=schedule.main_matcher_score_alpha,
-            pred_token_alignment_logit=token_logits if use_token_matching else None,
+            pred_phrase_matching=token_logits if use_token_matching else None,
             positive_token_maps=token_maps if use_token_matching else None,
             alignment_text_mask=valid_token_mask if use_token_matching else None,
             alignment_cost_alpha=alignment_match_alpha,
@@ -1497,6 +1383,8 @@ class GroundingLoss(nn.Module):
             hard_negative_alpha=schedule.hard_negative_alpha,
             negative_iou_ignore_thr=schedule.negative_iou_threshold,
             enable_extra_negative_losses=True,
+            objects_complete=[t.get("objects_complete", False) for t in effective_targets],
+            background_scale=background_scale,
         )
 
         zero = pred_bbox.new_zeros(())
@@ -1512,22 +1400,42 @@ class GroundingLoss(nn.Module):
             "rank_pair_count": zero,
             "extra_query_count": zero,
             "background_query_count": zero,
+            "background_candidate_count": zero,
+            "background_pair_count": zero,
+            "background_rank_pair_count": zero,
+            "background_bce": zero,
+            "background_rank": zero,
+            "ranking_negative_candidates": zero,
+            "ranking_hard_negative_candidates": zero,
+            "ranking_selected_negatives": zero,
+            "ranking_selected_hard_negatives": zero,
         }
         if phrase_logits is not None:
             alignment_loss, alignment_rank_loss, alignment_metrics = relation_loss(
                 phrase_logits, effective_targets, assignments, self.text_alignment_focal_gamma,
                 self.text_alignment_ranking_margin, self.text_alignment_negative_weight,
-                quality_logits=quality_logit)
+                quality_logits=quality_logit, pred_boxes=pred_bbox,
+                background_policy=self.background_policy, background_scale=background_scale,
+                ranking_top_k=self.ranking_negative_top_k,
+                ranking_preferred_quota=self.ranking_hard_negative_quota)
         alignment_weight = (
             self.text_alignment_loss_weight
             if lambda_text_alignment is None
             else max(0.0, float(lambda_text_alignment))
         )
         alignment_contrib = alignment_weight * schedule.alignment_alpha * alignment_loss
+        contrast_loss = zero
+        if self.ranking_contrast_weight > 0:
+            if ranking_visual_features is None or ranking_text_features is None or phrase_logits is None:
+                raise ValueError("Ranking contrast requires staged ROI/text features and phrase supervision")
+            contrast_loss = ranking_contrast_loss(
+                ranking_visual_features, ranking_text_features, offsets, valid_token_mask,
+                effective_targets, pred_bbox, self.ranking_contrast_temperature,
+                matching=token_logits if isinstance(token_logits, dict) else getattr(token_logits, "_phrase_matching", None))
+        ranking_order_contrib = self.text_alignment_ranking_weight * schedule.alignment_alpha * alignment_rank_loss
+        ranking_contrast_contrib = self.ranking_contrast_weight * schedule.alignment_alpha * contrast_loss
         alignment_rank_contrib = (
-            self.text_alignment_ranking_weight
-            * schedule.alignment_alpha
-            * alignment_rank_loss
+            ranking_order_contrib + ranking_contrast_contrib
         )
 
         aux_loss = zero
@@ -1537,28 +1445,25 @@ class GroundingLoss(nn.Module):
             "loss_score": zero,
             "matched": 0.0,
         }
-        aux_token_candidate = aux_pred_token_alignment_logit
-        if aux_token_candidate is None and aux_pred_text_alignment_logit is not None:
-            if aux_pred_text_alignment_logit.ndim == 3 and aux_pred_text_alignment_logit.shape[-1] != 1:
-                aux_token_candidate = aux_pred_text_alignment_logit
+        aux_token_candidate = aux_pred_phrase_matching
         if aux_pred_bbox is not None and aux_pred_score_logit is not None:
             aux_quality = aux_pred_quality_logit if aux_pred_quality_logit is not None else aux_pred_score_logit
             aux_token = self._extract_metadata(
                 aux_quality,
                 aux_token_candidate,
-                "_token_alignment_logits",
+                "_phrase_matching",
             )
             aux_phrases = (phrase_predictions(aux_token, offsets, valid_token_mask, effective_targets)
                            if phrase_logits is not None and aux_token is not None else None)
             aux_phrase_costs = ([relation_cost(p, t, self.aux_matcher.alignment_negative_weight) for p, t in zip(aux_phrases, effective_targets)]
-                                if aux_phrases is not None else None)
+                                if aux_phrases is not None and self.aux_matcher.cost_alignment != 0 else None)
             aux_assignments = self.aux_matcher(
                 pred_bbox=aux_pred_bbox,
                 pred_score_logit=aux_quality,
                 targets=effective_targets,
                 packed_targets=packed,
                 score_cost_alpha=schedule.aux_matcher_score_alpha,
-                pred_token_alignment_logit=aux_token if use_token_matching else None,
+                pred_phrase_matching=aux_token if use_token_matching else None,
                 positive_token_maps=token_maps if use_token_matching else None,
                 alignment_text_mask=valid_token_mask if use_token_matching else None,
                 alignment_cost_alpha=alignment_match_alpha,
@@ -1579,11 +1484,17 @@ class GroundingLoss(nn.Module):
                 hard_negative_alpha=0.0,
                 negative_iou_ignore_thr=0.0,
                 enable_extra_negative_losses=False,
+                objects_complete=[t.get("objects_complete", False) for t in effective_targets],
+                background_scale=background_scale,
             )
             if aux_phrases is not None:
                 aux_align, aux_rank, _ = relation_loss(aux_phrases, effective_targets, aux_assignments,
                     self.text_alignment_focal_gamma, self.text_alignment_ranking_margin,
-                    self.text_alignment_negative_weight, quality_logits=aux_quality)
+                    self.text_alignment_negative_weight, quality_logits=aux_quality,
+                    pred_boxes=aux_pred_bbox, background_policy=self.background_policy,
+                    background_scale=background_scale,
+                    ranking_top_k=self.ranking_negative_top_k,
+                    ranking_preferred_quota=self.ranking_hard_negative_quota)
                 aux_loss = aux_loss + schedule.alignment_alpha * (
                     alignment_weight * aux_align
                     + self.aux_text_alignment_ranking_weight * aux_rank)
@@ -1610,6 +1521,16 @@ class GroundingLoss(nn.Module):
             + identity_contrib
         )
         result: Dict[str, Any] = {
+            **{name: alignment_metrics[name].detach() for name in (
+                "ranking_negative_candidates", "ranking_hard_negative_candidates",
+                "ranking_selected_negatives", "ranking_selected_hard_negatives")},
+            "background_scale": float(background_scale),
+            "background_complete_images": float(sum(t.get("objects_complete", False) is True for t in effective_targets)),
+            "background_candidate_count": alignment_metrics["background_candidate_count"].detach(),
+            "background_pair_count": alignment_metrics["background_pair_count"].detach(),
+            "background_rank_pair_count": alignment_metrics["background_rank_pair_count"].detach(),
+            "loss_background_alignment": alignment_metrics["background_bce"].detach(),
+            "loss_background_rank": alignment_metrics["background_rank"].detach(),
             "loss": total.detach(),
             "loss_main_total": (
                 main_loss + alignment_contrib + alignment_rank_contrib + identity_contrib
@@ -1627,7 +1548,11 @@ class GroundingLoss(nn.Module):
             "loss_text_negative": alignment_loss.detach() if bool(negative_mask.any()) else zero,
             "loss_text_negative_contrib": alignment_contrib.detach() if bool(negative_mask.any()) else zero,
             "loss_rank": alignment_rank_contrib.detach(),
-            "loss_rank_raw": alignment_rank_loss.detach(),
+            "loss_rank_raw": (alignment_rank_loss + contrast_loss).detach(),
+            "loss_ranking_order": alignment_rank_loss.detach(),
+            "loss_ranking_contrast": contrast_loss.detach(),
+            "loss_ranking_order_contrib": ranking_order_contrib.detach(),
+            "loss_ranking_contrast_contrib": ranking_contrast_contrib.detach(),
             "loss_rank_contrib": alignment_rank_contrib.detach(),
             "lambda_rank": float(lambda_rank),
             "lambda_rank_eff": float(self.text_alignment_ranking_weight * schedule.alignment_alpha),
@@ -1644,13 +1569,13 @@ class GroundingLoss(nn.Module):
             "pairwise_ranking_enabled": False,
             "score_decoupled": True,
             "matcher_score_source": "quality_logit",
-            "matcher_alignment_source": "token_alignment_logits",
+            "matcher_alignment_source": "phrase_matching",
             "final_score_source": "quality_until_phrase_pooling",
             "negative_text_regression_matches": 0.0,
             "localization_query_rows": float((~negative_mask).sum().item()),
             "text_negative_query_rows": float(negative_mask.sum().item()),
             "text_alignment_enabled": self.text_alignment_enabled,
-            "text_alignment_active": use_token_matching,
+            "text_alignment_active": phrase_logits is not None and schedule.alignment_alpha > 0,
             "text_alignment_alpha": float(schedule.alignment_alpha),
             "lambda_text_alignment": float(alignment_weight),
             "text_alignment_positive_score_mean": alignment_metrics["positive_score_mean"].detach(),

@@ -126,19 +126,42 @@ def _validate_model_config(config: Dict[str, Any], path: str) -> None:
         path,
     )
 
-    _require_keys(
-        backbone,
-        (
-            "in_channels",
-            "base_channels",
-            "base_depths",
-            "width_multiple",
-            "depth_multiple",
-            "max_channels",
-        ),
-        "model.backbone",
-        path,
-    )
+    backbone_name = str(backbone.get("name", "bottlenet")).lower()
+    if backbone_name == "resnet50":
+        _require_keys(
+            backbone,
+            ("in_channels", "weights", "norm_eval"),
+            "model.backbone",
+            path,
+        )
+        if int(backbone["in_channels"]) != 3:
+            raise ValueError("ResNet50 requires model.backbone.in_channels = 3")
+        if backbone["weights"] not in (None, "IMAGENET1K_V1", "IMAGENET1K_V2"):
+            raise ValueError("Unsupported model.backbone.weights for ResNet50")
+        if not isinstance(backbone["norm_eval"], bool):
+            raise TypeError("model.backbone.norm_eval must be bool")
+    elif backbone_name == "bottlenet":
+        _require_keys(
+            backbone,
+            (
+                "in_channels",
+                "base_channels",
+                "base_depths",
+                "width_multiple",
+                "depth_multiple",
+                "max_channels",
+            ),
+            "model.backbone",
+            path,
+        )
+        base_channels = backbone["base_channels"]
+        base_depths = backbone["base_depths"]
+        if not isinstance(base_channels, (list, tuple)) or len(base_channels) != 5:
+            raise ValueError("model.backbone.base_channels must contain 5 values")
+        if not isinstance(base_depths, (list, tuple)) or len(base_depths) != 3:
+            raise ValueError("model.backbone.base_depths must contain 3 values")
+    else:
+        raise ValueError(f"Unsupported model.backbone.name: {backbone_name!r}")
     _require_keys(
         fpn,
         ("out_channels",),
@@ -159,20 +182,8 @@ def _validate_model_config(config: Dict[str, Any], path: str) -> None:
         path,
     )
 
-    base_channels = backbone["base_channels"]
-    base_depths = backbone["base_depths"]
     level_names = projector["level_names"]
     token_grids = projector["token_grids"]
-
-    if not isinstance(base_channels, (list, tuple)) or len(base_channels) != 5:
-        raise ValueError(
-            "model.backbone.base_channels must contain 5 values"
-        )
-
-    if not isinstance(base_depths, (list, tuple)) or len(base_depths) != 3:
-        raise ValueError(
-            "model.backbone.base_depths must contain 3 values"
-        )
 
     if not isinstance(level_names, (list, tuple)) or not level_names:
         raise ValueError(
@@ -410,6 +421,26 @@ def _parse_component_schedule(
     ]
 
 
+def _backbone_args(backbone: Dict[str, Any]) -> Dict[str, Any]:
+    name = str(backbone.get("name", "bottlenet")).lower()
+    if name == "resnet50":
+        return {
+            "name": name,
+            "in_channels": int(backbone["in_channels"]),
+            "weights": backbone["weights"],
+            "norm_eval": bool(backbone["norm_eval"]),
+        }
+    return {
+        "in_channels": int(backbone["in_channels"]),
+        "base_channels": tuple(int(value) for value in backbone["base_channels"]),
+        "base_depths": tuple(int(value) for value in backbone["base_depths"]),
+        "width_multiple": float(backbone["width_multiple"]),
+        "depth_multiple": float(backbone["depth_multiple"]),
+        "max_channels": int(backbone["max_channels"]),
+        "channel_divisor": int(backbone.get("channel_divisor", 8)),
+    }
+
+
 def cfg_to_args(
     model_cfg_all: Dict[str, Any],
     train_cfg_all: Dict[str, Any],
@@ -551,6 +582,7 @@ def cfg_to_args(
 
         # train
         epochs=train_cfg["epochs"],
+        localization_freeze_epochs=int(train_cfg.get("localization_freeze_epochs", 10)),
         batch_size=train_cfg["batch_size"],
         warmup_epochs=train_cfg["warmup_epochs"],
         num_workers=train_cfg["num_workers"],
@@ -575,38 +607,7 @@ def cfg_to_args(
         startup_smoke_test=train_cfg.get("startup_smoke_test", True),
 
         # model
-        backbone_config={
-            "in_channels": int(
-                backbone_cfg["in_channels"]
-            ),
-            "base_channels": tuple(
-                int(value)
-                for value in backbone_cfg[
-                    "base_channels"
-                ]
-            ),
-            "base_depths": tuple(
-                int(value)
-                for value in backbone_cfg[
-                    "base_depths"
-                ]
-            ),
-            "width_multiple": float(
-                backbone_cfg["width_multiple"]
-            ),
-            "depth_multiple": float(
-                backbone_cfg["depth_multiple"]
-            ),
-            "max_channels": int(
-                backbone_cfg["max_channels"]
-            ),
-            "channel_divisor": int(
-                backbone_cfg.get(
-                    "channel_divisor",
-                    8,
-                )
-            ),
-        },
+        backbone_config=_backbone_args(backbone_cfg),
 
         fpn_config={
             "out_channels": int(
@@ -1046,6 +1047,7 @@ def cfg_to_args(
         # log
         save_dir=log_cfg["save_dir"],
         weights_path=log_cfg.get("weights_path"),
+        weights_exclude_prefixes=tuple(log_cfg.get("weights_exclude_prefixes", ())),
         resume_path=log_cfg.get("resume_path"),
         prefer_ema=bool(log_cfg.get("prefer_ema", True)),
         save_latest_interval=log_cfg.get("save_latest_interval", 1),
@@ -1143,12 +1145,19 @@ def print_config_summary(
     total_image_tokens = sum(tokens_per_level.values())
 
     print(f"  hidden_dim   : {model['hidden_dim']}")
-    print(
-        f"  backbone     : width={backbone['width_multiple']}, "
-        f"depth={backbone['depth_multiple']}"
-    )
-    print(f"  base channels: {backbone['base_channels']}")
-    print(f"  base depths  : {backbone['base_depths']}")
+    backbone_name = str(backbone.get("name", "bottlenet")).lower()
+    if backbone_name == "resnet50":
+        print(
+            f"  backbone     : {backbone_name}, weights={backbone['weights']}, "
+            f"norm_eval={backbone['norm_eval']}"
+        )
+    else:
+        print(
+            f"  backbone     : {backbone_name}, width={backbone['width_multiple']}, "
+            f"depth={backbone['depth_multiple']}"
+        )
+        print(f"  base channels: {backbone['base_channels']}")
+        print(f"  base depths  : {backbone['base_depths']}")
     print(f"  fpn channels : {fpn['out_channels']}")
     print(f"  token grids  : {token_grids}")
     print(f"  token levels : {tokens_per_level}")
@@ -1209,48 +1218,11 @@ def print_config_summary(
     print(
         f"  aux matching : repeat_k="
         f"{score_sampling.get('max_positive_per_gt', 2)}, "
-        f"iou_thr={quality.get('iou_pos_thr', 0.10)}, "
+        f"iou_thr={score_sampling.get('min_extra_positive_iou', 0.30)}, "
         f"aux_score={quality.get('aux_score_enabled', False)}"
     )
-    print(
-        f"  class loss   : type={classification.get('type', 'ia_bce')}, "
-        f"ia_alpha={classification.get('ia_bce_alpha', 0.25)}, "
-        f"focal_alpha={classification.get('focal_alpha', 0.25)}, "
-        f"focal_gamma={classification.get('focal_gamma', 2.0)}, "
-        f"norm_gt={classification.get('normalize_by_num_gt', True)}, "
-        f"ignore_iou={classification.get('negative_iou_ignore_thr', 0.50)}, "
-        f"quality_warmup={quality.get('quality_warmup_epoch', 10)}"
-    )
-    print(
-        f"  duplicate    : enabled={duplicate.get('enabled', True)}, "
-        f"weight={duplicate.get('loss_weight', 0.10)}, "
-        f"margin={duplicate.get('margin', 0.25)}, "
-        f"bg_weight={duplicate.get('background_weight', 0.05)}, "
-        f"max_pairs={duplicate.get('max_pairs', 128)}, "
-        f"start={duplicate.get('start_epoch', 5)}"
-    )
-    print(
-        f"  hard negative: enabled={hard_negative.get('enabled', True)}, "
-        f"weight={hard_negative.get('loss_weight', 0.05)}, "
-        f"topk={hard_negative.get('topk', 10)}, "
-        f"max_iou={hard_negative.get('max_iou', 0.30)}, "
-        f"start={hard_negative.get('start_epoch', 10)}"
-    )
-    print(
-        f"  matcher sched: start="
-        f"{matcher_schedule.get('start_epoch', ranking.get('rank_start_epoch', 5))}, "
-        f"warmup="
-        f"{matcher_schedule.get('warmup_epoch', ranking.get('rank_warmup_epoch', 12))}, "
-        f"alpha_min="
-        f"{matcher_schedule.get('alpha_min', ranking.get('rank_alpha_min', 0.10))}"
-    )
-    print(
-        f"  pairwise rank: enabled={ranking.get('enabled', False)}, "
-        f"lambda={ranking.get('lambda_rank', 0.0)}, "
-        f"start={ranking.get('rank_start_epoch', 5)}, "
-        f"warmup={ranking.get('rank_warmup_epoch', 12)}"
-    )
-    print(f"  pos weight   : {pos_weight.get('value', 1.0)}")
+    print("  Quality Head : ROI IoU supervision, complete annotations required for background")
+    print(f"  freeze       : {training.get('localization_freeze_epochs', 10)} epochs")
     print(
         f"  eval         : metric={evaluation['best_metric']}, "
         f"score_thr={evaluation['score_thr']}, "
