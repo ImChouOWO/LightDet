@@ -36,7 +36,8 @@ The ResNet experiment completed 100 epochs, with the best Hit@1 of 52.28% at epo
 
 模型可使用多種文字條件查詢同一張影像，例如「單色紅色的船」與「含紅色的船」。同一個物件只保留一份定位框，描述關係由物件 ID 建立。
 
-目前資料集包含 10,733 張訓練影像與 2,683 張驗證影像。ResNet 實驗使用 `lightdet_grounding_resnet50_roi8_hardneg_log_100ep`，最佳 EMA checkpoint 位於 epoch 55：Hit@1 **52.28%**、Hit@5 **61.72%**、Hit@10 **68.50%**、Object Recall@10 **46.08%**、Set Success50 **3.61%**。
+目前資料集包含 10,733 張訓練影像與 2,683 張驗證影像。
+ResNet 實驗使用 `lightdet_grounding_resnet50_roi8_hardneg_log_100ep`，最佳 EMA checkpoint 位於 epoch 55：Hit@1 **52.28%**、Hit@5 **61.72%**、Hit@10 **68.50%**、Object Recall@10 **46.08%**、Set Success50 **3.61%**。
 
 **模組演進與績效比較**
 
@@ -50,8 +51,7 @@ The ResNet experiment completed 100 epochs, with the best Hit@1 of 52.28% at epo
 
 
 > [!NOTE]
->
->  加入 ROI 後，TextHit@1 從 27.93% 提升至 42.06%，支持局部視覺與語意監督這個階段的改善。ResNet 的融合 Hit@1 進一步達>  到 52.28%，但單獨使用 Alignment 排序的 TextHit@1 為 38.43%，語意排序仍有改善空間。
+> ResNet版本下 Hit@1 達 52.28%，但TextHit@1 為 38.43%，表示語意排序仍有改善空間。
 
 ResNet 在 epoch 45 已達 Hit@1 52.14%，epoch 55 最佳為 52.28%，epoch 100 為 50.96%；50 epoch 後候選定位仍改善，但語意排序沒有持續提升，因此使用最佳 checkpoint。
 
