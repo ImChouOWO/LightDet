@@ -42,17 +42,16 @@ The ResNet experiment completed 100 epochs, with the best Hit@1 of 52.28% at epo
 
 依主要架構變化分成三個階段。下表採各階段代表性實驗中、Hit@1 最佳 epoch 的同次驗證結果，均使用 `lightdet.grounding.v2`。
 
-| 階段 | 主要模組變化 | 最佳 epoch | Hit@1 | TextHit@1 | Oracle50 |
-|---|---|---:|---:|---:|---:|
-| 原始版本 | BottleNet＋FPN；使用全域影像／文字 context 評分，尚未以候選 BBox 的 ROI 限制評分視野；Main／Aux 提供定位監督 | 61 | 45.24% | 27.93% | 72.85% |
-| 加入 ROI | 依 BBox 從 FPN 擷取局部 ROI，加入 ROI refinement；Quality 與 Alignment 分開監督，並加入背景負例 | 45 | 45.88% | 42.06% | 73.99% |
-| 使用 ResNet | 改用預訓練 ResNet-50，沿用 FPN、ROI8 與描述匹配；Ranking 使用困難負例優先取樣及 log 分數比較 | 55 | 52.28% | 38.43% | 75.62% |
+| 階段 |  最佳 epoch | Hit@1 | TextHit@1 | Oracle50 |
+|---|---:|---:|---:|---:|
+| BottleNet＋FPN |  61 | 45.24% | 27.93% | 72.85% |
+| BottleNet＋FPN＋ROI |  45 | 45.88% | 42.06% | 73.99% |
+| ResNet＋FPN＋ROI |  55 | 52.28% | 38.43% | 75.62% |
+
 
 > [!NOTE]
-> 三階段分別以 `lightdet_grounding_v2_main_aux_split_100ep`（100 epoch）、`lightdet_grounding_roi5_background_100ep`（51 epoch）及 `lightdet_grounding_resnet50_roi8_hardneg_log_100ep`（100 epoch）作為代表。ROI 階段之間還曾加入對比學習、GT ROI 暖機與描述配對 MLP；這些是累積架構比較，不是只替換單一模組的嚴格消融。
-> ResNet 同時加入 ImageNet 正規化、固定 BN 統計、重建 FPN／影像投影，並取消前 10 epoch 定位凍結；其餘任務模組沿用 ROI8 phrase-pair E7 起始權重。不能將提升全部歸因於 Backbone。
-
-加入 ROI 後，TextHit@1 從 27.93% 提升至 42.06%，支持局部視覺與語意監督這個階段的改善。ResNet 的融合 Hit@1 進一步達到 52.28%，但單獨使用 Alignment 排序的 TextHit@1 為 38.43%，語意排序仍有改善空間。
+>
+>  加入 ROI 後，TextHit@1 從 27.93% 提升至 42.06%，支持局部視覺與語意監督這個階段的改善。ResNet 的融合 Hit@1 進一步達>  到 52.28%，但單獨使用 Alignment 排序的 TextHit@1 為 38.43%，語意排序仍有改善空間。
 
 ResNet 在 epoch 45 已達 Hit@1 52.14%，epoch 55 最佳為 52.28%，epoch 100 為 50.96%；50 epoch 後候選定位仍改善，但語意排序沒有持續提升，因此使用最佳 checkpoint。
 
@@ -60,14 +59,9 @@ ResNet 在 epoch 45 已達 Hit@1 52.14%，epoch 55 最佳為 52.28%，epoch 100 
 
 ![模型資料流](./img/dataFlow.png)
 
-```text
-Image + Text -> LightDet -> Main / Aux BBox + Quality + Alignment [Q,P]
-推論：sigmoid 轉為機率 -> sqrt(Quality × Alignment) -> 每個描述排序 -> threshold + NMS -> Result
-評估：未經 threshold / NMS 的原始候選 -> Hit@K / Object Recall@K / Oracle50
-訓練：唯一 GT BBox + Object–Phrase Relation -> 分別建立定位、Quality 與語意監督
-```
 
-Main 使用幾何成本的 Hungarian one-to-one matching；Aux 使用受 IoU 與成本限制的 one-to-many matching，只在訓練啟用。Hungarian 決定定位配對，不會替 GT 選出唯一描述。多描述關係由標記矩陣提供，Quality、Alignment 與 Ranking 分別計算 loss，再加權合併。GT ROI 暖機直接以 GT 框擷取 FPN ROI，提供額外語意監督。
+
+Main／Aux 分別採一對一／一對多定位配對，Aux 僅用於訓練。描述關係由標記矩陣提供，Quality、Alignment 與 Ranking 分別監督；GT ROI 暖機輔助語意學習。
 
 ### 模型結構
 
@@ -261,9 +255,9 @@ model:
 
 ## 模型設定
 
-原 BottleNet 設定：`units/model/cards/config/model.yaml`。ResNet 獨立設定：`units/model/cards/config/model_resnet50.yaml`。
+BottleNet 設定：`units/model/cards/config/model.yaml`
 
-目前 ResNet 關鍵設定：
+ResNet    設定：`units/model/cards/config/model_resnet50.yaml`。
 
 ```yaml
 model:
@@ -289,15 +283,11 @@ model:
   use_auxiliary_head: true
 ```
 
-影像 token grids 為 `24×24`、`12×12` 與 `10×10`。BBox conditioning 與 ROI 使用 detach 的框座標；語意 loss 不直接更新框座標，但定位與語意仍共用 FPN。ImageNet 正規化只在 ResNet 路徑執行，不重複套用至資料載入或 BottleNet。
 
 ---
 
 ## 訓練設定
 
-原實驗設定：`units/model/cards/config/train.yaml`。ResNet 獨立設定：`units/model/cards/config/train_resnet50.yaml`。
-
-ResNet 使用 100 epoch，從第一個 epoch 聯合訓練新影像分支與定位模組：
 
 ```yaml
 train:
@@ -331,7 +321,6 @@ log:
   resume_path: null
 ```
 
-排除舊影像分支後，ResNet 使用預訓練權重，FPN／Image Projector 重新初始化，其餘任務模組載入原 EMA 權重；optimizer 與排程重設。原 BottleNet 實驗保留於原目錄，不以 ResNet 輸出覆寫。
 
 ---
 
@@ -357,9 +346,10 @@ log:
 | Ranking | 結合雙向 log-margin 排序與對比學習，優先比較同圖語意困難負例，使正例分數高於負例 |
 | GT ROI 暖機 | 訓練初期以 GT 框擷取 ROI 輔助語意學習，再逐步移除 |
 
-背景標籤由預測框與全部 GT 的幾何關係建立，逐步加入監督。Ranking 中的 Quality 停止梯度，避免排序任務改變定位品質目標。
 
-各項 loss 加權合併；推論以 `sqrt(Quality × Alignment)` 排序，再以閾值與描述內 NMS 篩選結果。
+> 背景標籤由預測框與全部 GT 的幾何關係建立，逐步加入監督。Ranking 中的 Quality 停止梯度，避免排序任務改變定位品質目標。
+> 
+> 各項 loss 加權合併；推論以 `sqrt(Quality × Alignment)` 排序，再以閾值與描述內 NMS 篩選結果。
 
 ---
 
@@ -373,7 +363,7 @@ python3 units/model/train.py \
   --train-config units/model/cards/config/train_resnet50.yaml
 ```
 
-伺服器可將相同命令的入口改為 `units/model/_train.py`。原 BottleNet 使用 `model.yaml`／`train.yaml`；兩種模型由設定選擇，不覆寫原模型設定。啟動前執行 real-batch smoke test，確認資料、輸出與 loss 形狀；ResNet 路徑與權重轉移已通過 79 項測試及 6 張 1024 圖像的 BF16 forward／backward／optimizer 檢查。
+
 
 ---
 
@@ -394,9 +384,7 @@ log:
   resume_path: null
 ```
 
-此模式的 ResNet 仍依 `backbone.weights` 使用 ImageNet 預訓練；其他模組重新初始化。`weights_path` 用於新實驗的 weights-only warm start，只有恢復同一架構與實驗狀態時才使用 `resume_path`。
 
-`weights_exclude_prefixes: ["img_model."]` 僅用於從 BottleNet 切換至 ResNet 的轉移實驗。若載入已訓練的 ResNet checkpoint，應改為 `[]`，避免重建已學好的影像分支。Hit@1 任務使用 `best_hit_at_1.pt`，本輪最佳為 epoch 55；不使用 epoch 100 取代最佳 checkpoint。
 
 ---
 
