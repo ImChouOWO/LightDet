@@ -38,25 +38,23 @@ The ResNet experiment completed 100 epochs, with the best Hit@1 of 52.28% at epo
 
 目前資料集包含 10,733 張訓練影像與 2,683 張驗證影像。ResNet 實驗使用 `lightdet_grounding_resnet50_roi8_hardneg_log_100ep`，最佳 EMA checkpoint 位於 epoch 55：Hit@1 **52.28%**、Hit@5 **61.72%**、Hit@10 **68.50%**、Object Recall@10 **46.08%**、Set Success50 **3.61%**。
 
-**消融與版本比較**
+**模組演進與績效比較**
 
-以下採各實驗最後一次訓練序列中、Hit@1 最佳 epoch 的同次驗證數值；均使用 `lightdet.grounding.v2`。這些是累積版本實驗，初始化、排程與訓練長度並未完全控制，不能將差異歸因於單一模組。
+依主要架構變化分成三個階段。下表採各階段代表性實驗中、Hit@1 最佳 epoch 的同次驗證結果，均使用 `lightdet.grounding.v2`。
 
-| 實驗 | 已完成 epoch | 最佳 epoch | Hit@1 | TextHit@1 | Oracle50 |
-|---|---:|---:|---:|---:|---:|
-| 背景監督（BottleNet） | 51 | 45 | 45.88% | 42.06% | 73.99% |
-| 對比項（BottleNet） | 25 | 8 | 45.73% | 41.30% | 73.96% |
-| GT ROI 暖機（BottleNet） | 39 | 7 | 45.47% | 40.18% | 73.98% |
-| 描述匹配（BottleNet） | 69 | 8 | 45.38% | 39.51% | 73.97% |
-| 描述配對 MLP（BottleNet） | 17 | 7 | 44.98% | 38.70% | 73.96% |
-| 困難負例＋log（BottleNet，未完成） | 5 | 1 | 44.50% | 34.77% | 73.95% |
-| 困難負例＋log（ResNet-50） | 100 | 55 | 52.28% | 38.43% | 75.62% |
+| 階段 | 主要模組變化 | 最佳 epoch | Hit@1 | TextHit@1 | Oracle50 |
+|---|---|---:|---:|---:|---:|
+| 原始版本 | BottleNet＋FPN；使用全域影像／文字 context 評分，尚未以候選 BBox 的 ROI 限制評分視野；Main／Aux 提供定位監督 | 61 | 45.24% | 27.93% | 72.85% |
+| 加入 ROI | 依 BBox 從 FPN 擷取局部 ROI，加入 ROI refinement；Quality 與 Alignment 分開監督，並加入背景負例 | 45 | 45.88% | 42.06% | 73.99% |
+| 使用 ResNet | 改用預訓練 ResNet-50，沿用 FPN、ROI8 與描述匹配；Ranking 使用困難負例優先取樣及 log 分數比較 | 55 | 52.28% | 38.43% | 75.62% |
 
 > [!NOTE]
-> 實驗目錄名稱不是配置證據；例如名稱含 `roi16` 的描述匹配實驗，其後續報告實際使用 ROI8。BottleNet 的困難負例＋log 實驗在 epoch 6 中斷，只完成 5 個 epoch，不能用來判定新 loss 的最終效益。
-> ResNet 除 Backbone 外，也加入 ImageNet 正規化、固定 BN 統計、重建 FPN／影像投影，並取消前 10 epoch 定位凍結；其餘任務模組沿用相同的 ROI8 phrase-pair E7 起始權重。
+> 三階段分別以 `lightdet_grounding_v2_main_aux_split_100ep`（100 epoch）、`lightdet_grounding_roi5_background_100ep`（51 epoch）及 `lightdet_grounding_resnet50_roi8_hardneg_log_100ep`（100 epoch）作為代表。ROI 階段之間還曾加入對比學習、GT ROI 暖機與描述配對 MLP；這些是累積架構比較，不是只替換單一模組的嚴格消融。
+> ResNet 同時加入 ImageNet 正規化、固定 BN 統計、重建 FPN／影像投影，並取消前 10 epoch 定位凍結；其餘任務模組沿用 ROI8 phrase-pair E7 起始權重。不能將提升全部歸因於 Backbone。
 
-ResNet 在 epoch 45 已達 Hit@1 52.14%，epoch 55 最佳為 52.28%，epoch 100 則為 50.96%。Oracle50 從 epoch 50 的 74.74% 升至 76.63%，但 TextHit@1 從 38.89% 降至 36.76%；較好的候選定位沒有持續轉成較好的語意排序。使用最佳 checkpoint，不以最後一個 epoch 代表最佳表現。
+加入 ROI 後，TextHit@1 從 27.93% 提升至 42.06%，支持局部視覺與語意監督這個階段的改善。ResNet 的融合 Hit@1 進一步達到 52.28%，但單獨使用 Alignment 排序的 TextHit@1 為 38.43%，語意排序仍有改善空間。
+
+ResNet 在 epoch 45 已達 Hit@1 52.14%，epoch 55 最佳為 52.28%，epoch 100 為 50.96%；50 epoch 後候選定位仍改善，但語意排序沒有持續提升，因此使用最佳 checkpoint。
 
 ### 模型資料流
 
@@ -341,52 +339,27 @@ log:
 
 ### Main branch
 
-每個唯一物件只進行一次 Hungarian one-to-one matching：
-
-```text
-BBox L1 + GIoU（目前 Quality／Alignment matching cost 均為 0）
-              ↓
-       Query ↔ unique object
-```
+以 BBox L1＋GIoU 成本進行 Hungarian one-to-one matching，每個唯一 GT 物件配對一個 query，提供定位監督。
 
 ### Auxiliary branch
 
-每個 GT 從成本矩陣選擇最多 3 個候選 query，且必須滿足 IoU ≥ 0.30。候選由 cost 排序並解決 query 衝突，僅用於訓練輔助監督。
+每個 GT 最多配對 3 個 query，且 IoU ≥ 0.30，提供額外定位、Quality 與 Alignment 監督；僅用於訓練。
 
 ### Relation loss
 
-從全部 queries 篩選唯一對應 GT 且 IoU ≥ 0.5 的候選，再依物件 ID 查詢關係矩陣：
+將唯一對應 GT 且 IoU ≥ 0.5 的 query，依物件 ID 連結描述關係矩陣，建立正例、負例與忽略標籤。
 
-```text
-query × phrase → positive / negative / ignore
-```
-
-整體 loss 為 Main 定位＋Quality、Alignment、Ranking、加權 Aux，以及 GT ROI 暖機：
-
-| 項目 | 監督與目前權重 |
+| Loss | 運作機制 |
 |---|---|
-| BBox／GIoU | Hungarian 配對後回歸 GT；L1 權重 5→3.5，GIoU 權重 2 |
-| Quality | IoU ≥ 0.5 候選的最大 GT IoU；可靠背景目標為 0；權重 1→4 |
-| Alignment | 關係矩陣的 masked focal BCE；正例 1、負例 0、未知忽略；權重 1 |
-| Ranking | 0.25×雙向 log-margin 排序＋0.01×雙向對比項；語意暖機 7 epoch |
-| Aux | 定位、Quality 與 Alignment 整組乘 0.25，另有暖機與後期衰減；Aux Ranking 權重目前為 0 |
-| GT ROI | GT 框擷取乾淨 ROI，提供 Alignment、排序與對比項；前 5 epoch 權重 0.5，第 15 epoch 降至 0 |
+| BBox／GIoU | 讓配對 query 的預測框接近 GT |
+| Quality | 學習預測框與 GT 的最大 IoU，可靠背景目標為 0 |
+| Alignment | 使用 focal BCE，學習物件是否符合各段描述；未知關係忽略 |
+| Ranking | 結合雙向 log-margin 排序與對比學習，優先比較同圖語意困難負例，使正例分數高於負例 |
+| GT ROI 暖機 | 訓練初期以 GT 框擷取 ROI 輔助語意學習，再逐步移除 |
 
-融合與排序中的 Quality／Alignment 使用 sigmoid 後機率；Focal BCE 使用 logits。雙向排序使用 hinge loss `ReLU(margin − log(s_positive) + log(s_negative))`：
+背景標籤由預測框與全部 GT 的幾何關係建立，逐步加入監督。Ranking 中的 Quality 停止梯度，避免排序任務改變定位品質目標。
 
-```text
-同一描述／不同物件：s = sqrt(detach(Quality) × Alignment)
-同一物件／不同描述：s = Alignment
-margin = ln(2)：要求正例分數至少是負例的 2 倍
-```
-
-兩方向各取最多 5 個已知負例，優先保留最多 3 個與描述共享顏色但關係為負的候選，再補入其餘高分負例。同一物件的多個正確描述／同一描述的多個正確物件不互相競爭；未知關係不被取樣。重複 query 以每物件候選數倒數加權，物件方向每個負例 GT 只保留最高分候選。
-
-Quality 在 Ranking 中 detach。同樣的 log margin 在 Quality 相同時，物件方向需要 Alignment 正／負比 ≥4，描述方向則 ≥2；GT ROI 的兩方向都使用 Alignment。對比項使用同一匹配 affinity，temperature=0.1，不另外建立一套推論分數。
-
-背景監督由全部 GT 與預測框的幾何關係建立：最大 IoU ≤0.2、中心不在 GT 內，且交集／候選面積與交集／GT 面積皆 ≤0.2。目前訓練依使用者確認的完整標記對所有影像啟用，不需修改 JSON；分數只用來選高分背景，不決定正負標籤。前 5 epoch 停用，第 6–10 epoch 逐步加入 Quality、Alignment 與 Ranking 背景 loss。IoU 中間區間及模糊對應不強制標為背景。
-
-推論依描述融合分數，使用 `score_thr=0.5` 與 NMS IoU=0.5；Quality 與 Alignment 的定位／語意任務分開。Matching cost 沒有加入文字分數，不啟用舊 duplicate-suppression loss；重複輸出由描述內 NMS 處理。困難負例候選數與實際選入數另記錄於訓練指標。
+各項 loss 加權合併；推論以 `sqrt(Quality × Alignment)` 排序，再以閾值與描述內 NMS 篩選結果。
 
 ---
 
