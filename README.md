@@ -43,11 +43,11 @@ ResNet 實驗使用 `lightdet_grounding_resnet50_roi8_hardneg_log_100ep`；既�
 
 使用相同驗證集（2,683 張影像、17,395 段描述）及 GREC 官方參考評估規則重新計算；Acc@0.5 僅計入 11,392 段單目標描述。
 
-| 階段 | 主要模組變化 | checkpoint epoch | GREC Pr@(F1=1) | 單目標 Acc@0.5 | N-acc |
-|---|---|---:|---:|---:|---:|
-| 原始版本 | BottleNet＋FPN，全域特徵評分 | 61 | 13.11% | 43.11% | N/A |
-| 加入 ROI | FPN 局部 ROI、Quality／Alignment 解耦與背景監督 | 45 | 0.79% | 43.07% | N/A |
-| 使用 ResNet | ResNet-50、ROI8、描述匹配與困難負例 log Ranking | 55 | 0.59% | 49.45% | N/A |
+| 階段 | checkpoint epoch | GREC Pr@(F1=1) | 單目標 Acc@0.5 | N-acc |
+|---|---:|---:|---:|---:|
+| Baseline | 61 | 13.11% | 43.11% | N/A |
+| Baseline + ROI  | 45 | 0.79% | 43.07% | N/A |
+| ResNe + ROI | 55 | 0.59% | 49.45% | N/A |
 
 > [!NOTE]
 > 以上使用過去依 Hit@1 選出的 EMA checkpoint，並非各實驗的最佳 GREC checkpoint；原始版與 ROI 版由完整預測重算，ResNet 版重新驗證。這些是累積版本比較，初始化與排程未完全控制，不能歸因於單一模組。驗證集沒有無目標描述，因此 N-acc 為 N/A。
