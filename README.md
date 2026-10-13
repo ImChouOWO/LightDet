@@ -14,11 +14,11 @@ Image + Expression -> Text-conditioned Dense CNN -> BBox + ROI Scores -> Target 
 <details>
 <summary><em>當前限制 / Current Limitations</em></summary>
 
-此版本尚未完成正式訓練，沒有可報告的模型績效。gRefCOCO 的官方 val 標記沒有單目標樣本，因此該切分的 Acc@0.5 為 N/A；testA／testB 保留單目標評估。
+此版本正在訓練，尚未完成完整訓練與 testA／testB 評估。gRefCOCO 的官方 val 標記沒有單目標樣本，因此該切分的 Acc@0.5 為 N/A；testA／testB 保留單目標評估。
 
 ---
 
-This branch has not completed training. The downloaded official gRefCOCO validation annotations contain no single-target references, so single-target Acc@0.5 is N/A on val and is reported on testA/testB.
+Training is ongoing; full training and testA/testB evaluation are not yet complete. The downloaded official gRefCOCO validation annotations contain no single-target references, so single-target Acc@0.5 is N/A on val and is reported on testA/testB.
 
 </details>
 
@@ -39,23 +39,15 @@ This branch has not completed training. The downloaded official gRefCOCO validat
 
 ### 模型資料流
 
-```text
-Image -> ResNet-50 -> FPN Maps ---------------------------> ROI Align
-                         |                                    ^
-Expression -> MiniLM -> Text Tokens + Phrase Feature           |
-                         |                                    |
-                  Spatial Text/Image Fusion                   |
-                         |                                    |
-                    Dense CNN -> Dense Boxes -> Top-100 Boxes -+
-                                                    |
-                                    Local ROI Refinement
-                                                    |
-                           Quality / Alignment / Selection
-                                                    |
-                              Score Threshold -> NMS -> Target Set
-```
+![模型資料流](./dataFlow.png)
+
+> 輸入 Image 與 Expression，訓練時另提供 GT。Alignment 與 Quality 經 sigmoid 後融合，再加上 Selection Residual 得到 Selection Logits；Final Score 經分數閾值與 NMS 產生結果。圖中的 Residual 不會產生 Alignment；Hungarian 同時使用預測與 GT 配對，其他監督直接使用候選與 GT。
 
 ### 模型結構
+
+![模型架構](./LightDet.png)
+
+> 候選框從原始 FPN feature maps 擷取 8×8 ROI。BBox Embedding 由預測框座標產生，與 ROI mean pool 相加後形成 refinement query；Quality Head 使用原始 ROI mean pool。文字特徵另傳入 Alignment 與 Selection Head。
 
 | 模組 | 功能 |
 |---|---|
@@ -68,7 +60,16 @@ Expression -> MiniLM -> Text Tokens + Phrase Feature           |
 | Alignment | ROI 與描述的正規化相似度，判斷是否符合描述 |
 | Selection | 描述條件下的保留／丟棄分數，對一對一代表框監督，抑制重複輸出 |
 
-先融合 `sqrt(sigmoid(Quality) × sigmoid(Alignment))`，轉成 logit 後加上 Selection 的校準殘差，最後用 sigmoid 得到保留分數。Quality 在這條監督路徑停止梯度，Selection loss 與 Ranking loss 都使用最終分數。多段描述推論會重用同一份 FPN 特徵。
+| 項目 | 功用 |
+|---|---|
+| **Quality Logits** | 預測框的定位品質；經 sigmoid 轉成 Quality 機率，學習與已標記 COCO 物件的最大 IoU。 |
+| **Alignment Logits** | 評估 ROI 與輸入描述的語意匹配程度；經 sigmoid 轉成 Alignment 機率。 |
+| **Selection Residual** | 根據 ROI 與文字的聯合特徵，學習修正基礎融合分數；它本身不是機率。 |
+| **Score Fusion** | 先計算 `base = √(Quality × Alignment)`，再計算 `logit(base) + Selection Residual`。 |
+| **logit** | 將機率轉為實數分數：`log(p / (1-p))`，讓 Residual 能以加法修正。 |
+| **Selection Logits** | 融合後的最終分數，供 Selection Loss 使用；經 sigmoid 得到 Final Score，Ranking Loss 比較其 log 分數。 |
+
+Quality 在融合監督路徑停止梯度；`base` 限制於 `[1e-6, 1−1e-6]`，避免 logit 出現無限值。多段描述推論重用同一份 FPN 特徵。
 
 ---
 
