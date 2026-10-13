@@ -1,23 +1,27 @@
-# Python cache
+# Python and environments
 __pycache__/
 *.py[cod]
-
-# Virtual environment
 venv/
 .venv/
+.DS_Store
+.vscode/
+.idea/
 
-# Output / logs
-output/
-outputs/
-logs/
-*.log
+# Downloaded data; retain the existing directory structure
+datasets/images/*
+!datasets/images/.gitkeep
+datasets/labels/*
+!datasets/labels/.gitkeep
+datasets/pre/*.zip
+datasets/pre/*.tar
+units/model/bert/*
+!units/model/bert/.gitkeep
+units/model/resnet/*
+!units/model/resnet/checkpoints/
+units/model/resnet/checkpoints/*
+!units/model/resnet/checkpoints/.gitkeep
 
-
-# Dataset
-datasets/images/
-datasets/labels/
-
-# Model weights / checkpoints
+# Checkpoints and generated outputs
 *.pt
 *.pth
 *.ckpt
@@ -25,22 +29,17 @@ datasets/labels/
 *.onnx
 *.engine
 *.safetensors
-
-# Model generated artifacts
+*.gz
+*.log
+output/
+outputs/
+logs/
+units/model/_train.py
 units/model/checkpoints/
 units/model/bert_cache/
-units/model/resnet/checkpoints/
-units/model/cards/config/train_pos.yaml
-units/model/_train.py
-# Large pretrained model folders
-units/model/bert/
-units/model/resnet/
-
-# macOS / editor
-.DS_Store
-.vscode/
-.idea/
+units/model/runs/*
+!units/model/runs/train/
+units/model/runs/train/*
+!units/model/runs/train/.gitkeep
+units/runs/
 .relation_update_backup/
-
-# Compressed generated reports
-*.gz
