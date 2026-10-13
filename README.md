@@ -1,9 +1,13 @@
 # LightDet-gRef
 
 ![Framework](https://img.shields.io/badge/framework-PyTorch-EE4C2C)
+![Architecture](https://img.shields.io/badge/architecture-Dense%20CNN%20%2B%20FPN%20%2B%20ROI-8A2BE2)
+![Modality](https://img.shields.io/badge/input-Text%20%2B%20Image-2F80ED)
 ![Backbone](https://img.shields.io/badge/backbone-ResNet--50-2F80ED)
 ![Dataset](https://img.shields.io/badge/dataset-gRefCOCO-4CAF50)
 ![Text](https://img.shields.io/badge/text-Multilingual%20MiniLM-8A2BE2)
+![Precision](https://img.shields.io/badge/precision-BF16%20AMP-FF9800)
+![Status](https://img.shields.io/badge/status-active%20research-yellow)
 
 文字引導的零／單／多目標物件定位。此分支使用 gRefCOCO、Multilingual MiniLM 與文字條件化的密集 CNN，移除原 Localization Transformer 與舊船舶資料流程。
 
@@ -41,24 +45,27 @@ Training is ongoing; full training and testA/testB evaluation are not yet comple
 
 ![模型資料流](./dataFlow.png)
 
-> 輸入 Image 與 Expression，訓練時另提供 GT。Alignment 與 Quality 經 sigmoid 後融合，再加上 Selection Residual 得到 Selection Logits；Final Score 經分數閾值與 NMS 產生結果。圖中的 Residual 不會產生 Alignment；Hungarian 同時使用預測與 GT 配對，其他監督直接使用候選與 GT。
+輸入 Image 與 Expression，訓練時另提供 GT。Quality、Alignment 與 Selection Residual 融合為最終分數，再經分數閾值與 NMS 輸出目標集合；Hungarian 配對與候選監督共同計算 loss。
 
 ### 模型結構
 
 ![模型架構](./LightDet.png)
 
-> 候選框從原始 FPN feature maps 擷取 8×8 ROI。BBox Embedding 由預測框座標產生，與 ROI mean pool 相加後形成 refinement query；Quality Head 使用原始 ROI mean pool。文字特徵另傳入 Alignment 與 Selection Head。
-
-| 模組 | 功能 |
+| 模組 | 說明 |
 |---|---|
-| ResNet-50／FPN | ImageNet 預訓練骨幹；保留 stride 8／16／32 空間特徵，固定 BN 統計 |
-| Multilingual MiniLM | 凍結多語編碼器；token 特徵 384→256，保留可訓練文字投影 |
-| Spatial Fusion | 影像位置編碼、token 相似度加權文字與 FiLM 條件融合 |
-| Dense Localization CNN | 三層密集連接卷積，在每個 FPN 位置預測框中心、寬高及描述目標分數；沒有 learnable localization queries |
-| ROI Align／Refinement | 每個候選取 8×8 FPN ROI，再執行 ROI 自身的局部注意力 |
-| Quality | 預測候選框與已標記 COCO 物件的最大 IoU |
-| Alignment | ROI 與描述的正規化相似度，判斷是否符合描述 |
-| Selection | 描述條件下的保留／丟棄分數，對一對一代表框監督，抑制重複輸出 |
+| `ResNet-50` | ImageNet 預訓練骨幹，輸出 stride 8／16／32 特徵；固定 BN 統計 |
+| `FPN` | 融合三個尺度並統一至 256 通道，供 Dense CNN 與原始 ROI 擷取使用 |
+| `Multilingual MiniLM` | 凍結多語編碼器；可訓練文字投影將 token 特徵由 384 轉為 256 維 |
+| `Spatial Fusion` | 影像位置編碼、token 相似度加權文字與 FiLM 條件融合 |
+| `Dense Localization CNN` | 三層密集連接卷積，預測框中心、寬高與描述目標分數；選取 Top-100 候選 |
+| `ROI Align` | 根據候選 BBox，從原始 FPN feature maps 擷取 8×8 局部特徵 |
+| `BBox Embedding` | 編碼預測框座標，與 ROI mean pool 相加後形成 refinement query |
+| `Text-Alignment Transformer` | Query 對每個 ROI 自身的 64 個 tokens 執行局部 refinement，不讀取文字或其他候選 |
+| `Quality Head` | 使用原始 ROI mean pool，預測與已標記 COCO 物件的最大 IoU |
+| `Alignment Head` | ROI／文字投影後計算正規化相似度，輸出語意匹配 logits |
+| `Selection Head` | ROI 與文字聯合特徵經 MLP 產生校準殘差，修正保留／丟棄分數 |
+
+**評分輸出與融合**
 
 | 項目 | 功用 |
 |---|---|
@@ -69,7 +76,7 @@ Training is ongoing; full training and testA/testB evaluation are not yet comple
 | **logit** | 將機率轉為實數分數：`log(p / (1-p))`，讓 Residual 能以加法修正。 |
 | **Selection Logits** | 融合後的最終分數，供 Selection Loss 使用；經 sigmoid 得到 Final Score，Ranking Loss 比較其 log 分數。 |
 
-Quality 在融合監督路徑停止梯度；`base` 限制於 `[1e-6, 1−1e-6]`，避免 logit 出現無限值。多段描述推論重用同一份 FPN 特徵。
+圖中 BBox Embedding 的輸入實際為框座標，Quality Head 的輸入為原始 ROI mean pool；Selection Residual 不產生 Alignment Logits，融合必須同時使用 Quality 與 Alignment。Quality 在融合監督路徑停止梯度；`base` 限制於 `[1e-6, 1−1e-6]`，避免 logit 出現無限值。多段描述推論重用同一份 FPN 特徵。
 
 ---
 
