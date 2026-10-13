@@ -106,7 +106,7 @@ class DenseLocalizationCNN(nn.Module):
             fused = self.merge(torch.cat(parts, 1))
             y, xcoord = torch.meshgrid(torch.arange(h,device=x.device),torch.arange(w,device=x.device),indexing='ij')
             centers = torch.stack([(xcoord+.5)/w,(y+.5)/h],-1).reshape(-1,2)
-            stride = feature.new_tensor([1/w,1/h])
+            stride = torch.tensor([1/w,1/h],device=feature.device,dtype=torch.float32)
             regression = self.box(fused).flatten(2).transpose(1,2)
             predicted_center = centers[None]+regression[:,:,:2].tanh()*stride*2
             size = F.softplus(regression[:,:,2:])*stride*4
@@ -208,17 +208,21 @@ class VisionTextModel(nn.Module):
                     rest = ids[i][~torch.isin(ids[i],guided)]
                     ids[i] = torch.cat([guided,rest])[:count]
         boxes = dense['boxes'].gather(1,ids[...,None].expand(-1,-1,4)).clamp(0,1)
-        alignment,quality,selection = self.score_rois(features,boxes,pooled_text,images.shape[-2:])
+        teacher_count = max((len(target['boxes']) for target in targets),default=0) if gt_roi and targets is not None else 0
+        scoring_boxes = boxes
+        if teacher_count:
+            truth = boxes.new_zeros(len(boxes),teacher_count,4)
+            for i,target in enumerate(targets):
+                truth[i,:len(target['boxes'])] = target['boxes']
+            scoring_boxes = torch.cat([boxes,truth],1)
+        all_alignment,all_quality,all_selection = self.score_rois(features,scoring_boxes,pooled_text,images.shape[-2:])
+        alignment,quality,selection = all_alignment[:,:count],all_quality[:,:count],all_selection[:,:count]
         base = torch.sqrt(quality.detach().float().sigmoid()*alignment.float().sigmoid()).clamp(1e-6,1-1e-6)
         selection = torch.logit(base)+selection.float()
         scores = selection.sigmoid()
         outputs = dict(boxes=boxes,scores=scores,quality_logits=quality,
                        alignment_logits=alignment,selection_logits=selection,dense=dense)
         if gt_roi and targets is not None:
-            outputs['gt_alignment_logits'] = []
-            for i,target in enumerate(targets):
-                if len(target['boxes']):
-                    local = OrderedDict((name,value[i:i+1]) for name,value in features.items())
-                    teacher,_,_ = self.score_rois(local,target['boxes'][None],pooled_text[i:i+1],images.shape[-2:])
-                    outputs['gt_alignment_logits'].append(teacher.flatten())
+            outputs['gt_alignment_logits'] = [all_alignment[i,count:count+len(target['boxes'])]
+                for i,target in enumerate(targets) if len(target['boxes'])]
         return outputs

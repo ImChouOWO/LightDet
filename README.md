@@ -157,7 +157,7 @@ python3 units/tool/getResNet.py
 
 ## 資料取樣
 
-訓練每 epoch 訪問每個 reference 一次，依 epoch 輪替句子。每張圖最多四段描述先組為區塊，再隨機組批；所有目標類型保留原始分布，不重複抽樣、不丟棄最後一批。同圖描述在 batch 中共用一次 ResNet／FPN 計算。驗證使用全部 sentences。
+訓練每 epoch 訪問每個 reference 一次，依 epoch 輪替句子。每張圖最多四段描述先組為區塊，再隨機組批；所有目標類型保留原始分布，不重複抽樣、不丟棄最後一批。同圖描述在 batch 中共用一次 ResNet／FPN 計算；合併 tensor 傳輸並快取近期縮放影像。GT 的密集幾何標籤在 CPU workers 建立，不於 loss 中逐樣本同步 GPU。驗證使用全部 sentences。
 
 ---
 
@@ -185,7 +185,7 @@ model:
 
 ## 訓練設定
 
-設定檔：`units/model/cards/config/train.yaml`。訓練 100 epoch、batch size 8、640 影像，使用 BF16、梯度裁切及 最多 2,000 step LR 暖機。預訓練 ResNet 使用較低學習率；新 FPN／定位／評分 heads 使用較高學習率。
+設定檔：`units/model/cards/config/train.yaml`。訓練 100 epoch、batch size 64、640 影像，使用 BF16、梯度裁切及 最多 250 step LR 暖機（維持約 16,000 組描述的暖機量）。預訓練 ResNet 使用較低學習率；新 FPN／定位／評分 heads 使用較高學習率。
 
 初期 5 epoch 保留靠近 GT 中心的預測候選；GT ROI 語意輔助權重前 5 epoch 為 0.5，第 15 epoch 歸零。GT 引導僅用於訓練，驗證與推論完全使用模型候選。
 
@@ -203,7 +203,7 @@ model:
 | Ranking | 比較保留候選與高分負例的最終 log 分數；Quality 停止梯度 |
 | GT ROI 暖機 | 直接從 GT 框取得 ROI，輔助早期語意學習 |
 
-Matching 只在 loss 中配對候選與 GT，沒有 Localization Transformer、Main／Aux queries 或舊顏色關係矩陣。
+Matching 成本整批回傳 CPU，逐筆求解後一次傳回配對；逐框 GIoU 直接計算，不建立完整成對矩陣。GT ROI 與一般候選合併評分。Matching 只在 loss 中配對候選與 GT，沒有 Localization Transformer、Main／Aux queries 或舊顏色關係矩陣。
 
 ---
 

@@ -1,5 +1,5 @@
 """Native gRefCOCO references; one expression can have zero, one, or many targets."""
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import json
 from pathlib import Path
 import random
@@ -8,11 +8,23 @@ import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import Dataset, Sampler, DataLoader
+from units.model.cards.loss import assign_dense_targets
 
 
 class GRefCOCODataset(Dataset):
     def __init__(self, dataset_dir, split, image_size=640, training=False, seed=49):
         self.root, self.split = Path(dataset_dir), split
+        self._image_cache = OrderedDict()
+        if image_size % 32:
+            raise ValueError('image_size must be divisible by 32')
+        points,strides,levels = [],[],[]
+        for level,stride in enumerate((8,16,32)):
+            size = image_size//stride
+            y,x = torch.meshgrid(torch.arange(size),torch.arange(size),indexing='ij')
+            points.append(torch.stack([(x+.5)/size,(y+.5)/size],-1).reshape(-1,2))
+            strides.append(torch.full((size*size,2),1/size))
+            levels.append(torch.full((size*size,),level,dtype=torch.long))
+        self.dense_geometry = dict(points=torch.cat(points),strides=torch.cat(strides),levels=torch.cat(levels))
         self.image_size, self.training, self.seed, self.epoch = image_size, training, seed, 0
         records = json.loads((self.root/'labels/grefs(unc).json').read_text())
         instances = json.loads((self.root/'labels/instances.json').read_text())
@@ -57,15 +69,22 @@ class GRefCOCODataset(Dataset):
         if not isinstance(text,str) or not text.strip():
             raise ValueError('Missing referring expression')
         info = self.images[ref['image_id']]
-        with Image.open(self.root/'images'/info['file_name']) as source:
-            image = source.convert('RGB')
-            width,height = image.size
-            scale = self.image_size/max(width,height)
-            resized = image.resize((max(1,round(width*scale)),max(1,round(height*scale))),Image.Resampling.BILINEAR)
-            canvas = Image.new('RGB',(self.image_size,self.image_size),(124,116,104))
-            canvas.paste(resized,(0,0))
-            tensor = torch.from_numpy(np.array(canvas)).permute(2,0,1)
-        sx,sy = resized.width/width,resized.height/height
+        key = info['file_name']
+        if key not in self._image_cache:
+            with Image.open(self.root/'images'/key) as source:
+                image = source.convert('RGB')
+                width,height = image.size
+                scale = self.image_size/max(width,height)
+                resized = image.resize((max(1,round(width*scale)),max(1,round(height*scale))),Image.Resampling.BILINEAR)
+                canvas = Image.new('RGB',(self.image_size,self.image_size),(124,116,104))
+                canvas.paste(resized,(0,0))
+                tensor = torch.from_numpy(np.array(canvas)).permute(2,0,1)
+                self._image_cache[key] = (tensor,width,height,resized.width,resized.height)
+            if len(self._image_cache)>16:
+                self._image_cache.popitem(last=False)
+        self._image_cache.move_to_end(key)
+        tensor,width,height,rw,rh = self._image_cache[key]
+        sx,sy = rw/width,rh/height
         def boxes(annotations):
             result=[]
             for ann in annotations:
@@ -79,11 +98,14 @@ class GRefCOCODataset(Dataset):
         anns = [self.annotations[i] for i in ids]
         if any(a['image_id']!=ref['image_id'] for a in anns):
             raise ValueError('Reference points to another image')
-        return dict(image=tensor,text=text,boxes=boxes(anns),
+        item = dict(image=tensor,text=text,boxes=boxes(anns),
                     all_boxes=boxes(self.image_annotations[ref['image_id']]),
                     ref_id=ref['ref_id'],sent_id=sentence['sent_id'],image_id=ref['image_id'],
-                    object_ids=ids,valid_size=torch.tensor([resized.width,resized.height])/self.image_size,
+                    object_ids=ids,valid_size=torch.tensor([rw,rh])/self.image_size,
                     group=min(len(ids),2))
+        if self.training:
+            item['dense_owner'],item['dense_valid'] = assign_dense_targets(self.dense_geometry,item)
+        return item
 
 
 class GRefBatchSampler(Sampler):
@@ -118,9 +140,24 @@ def grounding_collate_fn(items):
         if image_id not in positions:
             positions[image_id]=len(images);images.append(item['image'])
         indices.append(positions[image_id])
+    targets=[{k:v for k,v in item.items() if k not in ('image','text')} for item in items]
+    packed={key:torch.cat([item[key] for item in items],0) for key in ('boxes','all_boxes')}
+    packed['valid_size']=torch.stack([item['valid_size'] for item in items])
+    if 'dense_owner' in items[0]:
+        for key in ('dense_owner','dense_valid'):
+            packed[key]=torch.stack([item[key] for item in items])
+    offsets={}
+    for key in ('boxes','all_boxes'):
+        start=0;offsets[key]=[]
+        for target in targets:
+            end=start+len(target[key]);offsets[key].append((start,end))
+            target[key]=packed[key][start:end];start=end
+    for i,target in enumerate(targets):
+        for key in packed:
+            if key not in offsets:target[key]=packed[key][i]
     return dict(images=torch.stack(images),image_indices=torch.tensor(indices),
-                texts=[item['text'] for item in items],
-                targets=[{k:v for k,v in item.items() if k not in ('image','text')} for item in items])
+                texts=[item['text'] for item in items],targets=targets,
+                packed_targets=packed,target_offsets=offsets)
 
 
 def build_dataloader(dataset, batch_size, workers):

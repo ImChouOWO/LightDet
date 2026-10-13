@@ -3,13 +3,22 @@ import torch
 from torchvision.ops import nms
 
 
-def prepare_model_batch(batch,tokenizer,device,max_length):
+def prepare_model_batch(batch,tokenizer,device,max_length,move_targets=True):
     tokens=tokenizer(batch['texts'],padding=True,truncation=False,return_tensors='pt')
     if tokens['input_ids'].shape[1]>max_length:
         raise ValueError('Expression exceeds text_max_length')
     tokens={k:v.to(device,non_blocking=True) for k,v in tokens.items() if k in ('input_ids','attention_mask','token_type_ids')}
     images=batch['images'].to(device,non_blocking=True).float().div_(255)
-    targets=[{k:v.to(device,non_blocking=True) if isinstance(v,torch.Tensor) else v for k,v in item.items()} for item in batch['targets']]
+    targets=batch['targets']
+    if move_targets:
+        packed={key:value.to(device,non_blocking=True) for key,value in batch['packed_targets'].items()}
+        targets=[dict(item) for item in targets]
+        for i,target in enumerate(targets):
+            for key,value in packed.items():
+                if key in batch['target_offsets']:
+                    start,end=batch['target_offsets'][key][i]
+                    target[key]=value[start:end]
+                else:target[key]=value[i]
     return images,tokens,targets
 
 

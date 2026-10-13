@@ -39,6 +39,9 @@ class GRefDataTests(unittest.TestCase):
             batch=grounding_collate_fn([dataset[0],dataset[1]])
             self.assertEqual(len(batch['images']),1)
             self.assertEqual(batch['image_indices'].tolist(),[0,0])
+            for target in batch['targets']:
+                self.assertEqual(target['dense_owner'].untyped_storage().data_ptr(),batch['packed_targets']['dense_owner'].untyped_storage().data_ptr())
+                self.assertEqual(target['boxes'].untyped_storage().data_ptr(),batch['packed_targets']['boxes'].untyped_storage().data_ptr())
 
     def test_checkpoint_contains_complete_resume_state(self):
         from units.model.train import save_checkpoint
@@ -82,6 +85,7 @@ class GRefDataTests(unittest.TestCase):
                  dense=dict(points=torch.tensor([[.3,.3]]),strides=torch.tensor([[.1,.1]]),levels=torch.tensor([0]),
                             boxes=bbox[:,:1],logits=torch.zeros(1,1,requires_grad=True)))
         target=dict(boxes=torch.tensor([[.2,.2,.6,.6]]),all_boxes=torch.tensor([[.2,.2,.6,.6]]),valid_size=torch.ones(2))
+        target['dense_owner'],target['dense_valid']=GroundingLoss.dense_targets(out['dense'],target)
         _,parts=GroundingLoss()(out,[target])
         parts['selection'].backward()
         self.assertEqual(int((selection.grad!=0).sum()),1)
@@ -106,6 +110,7 @@ class GRefDataTests(unittest.TestCase):
         out['selection_logits'].sum().backward(retain_graph=True)
         self.assertIsNone(model.quality_head[-1].weight.grad)
         model.zero_grad(set_to_none=True)
+        for target in targets:target['dense_owner'],target['dense_valid']=GroundingLoss.dense_targets(out['dense'],target)
         loss,parts=GroundingLoss()(out,targets);loss.backward()
         self.assertTrue(torch.isfinite(loss));self.assertEqual(out['boxes'].shape,(2,10,4))
         self.assertTrue(all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None))

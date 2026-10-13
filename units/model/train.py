@@ -35,7 +35,7 @@ def make_optimizer(model,config):
         groups.append(dict(params=parameters,lr=lr))
     heads=[p for name,p in model.named_parameters() if p.requires_grad and not name.startswith(('vision.','text.'))]
     groups.append(dict(params=heads,lr=config['head_lr']))
-    return torch.optim.AdamW(groups,weight_decay=config['weight_decay'])
+    return torch.optim.AdamW(groups,weight_decay=config['weight_decay'],fused=next(model.parameters()).is_cuda)
 
 
 def build_components(model_path,train_path,device=None):
@@ -120,7 +120,9 @@ def train(args):
             norm=torch.nn.utils.clip_grad_norm_(model.parameters(),settings['grad_clip'],error_if_nonfinite=True)
             optimizer.step();scheduler.step()
             steps+=1
-            for name,value in dict(total=loss,**parts).items():totals[name]=totals.get(name,0.)+float(value.detach())
+            values=dict(total=loss,**parts)
+            measured=torch.stack([value.detach() for value in values.values()]).float().cpu().tolist()
+            for name,value in zip(values,measured):totals[name]=totals.get(name,0.)+value
             if args.smoke_test:
                 print(json.dumps(dict(loss=float(loss.detach()),gradient_norm=float(norm),predictions=list(outputs['boxes'].shape),
                     teacher_weight=teacher_weight,losses={k:float(v.detach()) for k,v in parts.items()})))
