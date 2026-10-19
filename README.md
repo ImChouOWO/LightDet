@@ -70,6 +70,11 @@ Training is ongoing; full training and testA/testB evaluation are not yet comple
 | `Alignment Head` | Refined ROI 與文字投影後的正規化相似度 |
 | `Selection Head` | Refined ROI 加上 Decoder query conditioning，再與文字拼接，產生保留分數的校準殘差；讓不同 query 可區分重複 ROI |
 
+
+## TGQ(Text-Guided Query)
+
+![TGQ](https://github.com/ImChouOWO/LightDet/blob/LightDet-gRef/TQG.png)
+
 **評分輸出與融合**
 
 | 項目 | 功用 |
