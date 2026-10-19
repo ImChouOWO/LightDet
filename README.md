@@ -49,28 +49,15 @@ Training is ongoing; full training and testA/testB evaluation are not yet comple
 
 ### 模型資料流
 
-```text
-Text -> Frozen MiniLM -> Text Tokens -> Cross-Attention (K/V)
-Zero + Learnable Queries -------------> Cross-Attention (Q)
+![模型能力](https://github.com/ImChouOWO/LightDet/blob/LightDet-gRef/dataFlow.png)
 
-Guided Queries = Attention Output + Learnable Queries + Projection(Mean Text)
 
-Image -> ResNet-50 -> FPN -> Spatial Memory --+
-Text Tokens --------------------------------+-> Shared Query Decoder (K/V)
-Guided Queries -------------------------------> Shared Query Decoder (Q)
-                                                        |            |
-                                                   Main 10        Aux 100
-                                                        |            |
-                                                   Main Head      Aux Head
-                                                        |            |
-                                                 Threshold 0.7   NMS (diagnostics only)
-                                                        |
-                                                    Target Set
-```
+
 
 Main／Aux 分別使用 10／100 個獨立 query 與輸出 Head，共用文字 Cross-Attention 與 Decoder；兩組 query 的 self-attention 隔離。初始化為 `CrossAttention(Zero + Learnable Query, Text, Text) + Learnable Query + Projection(Mean-pooled Text)`。推論僅使用 Main，無 NMS。單一描述超過 10 個 GT 時，Hungarian 最多配對 10 個，保留全部 GT 評估；Main 無法完整輸出超過 10 個物件的集合。Main 的未配對候選皆監督為 no-object，包含同物件的重複框。
 
 ### 模型結構
+![模型能力](https://github.com/ImChouOWO/LightDet/blob/LightDet-gRef/LightDet.png)
 
 | 模組 | 說明 |
 |---|---|
