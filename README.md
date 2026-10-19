@@ -1,7 +1,7 @@
 # LightDet-gRef
 
 ![Framework](https://img.shields.io/badge/framework-PyTorch-EE4C2C)
-![Architecture](https://img.shields.io/badge/architecture-Dense%20CNN%20%2B%20FPN%20%2B%20ROI-8A2BE2)
+![Architecture](https://img.shields.io/badge/architecture-Transformer%20Queries%20%2B%20FPN%20%2B%20ROI-8A2BE2)
 ![Modality](https://img.shields.io/badge/input-Text%20%2B%20Image-2F80ED)
 ![Backbone](https://img.shields.io/badge/backbone-ResNet--50-2F80ED)
 ![Dataset](https://img.shields.io/badge/dataset-gRefCOCO-4CAF50)
@@ -9,10 +9,10 @@
 ![Precision](https://img.shields.io/badge/precision-BF16%20AMP-FF9800)
 ![Status](https://img.shields.io/badge/status-active%20research-yellow)
 
-文字引導的零／單／多目標物件定位。此分支使用 gRefCOCO、Multilingual MiniLM 與文字條件化的密集 CNN，移除原 Localization Transformer 與舊船舶資料流程。
+文字引導的零／單／多目標物件定位。此分支使用 gRefCOCO、Multilingual MiniLM 與 Transformer object queries；Main 採 one-to-one 集合預測，Aux 可選擇以 one-to-many 提供訓練輔助。
 
 ```text
-Image + Expression -> Text-conditioned Dense CNN -> BBox + ROI Scores -> Target Set
+Image + Expression -> Transformer Object Queries -> BBox + ROI Scores -> Target Set
 ```
 
 <details>
@@ -34,36 +34,54 @@ Training is ongoing; full training and testA/testB evaluation are not yet comple
 
 輸入英文或中文描述，預測符合描述的物件集合；無目標描述允許輸出空集合。公開訓練描述為英文，中英 grounding 的實際泛化仍需另外驗證。
 
-| 官方切分 | 訓練／評估單位 | 單目標 | 多目標 | 無目標 |
-|---|---:|---:|---:|---:|
-| train | 78,930 references，每 epoch 輪替一句 | 42,404 | 25,060 | 11,466 |
-| val | 14,229 sentences，全部評估 | 0 | 5,324 | 8,905 |
-| testA | 19,200 sentences，全部評估 | 5,917 | 8,835 | 4,448 |
-| testB | 16,063 sentences，全部評估 | 5,646 | 5,744 | 4,673 |
+
+
+| Model | Encoder | val | testA | testB |
+|---|---|---:|---:|---:|
+| ReLA | ResNet-50＋BERT | 59.36% | 48.09% | 42.85% |
+| SSDE | BEiT-3 ViT-B | 74.17% | 71.19% | 60.62% |
+| LightDet | ResNet-50＋MiniLM | 62.79% | 44.69% | 41.03% |
+
+> 驗證指標：GREC Pr@(F1=1)  
+> 參考資料：[GREx／ReLA，Table 14](https://arxiv.org/html/2601.05244v1#S5.SS4)、[SSDE，Table 8](https://arxiv.org/html/2608.30233#S4.SS2)。
+
+
 
 ### 模型資料流
 
-![模型資料流](./dataFlow.png)
+```text
+Text -> Frozen MiniLM -> Text Tokens -> Cross-Attention (K/V)
+Zero + Learnable Queries -------------> Cross-Attention (Q)
 
-輸入 Image 與 Expression，訓練時另提供 GT。Quality、Alignment 與 Selection Residual 融合為最終分數，再經分數閾值與 NMS 輸出目標集合；Hungarian 配對與候選監督共同計算 loss。
+Guided Queries = Attention Output + Learnable Queries + Projection(Mean Text)
+
+Image -> ResNet-50 -> FPN -> Spatial Memory --+
+Text Tokens --------------------------------+-> Shared Query Decoder (K/V)
+Guided Queries -------------------------------> Shared Query Decoder (Q)
+                                                        |            |
+                                                   Main 10        Aux 100
+                                                        |            |
+                                                   Main Head      Aux Head
+                                                        |            |
+                                                 Threshold 0.7   NMS (diagnostics only)
+                                                        |
+                                                    Target Set
+```
+
+Main／Aux 分別使用 10／100 個獨立 query 與輸出 Head，共用文字 Cross-Attention 與 Decoder；兩組 query 的 self-attention 隔離。初始化為 `CrossAttention(Zero + Learnable Query, Text, Text) + Learnable Query + Projection(Mean-pooled Text)`。推論僅使用 Main，無 NMS。單一描述超過 10 個 GT 時，Hungarian 最多配對 10 個，保留全部 GT 評估；Main 無法完整輸出超過 10 個物件的集合。Main 的未配對候選皆監督為 no-object，包含同物件的重複框。
 
 ### 模型結構
 
-![模型架構](./LightDet.png)
-
 | 模組 | 說明 |
 |---|---|
-| `ResNet-50` | ImageNet 預訓練骨幹，輸出 stride 8／16／32 特徵；固定 BN 統計 |
-| `FPN` | 融合三個尺度並統一至 256 通道，供 Dense CNN 與原始 ROI 擷取使用 |
-| `Multilingual MiniLM` | 凍結多語編碼器；可訓練文字投影將 token 特徵由 384 轉為 256 維 |
-| `Spatial Fusion` | 影像位置編碼、token 相似度加權文字與 FiLM 條件融合 |
-| `Dense Localization CNN` | 三層密集連接卷積，預測框中心、寬高與描述目標分數；選取 Top-100 候選 |
-| `ROI Align` | 根據候選 BBox，從原始 FPN feature maps 擷取 8×8 局部特徵 |
-| `BBox Embedding` | 編碼預測框座標，與 ROI mean pool 相加後形成 refinement query |
-| `Text-Alignment Transformer` | Query 對每個 ROI 自身的 64 個 tokens 執行局部 refinement，不讀取文字或其他候選 |
-| `Quality Head` | 使用原始 ROI mean pool，預測與已標記 COCO 物件的最大 IoU |
-| `Alignment Head` | ROI／文字投影後計算正規化相似度，輸出語意匹配 logits |
-| `Selection Head` | ROI 與文字聯合特徵經 MLP 產生校準殘差，修正保留／丟棄分數 |
+| `ResNet-50 / FPN` | ImageNet 骨幹與三尺度 256 通道特徵，固定 BN 統計；同圖描述共用影像計算 |
+| `Multilingual MiniLM` | 凍結文字編碼器，投影 384→256；保留 token 特徵與描述池化特徵 |
+| `Object Query Transformer` | 先以 8-head 文字 Cross-Attention 引導 Main 10／Aux 100 個 queries，加回 learnable query 與整句文字投影；再以 FPN memory grids 20／10／5 與文字 tokens，經兩層 8-head Decoder 更新 |
+| `BBox Head` | 每組 query 經獨立 MLP 預測中心與寬高，限制於有效影像範圍 |
+| `ROI Align / Refinement` | 由原始 FPN 擷取 8×8 ROI，ROI mean＋BBox embedding 對自身 tokens 執行局部 refinement |
+| `Quality Head` | 原始 ROI mean 預測與已標記 COCO 物件的最大 IoU |
+| `Alignment Head` | Refined ROI 與文字投影後的正規化相似度 |
+| `Selection Head` | Refined ROI 加上 Decoder query conditioning，再與文字拼接，產生保留分數的校準殘差；讓不同 query 可區分重複 ROI |
 
 **評分輸出與融合**
 
@@ -76,7 +94,7 @@ Training is ongoing; full training and testA/testB evaluation are not yet comple
 | **logit** | 將機率轉為實數分數：`log(p / (1-p))`，讓 Residual 能以加法修正。 |
 | **Selection Logits** | 融合後的最終分數，供 Selection Loss 使用；經 sigmoid 得到 Final Score，Ranking Loss 比較其 log 分數。 |
 
-圖中 BBox Embedding 的輸入實際為框座標，Quality Head 的輸入為原始 ROI mean pool；Selection Residual 不產生 Alignment Logits，融合必須同時使用 Quality 與 Alignment。Quality 在融合監督路徑停止梯度；`base` 限制於 `[1e-6, 1−1e-6]`，避免 logit 出現無限值。多段描述推論重用同一份 FPN 特徵。
+Quality 在融合監督路徑停止梯度；`base` 限制於 `[1e-6, 1−1e-6]`。`no_object_logits = −selection_logits`，target／no-object 是同一組二元分類分數的兩面。Main 不忽略重複候選；Aux 的多正例不加入 Main 標籤。
 
 ---
 
@@ -165,7 +183,7 @@ python3 units/tool/getResNet.py
 
 ## 資料取樣
 
-訓練每 epoch 訪問每個 reference 一次，依 epoch 輪替句子。每張圖最多四段描述先組為區塊，再隨機組批；所有目標類型保留原始分布，不重複抽樣、不丟棄最後一批。同圖描述在 batch 中共用一次 ResNet／FPN 計算；合併 tensor 傳輸並快取近期縮放影像。GT 的密集幾何標籤在 CPU workers 建立，不於 loss 中逐樣本同步 GPU。驗證使用全部 sentences。
+訓練每 epoch 訪問每個 reference 一次，依 epoch 輪替句子。每張圖最多四段描述先組為區塊，再隨機組批；所有目標類型保留原始分布，不重複抽樣、不丟棄最後一批。同圖描述在 batch 中共用一次 ResNet／FPN 計算；合併 tensor 傳輸並快取近期縮放影像。Main／Aux 匹配各批次僅集中傳輸一次成本矩陣。驗證使用全部 sentences。
 
 ---
 
@@ -183,9 +201,11 @@ python3 units/tool/getResNet.py
 model:
   hidden_dim: 256
   freeze_text: true
-  dense_growth: 64
-  dense_depth: 3
-  candidate_count: 100
+  num_object_queries: 10
+  num_aux_queries: 100
+  query_heads: 8
+  query_layers: 2
+  memory_grids: [20, 10, 5]
   roi_size: 8
 ```
 
@@ -193,36 +213,39 @@ model:
 
 ## 訓練設定
 
-設定檔：`units/model/cards/config/train.yaml`。訓練 100 epoch、batch size 64、640 影像，使用 BF16、梯度裁切及 最多 250 step LR 暖機（維持約 16,000 組描述的暖機量）。預訓練 ResNet 使用較低學習率；新 FPN／定位／評分 heads 使用較高學習率。
+設定檔：`units/model/cards/config/train.yaml`。本次實驗訓練 30 epoch、batch size 64、640 影像，使用 BF16、梯度裁切及 最多 250 step LR 暖機（維持約 16,000 組描述的暖機量）。預訓練 ResNet 使用較低學習率；新 FPN／Query Decoder／評分 heads 使用較高學習率。
 
-初期 5 epoch 保留靠近 GT 中心的預測候選；GT ROI 語意輔助權重前 5 epoch 為 0.5，第 15 epoch 歸零。GT 引導僅用於訓練，驗證與推論完全使用模型候選。
+GT ROI 語意輔助權重前 5 epoch 為 0.5，第 15 epoch 歸零。GT 引導僅用於訓練，驗證與推論完全使用模型候選。
 
 ---
 
 ## Loss 與 Matching
 
+Main 使用 Hungarian one-to-one。Aux 先保留符合 IoU ≥0.3 的 Hungarian 配對，再依成本補入最多 3 個候選；每個候選僅屬於一個 GT，不強制湊滿。
+
 | Loss | 監督 |
 |---|---|
-| Dense classification | GT 內的中心區域為描述目標正例，無目標描述全部為負例；排除補邊區域 |
-| BBox／GIoU | 密集正例及 Hungarian 一對一配對的定位回歸 |
-| Quality | 預測框對已標記 COCO 物件的最大 IoU |
-| Alignment | 符合描述的候選為正例，同物件重複候選仍可保留語意正例 |
-| Selection | 每個 GT 的一對一代表候選為正例，其餘有效候選為丟棄目標；同物件且會被 NMS 移除的重複候選忽略，以免相同 ROI 接收矛盾標籤 |
-| Ranking | 比較保留候選與高分負例的最終 log 分數；Quality 停止梯度 |
-| GT ROI 暖機 | 直接從 GT 框取得 ROI，輔助早期語意學習 |
+| BBox／GIoU | 各分支的已匹配候選回歸 GT；Aux 同物件正例以候選數倒數加權 |
+| Quality | 預測框對全部已標記 COCO 物件的最大 IoU |
+| Alignment | 已匹配候選與 IoU ≥0.5 的語意候選為正例 |
+| Selection | Main 只有一對一代表候選為正例，所有未配對候選為 no-object；Aux 使用自己的 one-to-many 標籤 |
+| Ranking | 正例與高分未配對候選比較最終 log 分數 |
+| Threshold margin | 以 `logit(0.7)` 為邊界；前 5 epoch 停用，第 6–15 epoch 將 margin／權重增加至 0.5／0.1 |
+| GT ROI 暖機 | GT ROI 提供 Main 早期 Alignment 輔助監督，第 15 epoch 歸零 |
 
-Matching 成本整批回傳 CPU，逐筆求解後一次傳回配對；逐框 GIoU 直接計算，不建立完整成對矩陣。GT ROI 與一般候選合併評分。Matching 只在 loss 中配對候選與 GT，沒有 Localization Transformer、Main／Aux queries 或舊顏色關係矩陣。
+`Total Loss = 0.8 × Main Loss + 0.2 × schedule × Aux Loss`。Aux 前 5 epoch 停用，第 6–15 epoch 暖機，第 24–30 epoch 衰減至 0；關閉 Aux 時不計算 Aux queries／Head，Main 權重仍為 0.8。Aux 的 NMS 僅用於輸出檢查，不參與 matching 或 Loss。
+
 
 ---
 
 ## 啟動訓練
 
 ```bash
-python3 units/model/train.py --smoke-test
-python3 units/model/train.py
+python3 units/model/train.py --no-aux --smoke-test
+python3 units/model/train.py --no-aux
 ```
 
-伺服器的 `_train.py` 使用相同程式；不自動啟動完整訓練。
+伺服器的 `_train.py` 使用相同程式。`train.aux_enabled` 預設為 false，可用 `--aux`／`--no-aux` 選擇；另開實驗需使用新的 `log.prefix`。
 
 ---
 
@@ -230,10 +253,10 @@ python3 units/model/train.py
 
 ```bash
 python3 units/model/train.py \
-  --resume units/model/runs/train/lightdet_gref_latest.pt
+  --resume units/model/runs/train/lightdet_gref_tqg_main10_30ep_latest.pt
 ```
 
-此分支只接受 `lightdet.grefcoco.v1` checkpoint。原版權重的任務模組不相容；新模型僅從 ImageNet ResNet 與預訓練 MiniLM 初始化。另開實驗時修改 `log.prefix`，避免覆寫既有訓練。
+此分支只接受 `lightdet.grefcoco.queries.v3` checkpoint。舊 Query／Dense CNN／原版權重不相容；新模型僅從 ImageNet ResNet 與預訓練 MiniLM 初始化。另開實驗時修改 `log.prefix`，避免覆寫既有訓練。
 
 ---
 
@@ -241,9 +264,9 @@ python3 units/model/train.py \
 
 ```bash
 python3 units/model/val.py \
-  --weights units/model/runs/train/lightdet_gref_best.pt --split val
+  --weights units/model/runs/train/lightdet_gref_tqg_main10_30ep_best.pt --split val
 python3 units/model/val.py \
-  --weights units/model/runs/train/lightdet_gref_best.pt --split testA
+  --weights units/model/runs/train/lightdet_gref_tqg_main10_30ep_best.pt --split testA
 ```
 
 | 指標 | 定義 |
@@ -253,14 +276,20 @@ python3 units/model/val.py \
 | N-acc | 明確無目標描述是否輸出空集合 |
 | T-acc | 有目標描述是否輸出非空集合，不代表定位正確 |
 
-集合評估與推論統一使用分數 ≥0.5、NMS IoU=0.5、最多 100 框；集合匹配使用 IoU ≥0.5 的最大一對一配對。gRefCOCO 每段描述最多有 18 個 GT，不使用固定 Top-10 截斷。Acc@0.5 取最高分有效候選，不以 GT 在 Top-10 中挑選答案，也不受集合分數閾值限制。
+Main 集合評估與推論統一使用分數 ≥0.7、不使用 NMS、最多 100 框。集合匹配與官方參考程式一致，採 GIoU ≥0.5 的最大重疊貪婪一對一配對；不是最大配對數 Hungarian。Acc@0.5 額外評估單目標最高分候選，val 沒有單目標描述時為 N/A。`Positive-Pr` 為有目標描述的完整集合成功率，僅供拆分分析。
 
-此流程使用 GREC 指標定義，但後處理與官方參考程式的 0.7／無 NMS 設定不同；不能直接比較不同協定的論文數值。val 的 Acc@0.5 為 N/A，不以 0 取代。不再輸出 Hit@K、TextHit、Oracle 或舊 mAP。
+官方驗證輸出清楚的設定摘要與分切分百分比表：
+
+```bash
+python3 units/model/val_official.py \
+  --weights units/model/runs/train/lightdet_gref_tqg_main10_30ep_best.pt \
+  --output units/model/runs/train/lightdet_gref_tqg_main10_30ep_official.json
+```
 
 多描述推論：
 
 ```bash
-python3 units/infer.py --weights units/model/runs/train/lightdet_gref_best.pt \
+python3 units/infer.py --weights units/model/runs/train/lightdet_gref_tqg_main10_30ep_best.pt \
   --image /PATH/TO/image.jpg --text "the red boat" "紅色的船"
 ```
 
@@ -270,10 +299,10 @@ python3 units/infer.py --weights units/model/runs/train/lightdet_gref_best.pt \
 
 | 檔案 | 功能 |
 |---|---|
-| `lightdet_gref_latest.pt` | 完整續訓狀態 |
-| `lightdet_gref_best.pt` | 最佳 GREC 集合成功率權重 |
-| `lightdet_gref_epoch_XXX.pt` | 每 10 epoch 保存 |
-| `lightdet_gref_metrics.jsonl` | 每個 epoch 的 loss 與統一指標 |
+| `lightdet_gref_tqg_main10_30ep_latest.pt` | 完整續訓狀態 |
+| `lightdet_gref_tqg_main10_30ep_best.pt` | 最佳 GREC 集合成功率權重 |
+| `lightdet_gref_tqg_main10_30ep_epoch_XXX.pt` | 每 10 epoch 保存 |
+| `lightdet_gref_tqg_main10_30ep_metrics.jsonl` | 每個 epoch 的 loss 與統一指標 |
 
 全部輸出位於既有 `units/model/runs/train`。資料、編碼器與模型權重不提交 Git。
 
