@@ -3,9 +3,11 @@ model:
   encoder_path: units/model/bert
   freeze_text: true
   backbone_weights: units/model/resnet/checkpoints/resnet50-11ad3fa6.pth
-  dense_growth: 64
-  dense_depth: 3
-  candidate_count: 100
+  num_object_queries: 10
+  num_aux_queries: 100
+  query_heads: 8
+  query_layers: 2
+  memory_grids: [20, 10, 5]
   roi_size: 8
   score_heads: 8
   score_layers: 2

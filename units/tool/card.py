@@ -1,5 +1,6 @@
-"""Text-conditioned dense CNN localization with local ROI semantic scoring."""
+"""Transformer object queries with Main set prediction and optional Aux supervision."""
 from collections import OrderedDict
+from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -10,11 +11,6 @@ from torchvision.ops import FeaturePyramidNetwork, roi_align
 from transformers import AutoModel
 
 ROOT = Path(__file__).resolve().parents[2]
-
-
-def conv(in_channels, out_channels, kernel=3):
-    return nn.Sequential(nn.Conv2d(in_channels, out_channels, kernel, padding=kernel//2, bias=False),
-                         nn.GroupNorm(8, out_channels), nn.SiLU())
 
 
 class MultilingualMiniLM(nn.Module):
@@ -43,7 +39,7 @@ class MultilingualMiniLM(nn.Module):
 
 
 class ResNetFPN(nn.Module):
-    """Keep stride-8/16/32 maps for dense prediction and ROI sampling."""
+    """Keep stride-8/16/32 maps for query attention and ROI sampling."""
     def __init__(self, hidden_dim, weights):
         super().__init__()
         self.backbone = resnet50(weights=None)
@@ -70,52 +66,56 @@ class ResNetFPN(nn.Module):
         return self.fpn(OrderedDict(c3=c3, c4=c4, c5=c5))
 
 
-class DenseLocalizationCNN(nn.Module):
-    """Fuse text at each FPN location; densely connected convolutions predict center/size boxes."""
-    def __init__(self, hidden_dim, growth=64, depth=3):
+class ObjectQueryTransformer(nn.Module):
+    """Zero-content queries read text, add learned positions and pooled projection, then attend image/text memory."""
+    def __init__(self,dim,heads,layers,queries,aux_queries,grids):
         super().__init__()
-        self.film = nn.Linear(hidden_dim, hidden_dim*2)
-        self.token_gate = nn.Conv2d(hidden_dim*2, hidden_dim, 1)
-        self.coordinates = nn.Conv2d(2, hidden_dim, 1)
-        self.layers = nn.ModuleList([conv(hidden_dim+i*growth, growth) for i in range(depth)])
-        self.merge = conv(hidden_dim+depth*growth, hidden_dim, 1)
-        self.box = nn.Conv2d(hidden_dim, 4, 1)
-        self.objectness = nn.Conv2d(hidden_dim, 1, 1)
-        nn.init.constant_(self.objectness.bias, -4.595)
-        self.hidden_dim = hidden_dim
+        self.main_queries=nn.Embedding(queries,dim)
+        self.aux_queries=nn.Embedding(aux_queries,dim)
+        self.coordinates=nn.Linear(2,dim)
+        self.level_embedding=nn.Parameter(torch.randn(3,dim)*.02)
+        self.text_type=nn.Parameter(torch.randn(1,1,dim)*.02)
+        self.text_condition=nn.Linear(dim,dim)
+        self.text_attention=nn.MultiheadAttention(dim,heads,dropout=.1,batch_first=True)
+        self.memory_norm=nn.LayerNorm(dim)
+        layer=nn.TransformerDecoderLayer(dim,heads,dim*4,dropout=.1,batch_first=True,norm_first=True)
+        self.decoder=nn.TransformerDecoder(layer,layers,norm=nn.LayerNorm(dim))
+        self.grids=grids
 
-    def forward(self, features, text, text_mask, text_pooled, image_size):
-        height, width = image_size
-        scale, bias = self.film(text_pooled).chunk(2, -1)
-        boxes, logits, points, strides, levels = [], [], [], [], []
-        for level, feature in enumerate(features.values()):
-            batch, dim, h, w = feature.shape
-            gy,gx = torch.meshgrid(torch.linspace(-1,1,h,device=feature.device),
-                                   torch.linspace(-1,1,w,device=feature.device),indexing='ij')
-            positions = torch.stack([gx,gy])[None].expand(batch,-1,-1,-1).to(feature.dtype)
-            feature = feature+self.coordinates(positions)
-            pixels = feature.flatten(2).transpose(1,2)
-            attention = (pixels @ text.transpose(1,2)) / dim**.5
-            attention = attention.masked_fill(~text_mask[:,None,:], float('-inf')).softmax(-1)
-            local_text = (attention @ text).transpose(1,2).reshape(batch, dim, h, w)
-            x = self.token_gate(torch.cat([feature, local_text], 1))
-            x = x * (1+torch.tanh(scale[:,:,None,None])) + bias[:,:,None,None]
-            parts = [x]
-            for layer in self.layers:
-                parts.append(layer(torch.cat(parts, 1)))
-            fused = self.merge(torch.cat(parts, 1))
-            y, xcoord = torch.meshgrid(torch.arange(h,device=x.device),torch.arange(w,device=x.device),indexing='ij')
-            centers = torch.stack([(xcoord+.5)/w,(y+.5)/h],-1).reshape(-1,2)
-            stride = torch.tensor([1/w,1/h],device=feature.device,dtype=torch.float32)
-            regression = self.box(fused).flatten(2).transpose(1,2)
-            predicted_center = centers[None]+regression[:,:,:2].tanh()*stride*2
-            size = F.softplus(regression[:,:,2:])*stride*4
-            pred = torch.cat([predicted_center-size/2,predicted_center+size/2],-1)
-            boxes.append(pred); logits.append(self.objectness(fused).flatten(1))
-            points.append(centers); strides.append(stride.expand(h*w,2))
-            levels.append(torch.full((h*w,),level,device=x.device,dtype=torch.long))
-        return dict(boxes=torch.cat(boxes,1), logits=torch.cat(logits,1),
-                    points=torch.cat(points), strides=torch.cat(strides), levels=torch.cat(levels))
+    def guide_queries(self,positions,text,text_mask,pooled_text):
+        positions=positions[None].expand(len(text),-1,-1)
+        content=torch.zeros_like(positions)
+        guided=self.text_attention(content+positions,text,text,
+            key_padding_mask=~text_mask,need_weights=False)[0]
+        return guided+positions+self.text_condition(pooled_text)[:,None]
+
+    def forward(self,features,text,text_mask,pooled_text,valid_sizes,use_aux):
+        memories=[];padding=[]
+        for level,(feature,grid) in enumerate(zip(features.values(),self.grids)):
+            h,w=min(grid,feature.shape[-2]),min(grid,feature.shape[-1])
+            feature=F.adaptive_avg_pool2d(feature,(h,w))
+            y,x=torch.meshgrid((torch.arange(h,device=feature.device)+.5)/h,
+                               (torch.arange(w,device=feature.device)+.5)/w,indexing='ij')
+            coordinates=torch.stack([x,y],-1).reshape(-1,2)
+            position=self.coordinates(coordinates.to(feature.dtype))+self.level_embedding[level]
+            memories.append(feature.flatten(2).transpose(1,2)+position[None])
+            padding.append(~(coordinates[None]<valid_sizes[:,None]).all(-1))
+        memories.append(text+self.text_type)
+        padding.append(~text_mask)
+        memory=self.memory_norm(torch.cat(memories,1))
+        query=self.main_queries.weight
+        attention_mask=None
+        if use_aux:
+            main_count=len(query)
+            query=torch.cat([query,self.aux_queries.weight],0)
+            attention_mask=torch.zeros(len(query),len(query),dtype=torch.bool,device=query.device)
+            attention_mask[:main_count,main_count:]=True
+            attention_mask[main_count:,:main_count]=True
+        query=self.guide_queries(query,text,text_mask,pooled_text)
+        decoded=self.decoder(query,memory,tgt_mask=attention_mask,memory_key_padding_mask=torch.cat(padding,1))
+        main=decoded[:,:self.main_queries.num_embeddings]
+        aux=decoded[:,self.main_queries.num_embeddings:] if use_aux else None
+        return main,aux
 
 
 class TextAlignmentTransformer(nn.Module):
@@ -138,91 +138,105 @@ class TextAlignmentTransformer(nn.Module):
         return query[:,0]
 
 
-class VisionTextModel(nn.Module):
-    def __init__(self, hidden_dim=256, encoder_path='units/model/bert', freeze_text=True,
-                 backbone_weights='units/model/resnet/checkpoints/resnet50-11ad3fa6.pth',
-                 dense_growth=64, dense_depth=3, candidate_count=100, roi_size=8,
-                 score_heads=8, score_layers=2):
+class GroundingHead(nn.Module):
+    """Query-conditioned box and ROI/text scores; final logits classify target versus no-object."""
+    def __init__(self,dim):
         super().__init__()
-        self.vision = ResNetFPN(hidden_dim, str(ROOT/backbone_weights) if backbone_weights else None)
-        self.text = MultilingualMiniLM(str(ROOT/encoder_path),hidden_dim,freeze_text)
-        self.localization = DenseLocalizationCNN(hidden_dim,dense_growth,dense_depth)
-        self.refinement = TextAlignmentTransformer(hidden_dim,score_heads,score_layers,roi_size)
-        self.visual_projection = nn.Sequential(nn.LayerNorm(hidden_dim),nn.Linear(hidden_dim,hidden_dim))
-        self.text_projection = nn.Sequential(nn.LayerNorm(hidden_dim),nn.Linear(hidden_dim,hidden_dim))
-        self.quality_head = nn.Sequential(nn.LayerNorm(hidden_dim),nn.Linear(hidden_dim,hidden_dim),nn.GELU(),nn.Linear(hidden_dim,1))
-        self.selection_head = nn.Sequential(nn.Linear(hidden_dim*2,hidden_dim),nn.GELU(),nn.Linear(hidden_dim,1))
-        self.logit_scale = nn.Parameter(torch.tensor(2.3))
-        self.alignment_bias = nn.Parameter(torch.tensor(-2.2))
-        nn.init.constant_(self.selection_head[-1].bias,-2.2)
-        self.candidate_count, self.roi_size = candidate_count, roi_size
+        self.box=nn.Sequential(nn.Linear(dim,dim),nn.GELU(),nn.Linear(dim,dim),nn.GELU(),nn.Linear(dim,4))
+        self.visual_projection=nn.Sequential(nn.LayerNorm(dim),nn.Linear(dim,dim))
+        self.text_projection=nn.Sequential(nn.LayerNorm(dim),nn.Linear(dim,dim))
+        self.quality=nn.Sequential(nn.LayerNorm(dim),nn.Linear(dim,dim),nn.GELU(),nn.Linear(dim,1))
+        self.query_condition=nn.Sequential(nn.Linear(dim,dim),nn.LayerNorm(dim))
+        self.selection=nn.Sequential(nn.Linear(dim*2,dim),nn.GELU(),nn.Linear(dim,1))
+        self.logit_scale=nn.Parameter(torch.tensor(2.3))
+        self.alignment_bias=nn.Parameter(torch.tensor(-2.2))
+        nn.init.constant_(self.selection[-1].bias,-2.2)
 
-    def pool_rois(self, features, boxes, image_size):
-        batch, count, _ = boxes.shape
-        height, width = image_size
-        pixel_boxes = boxes.detach().clamp(0,1)*boxes.new_tensor([width,height,width,height])
-        rois = torch.cat([torch.arange(batch,device=boxes.device)[:,None,None].expand(batch,count,1),pixel_boxes],-1).reshape(-1,5)
-        area = ((pixel_boxes[:,:,2:]-pixel_boxes[:,:,:2]).clamp_min(0).prod(-1)).sqrt()
-        levels = (torch.floor(4+torch.log2(area.clamp_min(1)/224))-3).clamp(0,2).long().flatten()
-        maps = list(features.values())
-        pooled = maps[0].new_zeros(batch*count,maps[0].shape[1],self.roi_size,self.roi_size)
-        for level, feature in enumerate(maps):
-            ids = torch.where(levels==level)[0]
+    def predict_boxes(self,queries,valid_sizes):
+        center,size=self.box(queries).float().sigmoid().chunk(2,-1)
+        center=center*valid_sizes[:,None]
+        size=size.clamp_min(1e-4)*valid_sizes[:,None]
+        low=(center-size/2).clamp_min(0)
+        high=torch.minimum(center+size/2,valid_sizes[:,None])
+        return torch.cat([low,high],-1)
+
+    def score(self,raw_roi,refined,queries,text):
+        visual=F.normalize(self.visual_projection(refined),dim=-1)
+        phrase=F.normalize(self.text_projection(text),dim=-1)
+        alignment=(visual*phrase[:,None]).sum(-1)*self.logit_scale.exp().clamp(max=100)+self.alignment_bias
+        quality=self.quality(raw_roi).squeeze(-1)
+        selection_feature=refined+self.query_condition(queries)
+        residual=self.selection(torch.cat([selection_feature,text[:,None].expand_as(refined)],-1)).squeeze(-1)
+        base=torch.sqrt(quality.detach().float().sigmoid()*alignment.float().sigmoid()).clamp(1e-6,1-1e-6)
+        selection=torch.logit(base)+residual.float()
+        return dict(scores=selection.sigmoid(),quality_logits=quality,alignment_logits=alignment,
+                    selection_logits=selection,no_object_logits=-selection,selection_residual=residual)
+
+
+class VisionTextModel(nn.Module):
+    def __init__(self,hidden_dim=256,encoder_path='units/model/bert',freeze_text=True,
+                 backbone_weights='units/model/resnet/checkpoints/resnet50-11ad3fa6.pth',
+                 num_object_queries=10,num_aux_queries=100,query_heads=8,query_layers=2,
+                 memory_grids=(20,10,5),roi_size=8,score_heads=8,score_layers=2,aux_enabled=False):
+        super().__init__()
+        if len(memory_grids)!=3 or min(memory_grids)<1 or min(num_object_queries,num_aux_queries)<1:
+            raise ValueError('Invalid query or memory dimensions')
+        self.vision=ResNetFPN(hidden_dim,str(ROOT/backbone_weights) if backbone_weights else None)
+        self.text=MultilingualMiniLM(str(ROOT/encoder_path),hidden_dim,freeze_text)
+        self.localization=ObjectQueryTransformer(hidden_dim,query_heads,query_layers,num_object_queries,num_aux_queries,memory_grids)
+        self.refinement=TextAlignmentTransformer(hidden_dim,score_heads,score_layers,roi_size)
+        self.main_head=GroundingHead(hidden_dim)
+        self.aux_head=deepcopy(self.main_head)
+        self.roi_size=roi_size
+        self.aux_enabled=aux_enabled
+        if not aux_enabled:
+            self.aux_head.requires_grad_(False)
+            self.localization.aux_queries.requires_grad_(False)
+
+    def pool_rois(self,features,boxes,image_size):
+        batch,count,_=boxes.shape
+        height,width=image_size
+        pixel_boxes=boxes.detach()*boxes.new_tensor([width,height,width,height])
+        rois=torch.cat([torch.arange(batch,device=boxes.device)[:,None,None].expand(batch,count,1),pixel_boxes],-1).reshape(-1,5)
+        area=((pixel_boxes[:,:,2:]-pixel_boxes[:,:,:2]).clamp_min(0).prod(-1)).sqrt()
+        levels=(torch.floor(4+torch.log2(area.clamp_min(1)/224))-3).clamp(0,2).long().flatten()
+        maps=list(features.values())
+        pooled=maps[0].new_zeros(batch*count,maps[0].shape[1],self.roi_size,self.roi_size)
+        for level,feature in enumerate(maps):
+            ids=torch.where(levels==level)[0]
             if len(ids):
-                pooled[ids] = roi_align(feature,rois[ids].float(),self.roi_size,
+                pooled[ids]=roi_align(feature,rois[ids].float(),self.roi_size,
                     spatial_scale=feature.shape[-1]/width,sampling_ratio=2,aligned=True).to(pooled.dtype)
         return pooled.flatten(2).transpose(1,2)
 
-    def score_rois(self, features, boxes, pooled_text, image_size):
-        count = boxes.shape[1]
-        roi = self.pool_rois(features, boxes, image_size)
-        refined = self.refinement(roi, boxes.detach().reshape(-1,4)).reshape(len(boxes),count,-1)
-        visual = F.normalize(self.visual_projection(refined),dim=-1)
-        phrase = F.normalize(self.text_projection(pooled_text),dim=-1)
-        alignment = (visual*phrase[:,None,:]).sum(-1)*self.logit_scale.exp().clamp(max=100)+self.alignment_bias
-        quality = self.quality_head(roi.mean(1)).reshape(len(boxes),count)
-        selection = self.selection_head(torch.cat([refined,pooled_text[:,None,:].expand_as(refined)],-1)).squeeze(-1)
-        return alignment,quality,selection
+    def score_branch(self,head,queries,features,text,valid_sizes,image_size):
+        boxes=head.predict_boxes(queries,valid_sizes)
+        roi=self.pool_rois(features,boxes,image_size)
+        refined=self.refinement(roi,boxes.detach().reshape(-1,4)).reshape_as(queries)
+        output=head.score(roi.mean(1).reshape_as(queries),refined,queries,text)
+        output['boxes']=boxes
+        return output
 
-    def forward(self, images, tokens, targets=None, guide_candidates=False, gt_roi=False, features=None, valid_sizes=None, image_indices=None):
-        features = self.vision(images) if features is None else features
+    def forward(self,images,tokens,targets=None,gt_roi=False,features=None,valid_sizes=None,image_indices=None):
+        features=self.vision(images) if features is None else features
         if image_indices is not None:
-            features = OrderedDict((name,value.index_select(0,image_indices)) for name,value in features.items())
-        text, mask, pooled_text = self.text(tokens)
-        dense = self.localization(features,text,mask,pooled_text,images.shape[-2:])
-        count = min(self.candidate_count,dense['logits'].shape[1])
-        proposal_logits = dense['logits']
-        if valid_sizes is None and targets is not None:
-            valid_sizes = torch.stack([target['valid_size'] for target in targets])
-        if valid_sizes is not None:
-            valid = (dense['points'][None,:,:] < valid_sizes[:,None,:]).all(-1)
-            proposal_logits = proposal_logits.masked_fill(~valid,float('-inf'))
-        ids = proposal_logits.topk(count,1).indices
-        if guide_candidates and targets is not None:
-            for i,target in enumerate(targets):
-                gt = target['boxes']
-                if len(gt):
-                    centers = (gt[:,:2]+gt[:,2:])/2
-                    distance = (dense['points'][None]-centers[:,None]).square().sum(-1)
-                    guided = distance.argmin(1).unique()
-                    rest = ids[i][~torch.isin(ids[i],guided)]
-                    ids[i] = torch.cat([guided,rest])[:count]
-        boxes = dense['boxes'].gather(1,ids[...,None].expand(-1,-1,4)).clamp(0,1)
-        teacher_count = max((len(target['boxes']) for target in targets),default=0) if gt_roi and targets is not None else 0
-        scoring_boxes = boxes
+            features=OrderedDict((name,value.index_select(0,image_indices)) for name,value in features.items())
+        text,mask,pooled_text=self.text(tokens)
+        if valid_sizes is None:
+            valid_sizes=torch.stack([target['valid_size'] for target in targets]) if targets is not None else images.new_ones(len(text),2)
+        use_aux=self.training and self.aux_enabled
+        main,aux=self.localization(features,text,mask,pooled_text,valid_sizes,use_aux)
+        output=self.score_branch(self.main_head,main,features,pooled_text,valid_sizes,images.shape[-2:])
+        if use_aux:
+            output['aux']=self.score_branch(self.aux_head,aux,features,pooled_text,valid_sizes,images.shape[-2:])
+        teacher_count=max((len(t['boxes']) for t in targets),default=0) if gt_roi and targets is not None else 0
         if teacher_count:
-            truth = boxes.new_zeros(len(boxes),teacher_count,4)
-            for i,target in enumerate(targets):
-                truth[i,:len(target['boxes'])] = target['boxes']
-            scoring_boxes = torch.cat([boxes,truth],1)
-        all_alignment,all_quality,all_selection = self.score_rois(features,scoring_boxes,pooled_text,images.shape[-2:])
-        alignment,quality,selection = all_alignment[:,:count],all_quality[:,:count],all_selection[:,:count]
-        base = torch.sqrt(quality.detach().float().sigmoid()*alignment.float().sigmoid()).clamp(1e-6,1-1e-6)
-        selection = torch.logit(base)+selection.float()
-        scores = selection.sigmoid()
-        outputs = dict(boxes=boxes,scores=scores,quality_logits=quality,
-                       alignment_logits=alignment,selection_logits=selection,dense=dense)
-        if gt_roi and targets is not None:
-            outputs['gt_alignment_logits'] = [all_alignment[i,count:count+len(target['boxes'])]
-                for i,target in enumerate(targets) if len(target['boxes'])]
-        return outputs
+            truth=main.new_zeros(len(main),teacher_count,4)
+            for i,target in enumerate(targets):truth[i,:len(target['boxes'])]=target['boxes']
+            roi=self.pool_rois(features,truth,images.shape[-2:])
+            refined=self.refinement(roi,truth.reshape(-1,4)).reshape(len(main),teacher_count,-1)
+            visual=F.normalize(self.main_head.visual_projection(refined),dim=-1)
+            phrase=F.normalize(self.main_head.text_projection(pooled_text),dim=-1)
+            logits=(visual*phrase[:,None]).sum(-1)*self.main_head.logit_scale.exp().clamp(max=100)+self.main_head.alignment_bias
+            output['gt_alignment_logits']=[logits[i,:len(t['boxes'])] for i,t in enumerate(targets) if len(t['boxes'])]
+        return output

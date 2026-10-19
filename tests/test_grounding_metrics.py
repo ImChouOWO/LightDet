@@ -22,9 +22,9 @@ class GroundingMetricTests(unittest.TestCase):
         metric=GroundingMetrics();update(metric,[A],[A,B]);update(metric,[A,B,C],[A,B])
         self.assertEqual(metric.compute()['grec_precision_f1'],0.)
 
-    def test_duplicate_nms_and_distinct_targets(self):
+    def test_main_duplicate_fails_without_nms(self):
         metric=GroundingMetrics();update(metric,[A,A,B],[A,B],[.95,.9,.85])
-        self.assertEqual(metric.compute()['grec_precision_f1'],1.)
+        self.assertEqual(metric.compute()['grec_precision_f1'],0.)
 
     def test_no_target_and_false_positive(self):
         metric=GroundingMetrics();update(metric,[A],[],[.1]);update(metric,[A],[],[.9])
@@ -39,16 +39,16 @@ class GroundingMetricTests(unittest.TestCase):
         self.assertEqual(metric.compute()['grec_precision_f1'],0.)
 
     def test_padding_removed_and_threshold_inclusive(self):
-        boxes=torch.tensor([[.8,.8,1.,1.],A]);scores=torch.tensor([.99,.5])
+        boxes=torch.tensor([[.8,.8,1.,1.],A]);scores=torch.tensor([.99,.7])
         selected,_=select_predictions(boxes,scores,torch.tensor([.5,.5]))
         self.assertEqual(len(selected),1)
 
-    def test_maximum_matching_not_maximum_iou_sum(self):
+    def test_greedy_matching_is_official_not_maximum_cardinality(self):
         from unittest.mock import patch
-        metric=GroundingMetrics(nms_iou=1.)
-        with patch('units.model.tool.grounding_metrics.box_iou',return_value=torch.tensor([[.6,.5],[.5,.1]])):
+        metric=GroundingMetrics()
+        with patch('units.model.tool.grounding_metrics.generalized_box_iou',return_value=torch.tensor([[.6,.5],[.5,.1]])):
             update(metric,[A,B],[A,B])
-        self.assertEqual(metric.compute()['grec_precision_f1'],1.)
+        self.assertEqual(metric.compute()['grec_precision_f1'],0.)
 
 
 if __name__=='__main__':unittest.main()

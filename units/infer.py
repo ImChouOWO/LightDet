@@ -25,7 +25,7 @@ def main():
     args=parser.parse_args()
     device=torch.device(args.device)
     checkpoint=torch.load(resolve(args.weights),map_location='cpu',weights_only=False)
-    if checkpoint['schema']!='lightdet.grefcoco.v1':raise ValueError('Expected a gRefCOCO checkpoint')
+    if checkpoint['schema']!='lightdet.grefcoco.queries.v3':raise ValueError('Expected text-guided query checkpoint (v3)')
     config,model_config=checkpoint['config'],checkpoint['model_config']
     model=VisionTextModel(**dict(model_config,backbone_weights=None)).to(device).eval()
     model.load_state_dict(checkpoint['model'],strict=True)

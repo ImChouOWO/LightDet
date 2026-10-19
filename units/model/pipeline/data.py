@@ -8,7 +8,6 @@ import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import Dataset, Sampler, DataLoader
-from units.model.cards.loss import assign_dense_targets
 
 
 class GRefCOCODataset(Dataset):
@@ -17,14 +16,6 @@ class GRefCOCODataset(Dataset):
         self._image_cache = OrderedDict()
         if image_size % 32:
             raise ValueError('image_size must be divisible by 32')
-        points,strides,levels = [],[],[]
-        for level,stride in enumerate((8,16,32)):
-            size = image_size//stride
-            y,x = torch.meshgrid(torch.arange(size),torch.arange(size),indexing='ij')
-            points.append(torch.stack([(x+.5)/size,(y+.5)/size],-1).reshape(-1,2))
-            strides.append(torch.full((size*size,2),1/size))
-            levels.append(torch.full((size*size,),level,dtype=torch.long))
-        self.dense_geometry = dict(points=torch.cat(points),strides=torch.cat(strides),levels=torch.cat(levels))
         self.image_size, self.training, self.seed, self.epoch = image_size, training, seed, 0
         records = json.loads((self.root/'labels/grefs(unc).json').read_text())
         instances = json.loads((self.root/'labels/instances.json').read_text())
@@ -103,8 +94,6 @@ class GRefCOCODataset(Dataset):
                     ref_id=ref['ref_id'],sent_id=sentence['sent_id'],image_id=ref['image_id'],
                     object_ids=ids,valid_size=torch.tensor([rw,rh])/self.image_size,
                     group=min(len(ids),2))
-        if self.training:
-            item['dense_owner'],item['dense_valid'] = assign_dense_targets(self.dense_geometry,item)
         return item
 
 
@@ -143,9 +132,6 @@ def grounding_collate_fn(items):
     targets=[{k:v for k,v in item.items() if k not in ('image','text')} for item in items]
     packed={key:torch.cat([item[key] for item in items],0) for key in ('boxes','all_boxes')}
     packed['valid_size']=torch.stack([item['valid_size'] for item in items])
-    if 'dense_owner' in items[0]:
-        for key in ('dense_owner','dense_valid'):
-            packed[key]=torch.stack([item[key] for item in items])
     offsets={}
     for key in ('boxes','all_boxes'):
         start=0;offsets[key]=[]

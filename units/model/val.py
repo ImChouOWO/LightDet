@@ -24,7 +24,7 @@ def main():
     args=parser.parse_args()
     device=torch.device(args.device);torch.set_num_threads(4)
     checkpoint=torch.load(resolve(args.weights),map_location='cpu',weights_only=False)
-    if checkpoint['schema']!='lightdet.grefcoco.v1':raise ValueError('Expected a gRefCOCO checkpoint')
+    if checkpoint['schema']!='lightdet.grefcoco.queries.v3':raise ValueError('Expected text-guided query checkpoint (v3)')
     model_config=checkpoint['model_config'];config=checkpoint['config']
     # The checkpoint contains all visual weights; do not load ImageNet weights again.
     constructor=dict(model_config,backbone_weights=None)

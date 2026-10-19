@@ -5,7 +5,7 @@ data:
   train_split: train
   val_split: val
 train:
-  epochs: 100
+  epochs: 30
   batch_size: 64
   workers: 8
   device: cuda:1
@@ -17,7 +17,7 @@ train:
   gt_roi_hold_epochs: 5
   gt_roi_end_epoch: 15
   gt_roi_weight: 0.5
-  guided_candidates_epochs: 5
+  aux_enabled: false
 optim:
   vision_lr: 0.00001
   fpn_lr: 0.0001
@@ -28,16 +28,29 @@ optim:
 loss:
   bbox_weight: 5.0
   giou_weight: 2.0
-  dense_weight: 1.0
   quality_weight: 1.0
   alignment_weight: 1.0
   selection_weight: 1.0
   ranking_weight: 0.25
+  no_object_weight: 0.1
+  main_weight: 0.8
+  aux_weight: 0.2
+  aux_top_k: 3
+  aux_min_iou: 0.3
+  aux_start_epoch: 6
+  aux_warmup_end_epoch: 15
+  aux_decay_start_epoch: 23
+  aux_end_epoch: 30
+  threshold_margin_weight: 0.1
+  threshold_margin_target: 0.5
+  threshold_margin_start_epoch: 6
+  threshold_margin_end_epoch: 15
 eval:
-  score_threshold: 0.5
+  score_threshold: 0.7
+  use_nms: false
   nms_iou: 0.5
-  max_detections: 100
+  max_detections: 10
 log:
   save_dir: units/model/runs/train
-  prefix: lightdet_gref
+  prefix: lightdet_gref_tqg_main10_30ep
   best_metric: grec_precision_f1

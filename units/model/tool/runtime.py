@@ -22,11 +22,18 @@ def prepare_model_batch(batch,tokenizer,device,max_length,move_targets=True):
     return images,tokens,targets
 
 
-def select_predictions(boxes,scores,valid_size,score_threshold=.5,nms_iou=.5,max_detections=100):
+def select_predictions(boxes,scores,valid_size,score_threshold=.7,use_nms=False,nms_iou=.5,max_detections=100):
     boxes=boxes.float().clamp_min(0).clone()
     boxes[:,[0,2]]=boxes[:,[0,2]].clamp_max(float(valid_size[0]))
     boxes[:,[1,3]]=boxes[:,[1,3]].clamp_max(float(valid_size[1]))
     keep=(scores>=score_threshold)&(boxes[:,2]>boxes[:,0])&(boxes[:,3]>boxes[:,1])
     boxes,scores=boxes[keep],scores[keep].float()
-    ids=nms(boxes,scores,nms_iou)[:max_detections]
+    ids=(nms(boxes,scores,nms_iou) if use_nms else scores.argsort(descending=True))[:max_detections]
     return boxes[ids],scores[ids]
+
+
+def select_branch_predictions(outputs,valid_size,branch='main',score_threshold=.7,nms_iou=.5,max_detections=100):
+    if branch not in ('main','aux'):raise ValueError('Unknown branch')
+    prediction=outputs if branch=='main' else outputs['aux']
+    return select_predictions(prediction['boxes'],prediction['scores'],valid_size,
+        score_threshold=score_threshold,use_nms=branch=='aux',nms_iou=nms_iou,max_detections=max_detections)
