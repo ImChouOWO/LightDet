@@ -54,7 +54,7 @@ Training is ongoing; full training and testA/testB evaluation are not yet comple
 
 
 
-Main／Aux 分別使用 10／100 個獨立 query 與輸出 Head，共用文字 Cross-Attention 與 Decoder；兩組 query 的 self-attention 隔離。初始化為 `CrossAttention(Zero + Learnable Query, Text, Text) + Learnable Query + Projection(Mean-pooled Text)`。推論僅使用 Main，無 NMS。單一描述超過 10 個 GT 時，Hungarian 最多配對 10 個，保留全部 GT 評估；Main 無法完整輸出超過 10 個物件的集合。Main 的未配對候選皆監督為 no-object，包含同物件的重複框。
+>Main／Aux 分別使用 10／100 個獨立 query 與輸出 Head，共用文字 Cross-Attention 與 Decoder；兩組 query 的 self-attention 隔離。初始化為 `CrossAttention(Zero + Learnable Query, Text, Text) + Learnable Query + Projection(Mean-pooled Text)`
 
 ### 模型結構
 ![模型能力](https://github.com/ImChouOWO/LightDet/blob/LightDet-gRef/LightDet.png)
@@ -81,7 +81,7 @@ Main／Aux 分別使用 10／100 個獨立 query 與輸出 Head，共用文字 C
 | **logit** | 將機率轉為實數分數：`log(p / (1-p))`，讓 Residual 能以加法修正。 |
 | **Selection Logits** | 融合後的最終分數，供 Selection Loss 使用；經 sigmoid 得到 Final Score，Ranking Loss 比較其 log 分數。 |
 
-Quality 在融合監督路徑停止梯度；`base` 限制於 `[1e-6, 1−1e-6]`。`no_object_logits = −selection_logits`，target／no-object 是同一組二元分類分數的兩面。Main 不忽略重複候選；Aux 的多正例不加入 Main 標籤。
+
 
 ---
 
