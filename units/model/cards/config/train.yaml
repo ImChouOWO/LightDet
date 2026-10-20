@@ -1,196 +1,56 @@
 data:
   dataset_dir: datasets
-  image_size: 1024
-  max_text_aug_per_image: 1
-  cache_images: true
-  image_cache_dir: datasets/.cache/images_1024_uint8
-  prebuild_image_cache: true
-  cache_workers: 8
-  prefetch_factor: 2
-  pin_memory: true
-  persistent_workers: true
-  query_budget: true
-  negative_query_path: null
-  negative_sample_ratio: 0.0
-  negative_phrase_max_per_image: 0
-  negative_phrase_separator: "。"
-  use_negative_queries_in_val: false
-
+  image_size: 640
+  text_max_length: 256
+  train_split: train
+  val_split: val
 train:
-  epochs: 100
-  localization_freeze_epochs: 10
-  batch_size: 48
-  warmup_epochs: 5
-  num_workers: 16
-  device: 1
+  epochs: 30
+  batch_size: 64
+  workers: 8
+  device: cuda:1
   seed: 49
-  deterministic: false
-  use_amp: true
-  amp_dtype: bf16
-  allow_tf32: true
-  matmul_precision: high
-  channels_last: false
-  compile: false
-  compile_mode: reduce-overhead
-  startup_smoke_test: true
-  use_ema: true
-  ema_decay: 0.999
-  ema_update_interval: 1
-  ema_buffer_update_interval: 1
-  grad_clip_norm: 1.0
-
+  amp: true
+  warmup_epochs: 1
+  max_warmup_steps: 250
+  grad_clip: 1.0
+  gt_roi_hold_epochs: 5
+  gt_roi_end_epoch: 15
+  gt_roi_weight: 0.5
+  aux_enabled: false
 optim:
-  components:
-    vision: [cosine, 0.00001, 0.000001, 0.0, 1.0]
-    text: [cosine, 0.00001, 0.0000005, 0.0, 1.0]
-    transformer: [cosine, 0.00001, 0.000001, 0.0, 1.0]
-    head: [cosine, 0.0001, 0.000005, 0.0, 1.0]
+  vision_lr: 0.00001
+  fpn_lr: 0.0001
+  text_lr: 0.00002
+  head_lr: 0.0001
+  min_lr_ratio: 0.05
   weight_decay: 0.0001
-  max_warmup_steps: 3000
-  fused: true
-
 loss:
-  gt_roi:
-    weight: 0.5
-    hold_epochs: 5
-    end_epoch: 15
-  background:
-    enabled: true
-    max_iou: 0.2
-    max_ioa: 0.2
-    top_k: 10
-    negative_ratio: 3.0
-    empty_top_k: 5
-    start_epoch: 6
-    warmup_epochs: 5
-    quality_weight: 0.25
-    alignment_weight: 0.25
-    ranking_weight: 1.0
-  matcher:
-    cost_bbox: 5.0
-    cost_giou: 2.0
-    cost_score: 0.0
-    score_cost_type: focal
-    focal_alpha: 0.25
-    focal_gamma: 2.0
-    cost_alignment: 0.0
-    alignment_negative_weight: 0.25
-  weight:
-    dynamic: true
-    bbox: 5.0
-    giou: 2.0
-    score: 1.0
-    bbox_start: 5.0
-    bbox_end: 3.5
-    giou_start: 2.0
-    giou_end: 2.0
-    score_start: 1.0
-    score_end: 4.0
-    start_epoch: 1
-    end_epoch: 20
-    schedule: cosine
-  classification:
-    type: iou
-    ia_bce_alpha: 0.25
-    focal_alpha: 0.25
-    focal_gamma: 2.0
-    negative_weight: 0.25
-    normalize_by_num_gt: true
-    negative_iou_ignore_thr: 0.50
-    negative_iou_ignore_start: 0.55
-    negative_iou_ignore_end: 0.45
-    negative_iou_ignore_start_epoch: 5
-    negative_iou_ignore_end_epoch: 20
-    negative_iou_ignore_schedule: cosine
-  quality:
-    iou_pos_thr: 0.0
-    quality_min: 0.10
-    quality_max: 1.0
-    qfl_beta: 2.0
-    quality_warmup_epoch: 10
-    aux_score_enabled: true
-  text_alignment:
-    enabled: true
-    loss_weight: 1.0
-    negative_weight: 0.25
-    focal_gamma: 2.0
-    ranking_weight: 0.25
-    # Ranking = warmup * (ranking_weight * order + ranking_contrast_weight * contrast).
-    ranking_contrast_weight: 0.01
-    ranking_contrast_temperature: 0.1
-    aux_ranking_weight: 0.0
-    # Log margin ln(2): positive score must be at least twice the negative score.
-    ranking_margin: 0.6931471805599453
-    ranking_negative_top_k: 5
-    ranking_hard_negative_quota: 3
-    start_epoch: 1
-    warmup_epoch: 7
-  matcher_schedule:
-    start_epoch: 10
-    warmup_epoch: 15
-    alpha_min: 0.0
-    alignment_start_epoch: 10
-    alignment_warmup_epoch: 15
-  score_sampling:
-    positive_ratio: 1.0
-    max_positive_per_gt: 3
-    min_extra_positive_iou: 0.30
-    hard_negative_ratio: 5.0
-    aux_positive_label: 0.7
-    expand_cost_bbox: 5.0
-    expand_cost_giou: 2.0
-  hybrid:
-    aux_loss_weight: 0.25
-    matcher_cost_score: 0.0
-    matcher_cost_alignment: 0.0
-    warmup_epoch: 5
-    decay_start_ratio: 0.75
-    min_factor: 0.25
-    matcher_score_start_epoch: 10
-    matcher_score_warmup_epoch: 15
-  text_negative:
-    as_empty_target: true
-    classification_weight: 1.0
-    max_query_loss_weight: 4.0
-    lambda_text_negative: 0.25
-    text_negative_topk: 20
-    hard_topk: 20
-    text_negative_hard_mix: 0.50
-    hard_mix: 0.50
-    start_epoch: 10
-    warmup_epoch: 10
-  duplicate_suppression:
-    enabled: false
-  hard_negative:
-    enabled: false
-  ranking:
-    enabled: false
-    lambda_rank: 0.0
-  query_refinement:
-    identity_weight: 0.0
-    start_epoch: 1
-    warmup_epoch: 5
-    detach_localization: true
-  pos_weight:
-    value: 1.0
-
+  bbox_weight: 5.0
+  giou_weight: 2.0
+  quality_weight: 1.0
+  alignment_weight: 1.0
+  selection_weight: 1.0
+  ranking_weight: 0.25
+  no_object_weight: 0.1
+  main_weight: 0.8
+  aux_weight: 0.2
+  aux_top_k: 3
+  aux_min_iou: 0.3
+  aux_start_epoch: 6
+  aux_warmup_end_epoch: 15
+  aux_decay_start_epoch: 23
+  aux_end_epoch: 30
+  threshold_margin_weight: 0.1
+  threshold_margin_target: 0.5
+  threshold_margin_start_epoch: 6
+  threshold_margin_end_epoch: 15
 eval:
-  val_loss_interval: 5
-  eval_interval: 1
-  max_val_batches: null
-  score_thr: 0.5
-  nms_iou_thr: 0.5
-  use_nms: true
-  best_metric: grec_precision_f1
-
+  score_threshold: 0.7
+  use_nms: false
+  nms_iou: 0.5
+  max_detections: 10
 log:
-  save_dir: units/model/runs/train/lightdet_grounding_roi8_hardneg_log_100ep
-  weights_path: units/model/runs/train/lightdet_grounding_roi8_phrase_pair_100ep/best_hit_at_1.pt
-  resume_path: null
-  prefer_ema: true
-  save_latest_interval: 1
-  save_epoch_interval: 10
-  emit_step_metrics: false
-  log_interval: 50
-  progress_leave: true
-  progress_mininterval: 0.5
+  save_dir: units/model/runs/train
+  prefix: lightdet_gref_tqg_main10_30ep
+  best_metric: grec_precision_f1

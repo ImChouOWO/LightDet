@@ -1,0 +1,56 @@
+data:
+  dataset_dir: datasets
+  image_size: 640
+  text_max_length: 256
+  train_split: train
+  val_split: val
+train:
+  epochs: 200
+  batch_size: 64
+  workers: 8
+  device: cuda:1
+  seed: 49
+  amp: true
+  warmup_epochs: 1
+  max_warmup_steps: 250
+  grad_clip: 1.0
+  gt_roi_hold_epochs: 5
+  gt_roi_end_epoch: 15
+  gt_roi_weight: 0.5
+  aux_enabled: true
+optim:
+  vision_lr: 1.0e-05
+  fpn_lr: 0.0001
+  text_lr: 2.0e-05
+  head_lr: 0.0001
+  min_lr_ratio: 0.05
+  weight_decay: 0.0001
+loss:
+  bbox_weight: 5.0
+  giou_weight: 2.0
+  quality_weight: 1.0
+  alignment_weight: 1.0
+  selection_weight: 1.0
+  ranking_weight: 0.25
+  no_object_weight: 0.1
+  main_weight: 0.8
+  aux_weight: 0.2
+  aux_top_k: 3
+  aux_min_iou: 0.3
+  aux_start_epoch: 6
+  aux_warmup_end_epoch: 15
+  aux_decay_start_epoch: 23
+  aux_end_epoch: 30
+  threshold_margin_weight: 0.1
+  threshold_margin_target: 0.5
+  threshold_margin_start_epoch: 6
+  threshold_margin_end_epoch: 15
+eval:
+  score_threshold: 0.7
+  use_nms: false
+  nms_iou: 0.5
+  max_detections: 10
+log:
+  save_dir: units/model/runs/train
+  prefix: lightdet_gref_tqg_main10_aux100_200ep
+  best_metric: grec_precision_f1
