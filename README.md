@@ -49,7 +49,7 @@ Training is ongoing; full training and testA/testB evaluation are not yet comple
 
 ### 模型資料流
 
-![模型能力](https://github.com/ImChouOWO/LightDet/blob/LightDet-gRef/dataFlow.png)
+![資料流](https://github.com/ImChouOWO/LightDet/blob/LightDet-gRef/dataFlow.png)
 
 
 
