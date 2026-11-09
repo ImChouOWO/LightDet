@@ -1,4 +1,4 @@
-"""Explicit configuration for the gRefCOCO-only branch."""
+"""Explicit model and dataset configuration."""
 from pathlib import Path
 import yaml
 

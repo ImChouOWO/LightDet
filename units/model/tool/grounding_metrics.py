@@ -1,8 +1,64 @@
-"""GREC reference GIoU greedy matching; Main inference has no NMS."""
+"""Dataset-specific GREC and RefCOCOg metrics; Main inference has no NMS."""
 import torch
 from torchvision.ops import box_iou
 from units.model.tool.official_grec import generalized_box_iou
 from units.model.tool.runtime import select_predictions
+
+
+def build_metrics(config):
+    loader = config['data']['dataloader']
+    if loader == 'grefcoco_unc':
+        return GroundingMetrics(**config['eval'])
+    if loader == 'refcocog_umd':
+        return RefCOCOgMetrics(**config['eval'])
+    raise ValueError(f'Unknown data.dataloader: {loader}')
+
+
+class RefCOCOgMetrics:
+    """Single-GT specialization of the LocateAnything per-expression P/R protocol."""
+    def __init__(self, score_threshold=.7, use_nms=False, nms_iou=.5, max_detections=10):
+        self.settings = dict(score_threshold=score_threshold, use_nms=use_nms,
+                             nms_iou=nms_iou, max_detections=max_detections)
+        self.thresholds = torch.tensor([.5, .55, .6, .65, .7, .75, .8, .85, .9, .95], dtype=torch.float64)
+        self.precision = torch.zeros(10, dtype=torch.float64)
+        self.recall = torch.zeros(10, dtype=torch.float64)
+        self.total = self.top1_correct = self.rejected = self.selected = 0
+
+    def update(self, boxes, scores, target):
+        boxes, scores = boxes.detach().float().cpu(), scores.detach().float().cpu()
+        gt = target['boxes'].detach().double().cpu()
+        size = target['valid_size'].detach().cpu()
+        if len(gt) != 1:
+            raise ValueError('RefCOCOg evaluation requires exactly one GT per expression')
+        if not all(torch.isfinite(value).all() for value in (boxes, scores, gt)):
+            raise ValueError('Non-finite evaluation input')
+        raw, _ = select_predictions(boxes, scores, size, score_threshold=-float('inf'),
+                                    use_nms=False, max_detections=1)
+        predicted, _ = select_predictions(boxes, scores, size, **self.settings)
+        self.total += 1
+        self.selected += len(predicted)
+        self.rejected += not len(predicted)
+        self.top1_correct += int((box_iou(raw.double(), gt) >= .5).any())
+        if len(predicted):
+            matched = (box_iou(predicted.double(), gt).max() >= self.thresholds).double()
+            self.precision += matched / len(predicted)
+            self.recall += matched
+
+    def compute(self):
+        if not self.total:
+            raise ValueError('No RefCOCOg expressions evaluated')
+        precision, recall = self.precision / self.total, self.recall / self.total
+        # The official protocol averages expression P/R before computing F1.
+        f1 = 2 * precision * recall / (precision + recall).clamp_min(1e-12)
+        return dict(f1_at_05=float(f1[0]), f1_at_095=float(f1[-1]), f1_mean=float(f1.mean()),
+                    rec_acc50=self.top1_correct / self.total, expression_count=self.total,
+                    rejection_rate=self.rejected / self.total, avg_selected=self.selected / self.total,
+                    by_iou={f'{value:.2f}': dict(precision=float(p), recall=float(r), f1=float(f))
+                            for value, p, r, f in zip(self.thresholds, precision, recall, f1)},
+                    metric_schema='lightdet.refcocog.umd.v1',
+                    protocol=dict(overlap='IoU', iou_thresholds=self.thresholds.tolist(),
+                                  reduction='mean expression precision/recall, then F1',
+                                  acc50='top-1 without score threshold', **self.settings))
 
 
 class GroundingMetrics:

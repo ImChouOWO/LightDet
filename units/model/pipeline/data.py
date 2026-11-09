@@ -1,4 +1,4 @@
-"""Native gRefCOCO references; one expression can have zero, one, or many targets."""
+"""Explicit native gRefCOCO UNC and RefCOCOg UMD data loading."""
 from collections import defaultdict, OrderedDict
 import json
 from pathlib import Path
@@ -9,16 +9,39 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset, Sampler, DataLoader
 
+from units.model.tool.config import resolve
 
-class GRefCOCODataset(Dataset):
-    def __init__(self, dataset_dir, split, image_size=640, training=False, seed=49):
+
+DATA_SOURCES = {
+    'grefcoco_unc': ('grefs(unc).json', 'instances.json', ('train', 'val', 'testA', 'testB')),
+    'refcocog_umd': ('refcocog_umd.json', 'refcocog_instances.json', ('train', 'val', 'test')),
+}
+
+
+def build_dataset(data, split, training=False, seed=49):
+    if 'dataloader' not in data:
+        raise ValueError('data.dataloader must explicitly select grefcoco_unc or refcocog_umd')
+    return GroundingDataset(resolve(data['dataset_dir']), data['dataloader'], split,
+                            data['image_size'], training, seed)
+
+
+class GroundingDataset(Dataset):
+    def __init__(self, dataset_dir, dataloader, split, image_size=640, training=False, seed=49):
         self.root, self.split = Path(dataset_dir), split
+        if dataloader not in DATA_SOURCES:
+            raise ValueError(f'Unknown data.dataloader: {dataloader}; choose {tuple(DATA_SOURCES)}')
+        references_file, instances_file, splits = DATA_SOURCES[dataloader]
+        if split not in splits:
+            raise ValueError(f'{dataloader} supports splits {splits}, not {split}')
+        if training and split != 'train':
+            raise ValueError('Training must use the train split')
+        self.dataloader = dataloader
         self._image_cache = OrderedDict()
-        if image_size % 32:
+        if image_size <= 0 or image_size % 32:
             raise ValueError('image_size must be divisible by 32')
         self.image_size, self.training, self.seed, self.epoch = image_size, training, seed, 0
-        records = json.loads((self.root/'labels/grefs(unc).json').read_text())
-        instances = json.loads((self.root/'labels/instances.json').read_text())
+        records = json.loads((self.root/'labels'/references_file).read_text())
+        instances = json.loads((self.root/'labels'/instances_file).read_text())
         self.images = {im['id']:im for im in instances['images']}
         annotations = [{k:a[k] for k in ('id','image_id','bbox','iscrowd') if k in a} for a in instances['annotations']]
         self.annotations = {a['id']:a for a in annotations}
@@ -29,7 +52,18 @@ class GRefCOCODataset(Dataset):
         self.references = [r for r in records if r['split']==split]
         if not self.references:
             raise ValueError(f'No references for official split {split}')
-        self.entries = [(i,None) for i in range(len(self.references))] if training else [
+        for ref in self.references:
+            ids = self.target_ids(ref)
+            if dataloader == 'refcocog_umd' and len(ids) != 1:
+                raise ValueError('RefCOCOg requires exactly one target per expression')
+            if not ref['sentences']:
+                raise ValueError(f'Missing sentences for reference {ref["ref_id"]}')
+            if ref['image_id'] not in self.images or any(
+                    self.annotations[obj]['image_id'] != ref['image_id'] for obj in ids):
+                raise ValueError('Reference points to another image')
+        # Preserve gRefCOCO reference cycling; RefCOCOg visits every expression per epoch.
+        cycle = training and dataloader == 'grefcoco_unc'
+        self.entries = [(i,None) for i in range(len(self.references))] if cycle else [
             (i,j) for i,r in enumerate(self.references) for j in range(len(r['sentences']))]
         self.groups = [min(len(self.target_ids(self.references[i])),2) for i,_ in self.entries]
         self.image_ids = [self.references[i]['image_id'] for i,_ in self.entries]
@@ -97,8 +131,8 @@ class GRefCOCODataset(Dataset):
         return item
 
 
-class GRefBatchSampler(Sampler):
-    """Group up to four expressions per image, shuffle blocks, and visit every reference once."""
+class ImageBatchSampler(Sampler):
+    """Group up to four expressions per image and visit every dataset entry once."""
     def __init__(self,dataset,batch_size,shuffle=True):
         self.dataset,self.batch_size,self.shuffle=dataset,batch_size,shuffle
 
@@ -148,6 +182,6 @@ def grounding_collate_fn(items):
 
 def build_dataloader(dataset, batch_size, workers):
     # Workers are restarted each epoch so sentence cycling receives the new epoch.
-    return DataLoader(dataset,batch_sampler=GRefBatchSampler(dataset,batch_size,dataset.training),
+    return DataLoader(dataset,batch_sampler=ImageBatchSampler(dataset,batch_size,dataset.training),
                       num_workers=workers,pin_memory=True,collate_fn=grounding_collate_fn,
                       persistent_workers=False)

@@ -1,4 +1,4 @@
-"""Train the gRefCOCO Transformer Main/Aux model; old LightDet checkpoints are not accepted."""
+"""Train the Transformer Main/Aux model on the explicitly configured dataset."""
 import argparse
 import json
 import math
@@ -16,7 +16,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from units.tool.card import VisionTextModel
-from units.model.pipeline.data import GRefCOCODataset,build_dataloader
+from units.model.pipeline.data import build_dataset,build_dataloader
 from units.model.cards.loss import GroundingLoss
 from units.model.tool.config import load_config,resolve
 from units.model.tool.runtime import prepare_model_batch
@@ -86,6 +86,7 @@ def print_training_details(model,config,model_config,device,train_data,val_data,
         f"  Parameters: total={total/1e6:.2f}M, trainable={trainable/1e6:.2f}M",
         '[Training]',
         f"  Device   : {device} ({hardware}), precision={'BF16' if device.type=='cuda' and settings['amp'] else 'FP32'}",
+        f"  Loader   : {data['dataloader']} (train={data['train_split']}, val={data['val_split']})",
         f"  Data     : train={len(train_data)}, val={len(val_data)}, image={data['image_size']}, batch={settings['batch_size']}, workers={settings['workers']}",
         f"  Capacity : train references above Main capacity={sum(len(train_data.target_ids(ref))>model_config['num_object_queries'] for ref in train_data.references)}; all GT retained",
         f"  Schedule : epochs={settings['epochs']}, start={start}, warmup={warm_steps} steps, mode={'resume' if resume else 'from scratch'}",
@@ -99,19 +100,21 @@ def print_training_details(model,config,model_config,device,train_data,val_data,
     print('\n'.join(lines),flush=True)
 
 
-def print_epoch_summary(record,epochs,elapsed,is_best,best_path):
+def print_epoch_summary(record,epochs,elapsed,is_best,best_path,best_metric):
     metrics=record['validation']
-    line=(f"Epoch [{record['epoch']}/{epochs}] train={record['train']['total']:.4f} "
-          f"GREC Pr@(F1=1)={format_metric(metrics['grec_precision_f1'])} "
-          f"Acc@0.5={format_metric(metrics['rec_acc50'])} "
-          f"N-Acc={format_metric(metrics['n_acc'])} T-Acc={format_metric(metrics['t_acc'])} "
-          f"Positive-Pr={format_metric(metrics['positive_precision_f1'])} time={elapsed:.1f}s")
+    names=({'f1_at_05':'F1@0.5','f1_at_095':'F1@0.95','f1_mean':'F1@Mean','rec_acc50':'Acc@0.5'}
+           if 'f1_mean' in metrics else
+           {'grec_precision_f1':'GREC Pr@(F1=1)','rec_acc50':'Acc@0.5','n_acc':'N-Acc',
+            't_acc':'T-Acc','positive_precision_f1':'Positive-Pr'})
+    line=f"Epoch [{record['epoch']}/{epochs}] train={record['train']['total']:.4f} "
+    line+=' '.join(f'{label}={format_metric(metrics[key])}' for key,label in names.items())
+    line+=f' time={elapsed:.1f}s'
     schedule=record.get('selection_margin')
     if schedule:
         line+=f" margin={schedule['value']:.3f} margin_weight={schedule['weight']:.3f}"
     tqdm.write(line)
     if is_best:
-        message=f"Saved best checkpoint: epoch={record['epoch']}, GREC Pr@(F1=1)={format_metric(metrics['grec_precision_f1'])} -> {best_path.name}"
+        message=f"Saved best checkpoint: epoch={record['epoch']}, {names[best_metric]}={format_metric(metrics[best_metric])} -> {best_path.name}"
         if sys.stdout.isatty():message=f'\033[1;32m{message}\033[0m'
         tqdm.write(message)
     sys.stdout.flush()
@@ -123,8 +126,8 @@ def train(args):
     torch.set_num_threads(4)
     if device.type=='cuda':torch.backends.cuda.matmul.allow_tf32=True
     data=config['data']
-    train_data=GRefCOCODataset(resolve(data['dataset_dir']),data['train_split'],data['image_size'],True,settings['seed'])
-    val_data=GRefCOCODataset(resolve(data['dataset_dir']),data['val_split'],data['image_size'],False,settings['seed'])
+    train_data=build_dataset(data,data['train_split'],training=True,seed=settings['seed'])
+    val_data=build_dataset(data,data['val_split'],seed=settings['seed'])
     loader=build_dataloader(train_data,settings['batch_size'],settings['workers'])
     val_loader=build_dataloader(val_data,settings['batch_size'],settings['workers'])
     criterion=GroundingLoss(**config['loss'],selection_threshold=config['eval']['score_threshold']).to(device)
@@ -201,7 +204,7 @@ def train(args):
         save_checkpoint(save_dir/(prefix+'_latest.pt'),model,optimizer,scheduler,scaler,epoch,best,config,model_config)
         if is_best:save_checkpoint(save_dir/(prefix+'_best.pt'),model,optimizer,scheduler,scaler,epoch,best,config,model_config)
         if epoch%10==0:save_checkpoint(save_dir/(prefix+f'_epoch_{epoch:03d}.pt'),model,optimizer,scheduler,scaler,epoch,best,config,model_config)
-        print_epoch_summary(record,settings['epochs'],perf_counter()-epoch_started,is_best,save_dir/(prefix+'_best.pt'))
+        print_epoch_summary(record,settings['epochs'],perf_counter()-epoch_started,is_best,save_dir/(prefix+'_best.pt'),config['log']['best_metric'])
 
 
 def main():

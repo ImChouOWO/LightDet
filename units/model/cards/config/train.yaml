@@ -1,4 +1,5 @@
 data:
+  dataloader: grefcoco_unc
   dataset_dir: datasets
   image_size: 640
   text_max_length: 256

@@ -12,8 +12,8 @@ import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from units.tool.card import VisionTextModel
-from units.model.pipeline.data import GRefCOCODataset,build_dataloader
-from units.model.tool.config import resolve
+from units.model.pipeline.data import build_dataset,build_dataloader
+from units.model.tool.config import load_config,resolve
 from units.model.tool.runtime import prepare_model_batch
 from units.model.tool.official_grec import RefExpEvaluator
 
@@ -41,7 +41,9 @@ class ExpressionAnnotations:
 
 @torch.inference_mode()
 def evaluate_official(model,tokenizer,config,device,split,batch_size,workers,limit=None):
-    dataset=GRefCOCODataset(resolve(config['data']['dataset_dir']),split,config['data']['image_size'])
+    if config['data']['dataloader']!='grefcoco_unc':
+        raise ValueError('val_official.py evaluates GREC only; use val.py or val_refcocog.py for RefCOCOg')
+    dataset=build_dataset(config['data'],split)
     if limit:
         dataset.entries=dataset.entries[:limit]
         dataset.groups=dataset.groups[:limit]
@@ -95,6 +97,7 @@ def print_results(result):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--weights',required=True)
+    parser.add_argument('--data-config',help='Explicit grefcoco_unc settings; otherwise use checkpoint data config')
     parser.add_argument('--splits',nargs='+',default=['val','testA','testB'],choices=['val','testA','testB'])
     parser.add_argument('--device',default='cuda:1')
     parser.add_argument('--batch-size',type=int,default=64)
@@ -113,6 +116,11 @@ def main():
     checkpoint=torch.load(weights,map_location='cpu',weights_only=False)
     if checkpoint['schema']!='lightdet.grefcoco.queries.v3':raise ValueError('Expected text-guided query checkpoint (v3)')
     settings=checkpoint['model_config'];config=checkpoint['config']
+    if args.data_config:config['data']=load_config(args.data_config)['data']
+    if 'dataloader' not in config['data']:
+        parser.error('Specify grefcoco_unc explicitly with --data-config; data.dataloader is required')
+    if config['data']['dataloader']!='grefcoco_unc':
+        parser.error('val_official.py requires grefcoco_unc; use val.py or val_refcocog.py for RefCOCOg')
     model=VisionTextModel(**dict(settings,backbone_weights=None)).to(device).eval()
     model.load_state_dict(checkpoint['model'],strict=True)
     tokenizer=AutoTokenizer.from_pretrained(resolve(settings['encoder_path']),local_files_only=True)
